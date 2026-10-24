@@ -20,8 +20,8 @@
 //! forcing every caller to unwrap an engine first.
 //!
 //! Which engine drives a connection is decided once, in
-//! [`TlsTable::create`]/[`TlsTable::create_client`], by the `tls-unbuffered`
-//! cargo feature. Backends never see that choice: `backend_mio` and
+//! [`TlsTable::create`]/[`TlsTable::create_client`]: the unbuffered engine,
+//! unless the `tls-buffered` cargo feature selects the buffered one. Backends never see that choice: `backend_mio` and
 //! `backend_uring` each dispatch their backend's entry points to whichever
 //! engine is compiled in, keeping the names and signatures the backend already
 //! called. `drain_tls_plaintext` below is the buffered engine's plaintext
@@ -104,7 +104,7 @@ impl TlsInfo {
 /// runtime surprise. Only operations rustls exposes through `CommonState` --
 /// which both engine families `Deref` to -- stay on this enum.
 pub enum TlsConnKind {
-    /// Never constructed in a `tls-unbuffered` build — see
+    /// Never constructed in a build without `tls-buffered` — see
     /// [`buffered::BufferedKind`] for why the allow is scoped this narrowly.
     #[cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
     Buffered(buffered::BufferedKind),
@@ -116,12 +116,11 @@ impl TlsConnKind {
     /// The buffered connection, or `None` if another engine drives this one.
     ///
     /// `Some` for every connection when only the buffered engine is
-    /// compiled in; `None` for a `tls-unbuffered`-engine connection once
-    /// that feature is enabled. Do not collapse this to an infallible
-    /// accessor.
+    /// compiled in (`tls-buffered`); `None` for an unbuffered-engine
+    /// connection otherwise. Do not collapse this to an infallible accessor.
     #[allow(
         clippy::unnecessary_wraps,
-        reason = "unconditionally Some without the tls-unbuffered feature; kept fallible so both configurations share one signature"
+        reason = "unconditionally Some with the tls-buffered feature; kept fallible so both configurations share one signature"
     )]
     pub fn as_buffered_mut(&mut self) -> Option<&mut buffered::BufferedKind> {
         match self {
@@ -133,7 +132,7 @@ impl TlsConnKind {
 
     /// The unbuffered connection, or `None` if another engine drives this one.
     ///
-    /// Only compiled in a `tls-unbuffered` build, where `TlsTable::create`
+    /// Only compiled in a build without `tls-buffered`, where `TlsTable::create`
     /// selects this engine for every connection — so the `Buffered` arm is
     /// unreachable in practice today. It is still spelled out rather than
     /// assumed: that build keeps both variants, and both backend dispatchers
@@ -148,8 +147,8 @@ impl TlsConnKind {
 
     /// Whether the unbuffered record layer drives this connection.
     ///
-    /// Always `false` without the `tls-unbuffered` feature, because the
-    /// variant does not exist there.
+    /// Always `false` with the `tls-buffered` feature, because the variant
+    /// does not exist there.
     pub fn is_unbuffered(&self) -> bool {
         match self {
             Self::Buffered(_) => false,
@@ -552,8 +551,8 @@ impl TlsTable {
     /// Create a new TLS server connection at the given index.
     ///
     /// The engine is selected here, once per connection, and fixed for its
-    /// lifetime: the `tls-unbuffered` feature picks rustls' unbuffered record
-    /// layer, otherwise the buffered one. See
+    /// lifetime: rustls' unbuffered record layer, unless the `tls-buffered`
+    /// feature selects the buffered one. See
     /// `docs/tls-unbuffered-design.md` ("Path selection").
     pub fn create(
         &mut self,
@@ -928,14 +927,14 @@ mod tests {
         {
             assert!(
                 conn.conn.as_unbuffered_mut().is_some(),
-                "tls-unbuffered build must select the unbuffered engine"
+                "the default build must select the unbuffered engine"
             );
             assert!(conn.conn.as_buffered_mut().is_none());
         }
         #[cfg(feature = "tls-buffered")]
         assert!(
             conn.conn.as_buffered_mut().is_some(),
-            "default build must select the buffered engine"
+            "a tls-buffered build must select the buffered engine"
         );
     }
 

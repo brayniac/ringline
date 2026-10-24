@@ -224,9 +224,9 @@ pub struct Config {
     /// record fits in a single slot: 5-byte record header + 2^14 plaintext +
     /// the inner content-type byte + a 16-byte AEAD tag = 16406, rounded up to
     /// a 64-byte boundary. A 16384-byte slot is 22 bytes short of that, which
-    /// forces the `tls-unbuffered` engine to shrink its plaintext chunk and
-    /// emit an extra record per send (17 rather than 16 for a 256 KiB
-    /// payload). Costs 64 bytes per slot — 0.4% of the pool.
+    /// forces the unbuffered engine (the default) to shrink its plaintext
+    /// chunk and emit an extra record per send (17 rather than 16 for a
+    /// 256 KiB payload). Costs 64 bytes per slot — 0.4% of the pool.
     pub(crate) send_copy_slot_size: u32,
     /// Minimum total send size (bytes) for the zero-copy guard send path.
     ///
@@ -574,7 +574,7 @@ impl Config {
         let min = crate::tls::unbuffered::MIN_ENCRYPT_DST;
         if (self.send_copy_slot_size as usize) < min {
             return Err(crate::error::Error::RingSetup(format!(
-                "send_copy_slot_size is {} but the tls-unbuffered record layer cannot encrypt \
+                "send_copy_slot_size is {} but the unbuffered TLS record layer cannot encrypt \
                  into a destination smaller than {min} bytes, so every TLS send would fail; \
                  raise send_copy_slot_size",
                 self.send_copy_slot_size,

@@ -22,8 +22,8 @@
 //! measures ~4-8% faster on the recv path, which is not a copy-count effect
 //! and is not yet explained.
 //!
-//! Selected per connection by the `tls-unbuffered` feature in
-//! `TlsTable::create`, and driven end-to-end on both backends through their
+//! The default engine, selected per connection in `TlsTable::create` unless
+//! the `tls-buffered` feature is on, and driven end-to-end on both backends through their
 //! dispatcher modules (`super::backend_mio`, `super::backend_uring`). The
 //! backends differ only in where the ciphertext lands: a `Vec` on the
 //! connection's pending-send FIFO for mio, `SendCopyPool` slots for io_uring
@@ -1118,6 +1118,9 @@ pub(crate) mod sni {
     }
 
     /// Wraps the caller's resolver and records the ClientHello's server name.
+    /// Forwards both `ResolvesServerCert` methods rustls 0.23.46 has
+    /// (`resolve`, `only_raw_public_keys`); a method a later release adds
+    /// with a default would get the default here, not the caller's.
     #[derive(Debug)]
     struct CaptureServerName {
         inner: Arc<dyn rustls::server::ResolvesServerCert>,
