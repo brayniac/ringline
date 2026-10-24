@@ -232,10 +232,10 @@ impl Driver {
 
     /// Arm `conn_index`'s hangup poll (`OpTag::HangupPoll`) once it is
     /// open. A direct connection arms a receive only when a read parks, so
-    /// without the poll a peer FIN or reset on a connection whose task is
-    /// not reading would not be seen until a read next parks. If the SQE
-    /// cannot be pushed the connection goes without it: a FIN or reset is
-    /// then seen when a read next parks. The failure is counted in
+    /// without the poll a peer FIN or reset is not seen until a receive
+    /// completes, and while no read is parked none may be in flight. If the
+    /// SQE cannot be pushed the connection goes without it: a FIN or reset is
+    /// then seen by the next receive to complete. The failure is counted in
     /// `ring::RECV_ARM_FAILURES`.
     pub(crate) fn arm_hangup_poll(&mut self, conn_index: u32) {
         let Some(cs) = self.connections.get(conn_index) else {
