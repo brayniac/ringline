@@ -4,9 +4,7 @@
 //! silent and again after the peer writes a second line. `recv_ready` must stay
 //! pending while nothing has arrived and resolve once the second line has,
 //! wherever the driver holds it. On io_uring a reply arriving on a connection
-//! with an empty accumulator is lent in place, and on a connection in the
-//! segmented domain it goes to the segment hold; neither is in the
-//! accumulator.
+//! with an empty accumulator is lent in place, outside the accumulator.
 
 use std::future::Future;
 use std::io::{Read, Write};
@@ -20,15 +18,12 @@ use ringline::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
-/// `recv_segment_reserve` at 8 so segmented deliveries on this 64-buffer
-/// ring are held in place rather than copied.
 fn test_config() -> Config {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
         .recv_buffer(64, 4096)
-        .recv_segment_reserve(8)
         .max_connections(16)
         .send_pool(16, 16448)
         .build()
@@ -76,33 +71,18 @@ fn wait_for(seen: &Mutex<Vec<Seen>>) -> Seen {
     }
 }
 
-/// Read one line: with `with_data`, or with `with_bytes_segments`, which
-/// leaves the connection in the segmented domain. `None` at end of stream.
-async fn read_line(conn: &mut Connection, segmented: bool) -> Option<Vec<u8>> {
+/// Read one line with `with_data`. `None` at end of stream.
+async fn read_line(conn: &mut Connection) -> Option<Vec<u8>> {
     let mut line = None;
-    let n = if segmented {
-        conn.with_bytes_segments(|pieces| {
-            let all: Vec<u8> = pieces.iter().flat_map(|p| p.iter().copied()).collect();
-            match all.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    line = Some(all[..=i].to_vec());
-                    ParseResult::Consumed(i + 1)
-                }
-                None => ParseResult::NeedMore,
-            }
-        })
-        .await
-        .expect("with_bytes_segments")
-    } else {
-        conn.with_data(|d| match d.iter().position(|&b| b == b'\n') {
+    let n = conn
+        .with_data(|d| match d.iter().position(|&b| b == b'\n') {
             Some(i) => {
                 line = Some(d[..=i].to_vec());
                 ParseResult::Consumed(i + 1)
             }
             None => ParseResult::NeedMore,
         })
-        .await
-    };
+        .await;
     if n == 0 { None } else { line }
 }
 
@@ -110,8 +90,8 @@ async fn read_line(conn: &mut Connection, segmented: bool) -> Option<Vec<u8>> {
 /// stays pending for `QUIET`, then wait for it and read what follows. The peer
 /// starts `GAP` only after the acknowledgement, so the quiet period falls
 /// inside it however long the server took to read the first line.
-async fn wait_then_read(conn: &mut Connection, segmented: bool) -> Seen {
-    read_line(conn, segmented).await.expect("the first line");
+async fn wait_then_read(conn: &mut Connection) -> Seen {
+    read_line(conn).await.expect("the first line");
     conn.send_nowait(b"+").expect("acknowledge");
     if let Either::Left(()) = ringline::select(conn.recv_ready(), ringline::sleep(QUIET)).await {
         return Seen::Early;
@@ -122,14 +102,14 @@ async fn wait_then_read(conn: &mut Connection, segmented: bool) -> Seen {
     {
         return Seen::Hung;
     }
-    match read_line(conn, segmented).await {
+    match read_line(conn).await {
         Some(line) => Seen::Line(line),
         None => Seen::Closed,
     }
 }
 
 macro_rules! server {
-    ($name:ident, $seen:ident, $segmented:expr) => {
+    ($name:ident, $seen:ident) => {
         static $seen: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
 
         struct $name;
@@ -138,7 +118,7 @@ macro_rules! server {
             #[allow(clippy::manual_async_fn)]
             fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
                 async move {
-                    let seen = wait_then_read(&mut conn, $segmented).await;
+                    let seen = wait_then_read(&mut conn).await;
                     $seen.lock().unwrap().push(seen);
                 }
             }
@@ -150,11 +130,9 @@ macro_rules! server {
     };
 }
 
-server!(Copy, COPY, false);
-#[cfg(not(has_io_uring))]
-server!(Segmented, SEGMENTED, true);
-server!(PeerClose, PEER_CLOSE, false);
-server!(Tls, TLS, false);
+server!(Copy, COPY);
+server!(PeerClose, PEER_CLOSE);
+server!(Tls, TLS);
 
 /// Wait for the server's acknowledgement of the first line.
 fn await_ack(stream: &mut impl Read) {
@@ -188,22 +166,6 @@ fn resolves_for_a_reply_on_an_empty_accumulator() {
     std::thread::sleep(GAP);
     peer.write_all(b"second\n").expect("write");
     assert_eq!(wait_for(&COPY), Seen::Line(b"second\n".to_vec()));
-    drop(peer);
-    stop(shutdown, handles);
-}
-
-/// The connection stays in the segmented domain after the first line. mio
-/// only: on io_uring an accepted plaintext connection refuses segmented
-/// reads.
-#[cfg(not(has_io_uring))]
-#[test]
-fn resolves_for_bytes_in_the_segment_hold() {
-    let (shutdown, handles, mut peer) = plain_server::<Segmented>();
-    peer.write_all(b"first\n").expect("write");
-    await_ack(&mut peer);
-    std::thread::sleep(GAP);
-    peer.write_all(b"second\n").expect("write");
-    assert_eq!(wait_for(&SEGMENTED), Seen::Line(b"second\n".to_vec()));
     drop(peer);
     stop(shutdown, handles);
 }

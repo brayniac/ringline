@@ -3,8 +3,8 @@
 //! On io_uring the client's connection is a plaintext outbound connection,
 //! which receives directly into its accumulator (`docs/recv-direct-design.md`),
 //! so `RING`, `BUF` and the ring counters in the result line do not apply to
-//! it, and `MODE=segments` and `MODE=forward`, which need the ring, exit with
-//! an error. MODE=whole, bytes and mixed measure direct receive. On mio they
+//! it, and `MODE=forward`, which needs the ring, exits with an error.
+//! MODE=whole, bytes and mixed measure direct receive. On mio they
 //! measure the mio read path.
 //!
 //! Protocol: the ringline client sends a 4-byte little-endian length request;
@@ -20,14 +20,13 @@
 //!   SECS      run duration seconds (default 5)
 //!   RING      provided-ring entry count / power of two (default 256)
 //!   BUF       provided-ring buffer size bytes (default 16384)
-//!   MODE      whole | bytes | mixed | segments | forward (default whole)
+//!   MODE      whole | bytes | mixed | forward (default whole)
 //!             whole    = with_data, parse a full response (1 accumulator copy)
 //!             bytes    = with_bytes (zero-copy value slices; redis-shaped)
 //!             mixed    = with_data, alternate SMALL/LARGE per round (index-derived)
-//!             segments = Mode B borrowed segment reader, process-and-release (0 copy)
 //!             forward  = Mode A forward_to a /dev/null sink (0 userspace copy)
-//!             (segments/forward exit with status 2 on io_uring, where the
-//!             connection receives directly; on mio they run as whole)
+//!             (forward exits with status 2 on io_uring, where the
+//!             connection receives directly; on mio it runs as whole)
 //!   PORT      server port (default 7891)
 #![allow(clippy::manual_async_fn)]
 
@@ -124,7 +123,7 @@ impl AsyncEventHandler for Bench {
                     // Reading an outbound connection goes through its read half.
                     let (mut conn_tx, mut conn_rx) = conn.split();
                     #[cfg(has_io_uring)]
-                    if (mode == "segments" || mode == "forward") && conn_rx.is_recv_direct() {
+                    if mode == "forward" && conn_rx.is_recv_direct() {
                         eprintln!(
                             "[ring_fill_bench] MODE={mode} needs the provided-buffer ring, \
                              and an outbound plaintext connection receives directly"
@@ -155,25 +154,6 @@ impl AsyncEventHandler for Bench {
                             break;
                         }
                         let got = match mode.as_str() {
-                            // Mode B: consume the response as borrowed zero-copy
-                            // segments, releasing each — no accumulator copy.
-                            #[cfg(has_io_uring)]
-                            "segments" => {
-                                let mut g = 0usize;
-                                {
-                                    let Ok(mut reader) = conn_rx.segments() else {
-                                        return;
-                                    };
-                                    while g < want {
-                                        match reader.next().await {
-                                            Ok(Some(seg)) => g += seg.len(),
-                                            _ => break,
-                                        }
-                                    }
-                                }
-                                let _ = conn_rx.end_segments();
-                                g
-                            }
                             // Mode A: forward the response straight to the sink fd,
                             // no userspace copy (recv buffers written by the kernel).
                             #[cfg(has_io_uring)]

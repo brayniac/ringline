@@ -25,7 +25,7 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
 
 #[metric(
     name = "ringline/recv_ring",
-    description = "TCP receive: the ring kind each worker selected, lends refused, views, and receive copies"
+    description = "TCP receive: the ring kind each worker selected, lends refused, and receive copies"
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
@@ -225,7 +225,7 @@ pub mod park_diag {
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
-/// Slot 2 is unused.
+/// Slots 2 and 10 are unused.
 /// Nothing is collapsed: an earlier version grouped the variants believed
 /// unreachable at the install re-check into a single `other_blocker`, and that
 /// slot then absorbed 97.8% of abandonments (18,844 of 19,268 in a saturated
@@ -254,9 +254,7 @@ pub mod park_abandon {
     pub const FORWARD_WRITE: usize = 8;
     /// A send chain has SQEs in the kernel.
     pub const CHAIN: usize = 9;
-    /// A live `SegmentReader` owns the connection's delivery discipline, so
-    /// there is no quiescent point at all.
-    pub const SEGMENT_READER: usize = 10;
+    // Slot 10 has no blocker.
     /// A fallback recv is in flight against this worker's send pool.
     pub const RECV_FALLBACK: usize = 11;
     /// The slot was recycled while the install was in flight.
@@ -304,7 +302,7 @@ pub mod ring {
 
 /// Slot indices for `RECV_RING`: one count per worker by the TCP receive
 /// ring it registered (`ConfigBuilder::recv_incremental`), the lends the
-/// lend cap refused, receive views, and copies in the receive path.
+/// lend cap refused, and copies in the receive path.
 pub mod recv_ring {
     /// An incremental ring (`IOU_PBUF_RING_INC`).
     pub const INCREMENTAL: usize = 0;
@@ -315,38 +313,13 @@ pub mod recv_ring {
     /// (`recv_incremental` only). A per-completion event, unlike the
     /// per-worker kind counts.
     pub const LEND_REFUSED: usize = 2;
-    /// Receive views created (`backend/uring/view.rs`). `VIEW_CREATED` minus
-    /// `VIEW_RELEASED` is the number of view holds outstanding plus the
-    /// releases that are still queued (including those queued while a worker
-    /// shuts down, which are never applied), dropped (`VIEW_RELEASE_DROPPED`),
-    /// or ignored because they named another ring's memory.
-    pub const VIEW_CREATED: usize = 3;
-    /// View holds released by their worker.
-    pub const VIEW_RELEASED: usize = 4;
-    /// Views dropped on a thread other than their worker's, whose release
-    /// went through the worker's inbox.
-    pub const VIEW_RELEASE_REMOTE: usize = 5;
-    /// View releases with no live worker to go to: the view's worker had
-    /// exited when its last clone dropped.
-    pub const VIEW_RELEASE_DROPPED: usize = 6;
-    /// `segment_hold` entries a `with_bytes_segments` call copied into the
-    /// accumulator because the hold reached its cap with the message
-    /// incomplete. Entries released without a copy, after the copy reached
-    /// `recv_accumulator_max`, are not counted.
-    pub const HOLD_CAP_COPIED: usize = 7;
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
     /// moves), prepended to it, or copied into an owned `segment_hold` entry,
-    /// TLS plaintext the unbuffered engine
-    /// stashes when the send path decrypts it, and values `copy_small_view`
-    /// copies. Ciphertext staged for TLS is not counted.
-    pub const BYTES_COPIED: usize = 8;
-    /// Values `copy_small_view` copied: non-empty views shorter than its
-    /// threshold, and, on io_uring where no worker's driver is current, any
-    /// other non-empty value shorter than it.
-    /// Their bytes also count in `BYTES_COPIED`.
-    pub const THRESHOLD_COPIED: usize = 9;
-    pub const COUNT: usize = 10;
+    /// and TLS plaintext the unbuffered engine stashes when the send path
+    /// decrypts it. Ciphertext staged for TLS is not counted.
+    pub const BYTES_COPIED: usize = 3;
+    pub const COUNT: usize = 4;
 }
 
 /// Slot indices for `RECV_DIRECT`.
@@ -452,8 +425,8 @@ pub mod pool {
     /// degradation path that keeps draining the socket when a single
     /// response exceeds the provided ring.
     pub const RECV_FALLBACK: usize = 5;
-    /// A connection holding received data (a `forward_to` source, a segment
-    /// reader, or a connection whose `forward_recv_buf` sends are unfinished)
+    /// A connection holding received data (a `forward_to` source, or a
+    /// connection whose `forward_recv_buf` sends are unfinished)
     /// reached its hold cap
     /// (`forward_hold_cap`, lowered as `ConfigBuilder::forward_hold_cap` says)
     /// and had its recv stopped (a one-shot recv not re-armed, a multishot one
@@ -464,21 +437,7 @@ pub mod pool {
     /// per-connection backpressure that prevents one slow consumer from depleting
     /// the shared recv ring.
     pub const FORWARD_THROTTLED: usize = 6;
-    /// A segmented reader was about to park while the `RecvAccumulator` still
-    /// held bytes, and those bytes were adopted into the segment hold instead.
-    ///
-    /// A segmented reader only ever reads `segment_hold`, so parking with a
-    /// non-empty accumulator strands those bytes permanently: the connection
-    /// hangs while every other signal reads healthy — ring full, multishot
-    /// live, no errors. That was #423, and it was invisible to every counter
-    /// here, which is why this one exists.
-    ///
-    /// Entering the segmented domain adopts what is already buffered, so a
-    /// non-zero count means bytes reached the accumulator after entry. The
-    /// known ways are a `RecvOwnedSegment` future created before one of
-    /// these and polled after it: a `with_bytes_segments` hold-cap copy, or
-    /// a `with_segments` under-drain. Any other is a path that strands bytes.
-    pub const SEGMENT_STRANDED_ADOPTED: usize = 7;
+    // Slot 7 is unused.
     /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
     /// that send went out as plain `send`s. On Linux the usual cause is
     /// that the pages the send would pin do not fit under
@@ -524,33 +483,7 @@ pub fn init_metadata() {
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
     RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
-    RECV_RING.insert_metadata(recv_ring::VIEW_CREATED, "op".into(), "view_created".into());
-    RECV_RING.insert_metadata(
-        recv_ring::VIEW_RELEASED,
-        "op".into(),
-        "view_released".into(),
-    );
-    RECV_RING.insert_metadata(
-        recv_ring::VIEW_RELEASE_REMOTE,
-        "op".into(),
-        "view_release_remote".into(),
-    );
-    RECV_RING.insert_metadata(
-        recv_ring::VIEW_RELEASE_DROPPED,
-        "op".into(),
-        "view_release_dropped".into(),
-    );
-    RECV_RING.insert_metadata(
-        recv_ring::HOLD_CAP_COPIED,
-        "op".into(),
-        "hold_cap_copied".into(),
-    );
     RECV_RING.insert_metadata(recv_ring::BYTES_COPIED, "op".into(), "bytes_copied".into());
-    RECV_RING.insert_metadata(
-        recv_ring::THRESHOLD_COPIED,
-        "op".into(),
-        "threshold_copied".into(),
-    );
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -651,11 +584,6 @@ pub fn init_metadata() {
     );
     PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());
     PARK_ABANDONED.insert_metadata(
-        park_abandon::SEGMENT_READER,
-        "op".into(),
-        "segment_reader".into(),
-    );
-    PARK_ABANDONED.insert_metadata(
         park_abandon::RECV_FALLBACK,
         "op".into(),
         "recv_fallback".into(),
@@ -730,11 +658,6 @@ pub fn init_metadata() {
         "op".into(),
         "forward_throttled".into(),
     );
-    POOL.insert_metadata(
-        pool::SEGMENT_STRANDED_ADOPTED,
-        "op".into(),
-        "segment_stranded_adopted".into(),
-    );
     POOL.insert_metadata(pool::SEND_ZC_ENOMEM, "op".into(), "send_zc_enomem".into());
 
     UDP.insert_metadata(
@@ -797,7 +720,6 @@ mod tests {
             pool::RECV_PARKED,
             pool::RECV_FALLBACK,
             pool::FORWARD_THROTTLED,
-            pool::SEGMENT_STRANDED_ADOPTED,
             pool::SEND_ZC_ENOMEM,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
@@ -814,13 +736,7 @@ mod tests {
             recv_ring::INCREMENTAL,
             recv_ring::PLAIN,
             recv_ring::LEND_REFUSED,
-            recv_ring::VIEW_CREATED,
-            recv_ring::VIEW_RELEASED,
-            recv_ring::VIEW_RELEASE_REMOTE,
-            recv_ring::VIEW_RELEASE_DROPPED,
-            recv_ring::HOLD_CAP_COPIED,
             recv_ring::BYTES_COPIED,
-            recv_ring::THRESHOLD_COPIED,
         ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
@@ -851,28 +767,7 @@ mod tests {
         assert_eq!(op(recv_ring::INCREMENTAL).as_deref(), Some("incremental"));
         assert_eq!(op(recv_ring::PLAIN).as_deref(), Some("plain"));
         assert_eq!(op(recv_ring::LEND_REFUSED).as_deref(), Some("lend_refused"));
-        assert_eq!(op(recv_ring::VIEW_CREATED).as_deref(), Some("view_created"));
-        assert_eq!(
-            op(recv_ring::VIEW_RELEASED).as_deref(),
-            Some("view_released")
-        );
-        assert_eq!(
-            op(recv_ring::VIEW_RELEASE_REMOTE).as_deref(),
-            Some("view_release_remote")
-        );
-        assert_eq!(
-            op(recv_ring::VIEW_RELEASE_DROPPED).as_deref(),
-            Some("view_release_dropped")
-        );
-        assert_eq!(
-            op(recv_ring::HOLD_CAP_COPIED).as_deref(),
-            Some("hold_cap_copied")
-        );
         assert_eq!(op(recv_ring::BYTES_COPIED).as_deref(), Some("bytes_copied"));
-        assert_eq!(
-            op(recv_ring::THRESHOLD_COPIED).as_deref(),
-            Some("threshold_copied")
-        );
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING

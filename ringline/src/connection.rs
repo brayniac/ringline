@@ -161,8 +161,7 @@ pub struct ConnectionState {
     pub recv_direct_slot: u32,
     /// A `forward_to_conn` that sends from this connection's accumulator (a
     /// plaintext source, or a TLS source outside the segmented domain) is
-    /// running; another forward, a segment reader and `forward_to` get
-    /// `EBUSY`.
+    /// running; another forward and `forward_to` get `EBUSY`.
     #[cfg(has_io_uring)]
     pub direct_forwarding: bool,
     /// The hangup poll (`OpTag::HangupPoll`) is in flight.

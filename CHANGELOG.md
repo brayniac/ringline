@@ -31,10 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   region; a larger message borrows a buffer from a per-worker pool of up to
   `ConfigBuilder::recv_direct_pool_max` free bytes (default 16 MiB) and gives
   it back when nothing is buffered and no `Bytes` read from it is alive. A
-  `ConnStream` read arms the receive the same way. Reads that need provided
-  buffers (`segments`, `recv_owned_segment`, `with_segments`,
-  `with_bytes_segments`, `forward_to`) return `io::ErrorKind::Unsupported`
-  on such a connection. `forward_to_conn` from such a connection sends each
+  `ConnStream` read arms the receive the same way. `forward_to`, which needs
+  provided buffers, returns `io::ErrorKind::Unsupported` on such a
+  connection. `forward_to_conn` from such a connection sends each
   received chunk from the accumulator through the sink's send queue,
   zero-copy at or above `send_zc_threshold`. Counters in
   `ringline/recv_direct`. `ConnCtx::is_recv_direct` (also on `Connection`
@@ -78,8 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Connection::recv_arrival` and `RecvHalf::recv_arrival` return a
   `RecvArrival`: when the first and the last byte consumed by the
   connection's most recent reader call arrived. The reader calls are
-  `with_data`, `with_data_result`, `with_bytes`, `with_bytes_segments`,
-  `try_with_data` and, on io_uring, `with_segments`. An arrival time is the
+  `with_data`, `with_data_result`, `with_bytes` and `try_with_data`. An
+  arrival time is the
   time of the batch in which the worker handled the receive that delivered
   the byte: one pass over the reaped completions on io_uring, or over the
   readable sockets on mio. Each TCP connection keeps a log of arrival times
@@ -178,42 +177,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
   listener can be named before any connection has arrived.
-- `metrics::recv_ring::VIEW_CREATED`, `VIEW_RELEASED`, `VIEW_RELEASE_REMOTE`
-  and `VIEW_RELEASE_DROPPED` count `Bytes` views of io_uring receive buffers
-  and their releases (`docs/recv-segment-views-design.md`).
-- `Connection::with_bytes_segments` and `RecvHalf::with_bytes_segments`, on
-  both backends, hand a parser the connection's buffered bytes as `&[Bytes]`
-  and take a `ParseResult`, for parsers that parse a message split across
-  pieces and return a value inside one piece as a slice of it. On io_uring
-  the call enters the segmented receive domain and presents each held
-  receive buffer as a `Bytes` view of the ring buffer, so a value inside one
-  buffer is not copied; a view the caller keeps holds its whole buffer until
-  it drops. After `NeedAtLeast(n)` the parser is not called again until `n`
-  more bytes are buffered. When the hold reaches the receive throttle's cap
-  with the message incomplete, the held bytes are copied into the
-  accumulator. The call resolves to `Err(EBUSY)` while a forward or a
-  `SegmentReader` owns the connection, or when, since it last parked,
-  another reader consumed bytes or the connection left the segmented domain.
-  On mio the parser is shown the
-  accumulator as one piece. Reported by `recv_arrival`.
-- `ConfigBuilder::recv_zc_threshold` (default 4096),
-  `ringline::recv_zc_threshold` and `ringline::copy_small_view`.
-  `copy_small_view(value, threshold)` returns an owned copy of a receive
-  view shorter than `threshold`. On io_uring, called anywhere other than a
-  worker's tasks and its `on_tick` and `on_notify` callbacks, it copies any
-  `Bytes` shorter than `threshold`. It returns other non-empty values
-  unchanged, and an empty value as an empty `Bytes`. A small value a client
-  keeps then does not hold a whole ring buffer. `recv_zc_threshold()`
-  returns the worker's configured value there, or 4096 elsewhere. The runtime does not apply the threshold itself;
-  a client applies it by calling `copy_small_view`.
-  `metrics::recv_ring::THRESHOLD_COPIED` counts the copies.
-- `Connection::end_segments` and `RecvHalf::end_segments` exist on mio,
-  where they return `Ok(())`.
-- `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries
-  `with_bytes_segments` copied at the hold cap, and `BYTES_COPIED` counts
-  bytes copied into receive storage (the accumulator, owned held entries,
-  owned forward copies, queued TLS plaintext and `copy_small_view` copies)
-  on both backends.
+- `metrics::recv_ring::BYTES_COPIED` counts bytes copied into receive
+  storage (the accumulator, owned held entries, owned forward copies and
+  queued TLS plaintext) on both backends.
 - `metrics::CQE_BY_TAG`: completions processed, split by `OpTag`, with
   `metrics::cqe_tag::COUNT` sizing the group. The slot index is the tag's
   discriminant, and `CQE_BY_TAG` plus `ring::CQE_UNKNOWN_TAG` partition
@@ -272,7 +238,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its handshake is done, as a plaintext connection's direct receive is, so a
   task that does not read stops its peer instead of buffering up to
   `recv_accumulator_max` (1 GiB by default). During the handshake, in the
-  segmented domain (a `forward_to` source or a segment reader), and after
+  segmented domain (a `forward_to` source), and after
   the peer closes, the receive is re-armed after each completion. A loop
   that polls `try_with_data` without ever parking a read no longer sees new
   bytes, as on a plaintext connection. A TLS connection now arms the
@@ -288,24 +254,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not read holds worker exit for up to its bound, as any guarded send does.
   A `forward_to_conn` from a TLS source in the segmented domain forwards
   from its hold and writes to the sink directly, unordered with other sends
-  on the sink. A TLS source is in that domain while a `segments` reader is
-  live, after `recv_owned_segment`, `with_segments` or `with_bytes_segments`
-  until `end_segments`, and after a `forward_to` that failed on a write. A
-  segment reader or `forward_to` started while a `forward_to_conn` sends
-  from the accumulator gets `EBUSY`, and so does `with_segments` while any
-  forward runs. `recv_multishot` has no effect: TLS connections, the only
+  on the sink. A TLS source is in that domain after a `forward_to` that
+  failed on a write. A `forward_to` started while a `forward_to_conn` sends
+  from the accumulator gets `EBUSY`. `recv_multishot` has no effect: TLS
+  connections, the only
   ones it affected, always arm one-shot receives.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from
   `connect` or `connect_unix`, receives directly into its accumulator (see
   Added), and no option gives it the provided-buffer ring. On such a
-  connection `segments`, `recv_owned_segment`, `with_segments`,
-  `with_bytes_segments` and `forward_to` return
-  `io::ErrorKind::Unsupported`, and `try_with_data` returns `None` while a
-  receive is in flight. They work on TLS connections; on mio only
-  `with_bytes_segments` exists, and it presents the accumulator. There is no
-  replacement for them on a plaintext connection on io_uring. Such a
+  connection `forward_to` returns `io::ErrorKind::Unsupported`, and
+  `try_with_data` returns `None` while a receive is in flight. `forward_to`
+  works on TLS connections. There is no replacement for it on a plaintext
+  connection on io_uring. Such a
   connection has a receive armed only when a read parks, and a `POLLRDHUP`
   poll armed when it opens. A FIN or reset from the peer closes a connection
   that nothing reads, and `is_alive` returns `false`. If bytes the peer sent
@@ -356,12 +318,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     and a `with_` setter (`with_max_field_section_size`, which the h3 docs
     already named, now exists).
 - `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
-  later, as the other crates do; views use `Bytes::from_owner` (1.9). On
-  io_uring a provided-buffer ring's buffers are an anonymous mapping, shared
-  through an `Arc` with views of them, instead of a heap `Vec`.
-- On io_uring, `RecvHalf::segments` and `RecvHalf::recv_owned_segment` keep a
-  completion lent before the call in its ring buffer, as a pinned entry,
-  instead of copying it into an owned one.
+  later, as the other crates do. On io_uring a provided-buffer ring's
+  buffers are an anonymous mapping instead of a heap `Vec`.
 - **Breaking (`ringline-redis`, `ringline-memcache`, `ringline-ping`):**
   `CommandResult` is `#[non_exhaustive]`. Code outside the crates reads it
   in an `on_result` callback and can no longer construct it.
@@ -608,15 +566,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   accept paths gate on it, so keying it by listener is a separate change.
   Step 1 of `docs/listeners-and-accept-design.md` (#443).
 
-- **Breaking (io_uring):** `ConnCtx::segments()` and
-  `ConnCtx::recv_owned_segment()` now return `io::Result<_>` and refuse a
-  conflicting entry instead of silently producing a reader that can never
-  deliver: `EBUSY` while a `SegmentReader` is live or a Mode A forward is
-  running, `EPIPE` on a stale handle whose slot was recycled. Previously the
-  conflict either surfaced one poll later as an error from `next()`, or — for
-  the forward and stale cases added in #425 — could only be refused silently,
-  because the signature had no error channel. Callers add `?` or a `match`.
-  Step 1 of `docs/connection-handle-ownership-design.md`.
 - mio: the connection lifecycle now follows io_uring's model. A peer FIN or
   a read error requests teardown immediately (`close_connection`), and
   teardown finalizes once queued sends have drained — a response sent after
@@ -654,6 +603,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** the segment readers `segments`, `recv_owned_segment`,
+  `with_segments` and `end_segments` (on `ConnCtx` in 0.6, io_uring only),
+  and the types only they used: `SegmentReader`, `RecvSegment`,
+  `RecvOwnedSegment`, `SegChain`, `SegConsumed` and `WithSegmentsFuture`.
+  They read held buffers of the provided-buffer ring, which on io_uring only
+  a TLS connection receives through. Parse with `with_bytes`, whose parser
+  gets the buffered bytes as one `Bytes` it can slice without copying, or
+  with `with_data`. `forward_to` and `forward_to_conn` remain.
+- **Breaking:** `metrics::pool::SEGMENT_STRANDED_ADOPTED`, the
+  `segment_stranded_adopted` op of `ringline/pool`, which counted bytes a
+  segment reader found in the accumulator. Slot 7 of the group is unused.
 - **Breaking:** `enable_recv_forward`, `forward_held`, `run_direct_echo`
   (io_uring only, with `DirectEchoFuture`), `set_recv_sink` and
   `take_recv_sink`, wherever `ConnCtx`, `Connection` or `RecvHalf` had them,
@@ -741,11 +701,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A TLS send made after the alert is queued returns `NotConnected`, since
   the peer discards records that follow it; on mio such a send goes out
   ahead of the alert.
-- io_uring: a TLS connection that is a `forward_to` source, or has a segment
-  reader, stops receiving once its hold reaches the hold cap
-  (`forward_hold_cap`; without `recv_incremental`, at most a quarter of the
-  receive ring's buffers) and receives again once the hold drains. Before,
-  it kept receiving whatever its sink or reader did, its hold grew to
+- io_uring: a TLS connection that is a `forward_to` source stops receiving
+  once its hold reaches the hold cap (`forward_hold_cap`; without
+  `recv_incremental`, at most a quarter of the receive ring's buffers) and
+  receives again once the hold drains. Before, it kept receiving whatever
+  its sink did, its hold grew to
   `recv_accumulator_max` (1 GiB by default), and the connection was then
   closed. A plaintext connection receives only when a read or a forward asks
   for bytes, so it was already stopped.
@@ -879,16 +839,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   8 MiB limit a guard smaller than 8 MiB can reach it. A `send_chain` with a
   guard part still fails on `-ENOMEM`, as on any send error (#642).
 
-- On io_uring, one segment reader or `forward_to` source whose consumer
-  stops draining what it holds no longer grows memory without limit. A
-  segment reader (`segments()`, `with_segments`, `recv_owned_segment`) that
-  stopped reading made the worker copy everything its peer sent (a test
-  client wrote 64 MiB unread). The `forward_hold_cap` receive throttle,
-  which applied only to `forward_to` sources, now applies to segment
-  readers too, at `forward_hold_cap` held entries, lowered to a quarter of
-  the receive ring's buffers for segment holds without `recv_incremental`:
-  its multishot receive is cancelled so only its peer is stopped, and it is
-  re-armed once the hold drains. The buffers a connection's sends hold count
+- On io_uring, the `forward_hold_cap` receive throttle of a `forward_to`
+  source is lowered to a quarter of the receive ring's buffers without
+  `recv_incremental`, and the buffers a connection's sends hold count
   toward its cap: those of a `forward_recv_buf` send of a lent receive
   buffer, and the ring buffers a `forward_to` write pins (#638). The cap is
   checked as completions arrive, so a multishot receive can take buffers

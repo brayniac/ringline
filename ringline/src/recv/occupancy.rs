@@ -2,7 +2,7 @@
 //!
 //! Given the recv ring's live free-buffer count and a low-water reserve, decide
 //! whether a fresh delivery may be handed out as a held (zero-copy) segment or
-//! must be force-copied (Mode C) so the buffer returns to the ring immediately.
+//! must be force-copied so the buffer returns to the ring immediately.
 //! This keeps transient consumers making progress under ring pressure: once the
 //! shared per-worker ring's free count drops to the reserve, everyone copies at
 //! delivery, so a well-behaved connection is never starved of a buffer by
@@ -10,7 +10,7 @@
 //!
 //! No I/O; unit-tested on both backends. Consulted by the io_uring segmented
 //! recv hold branch (`handle_recv_multi`): once the shared ring's `free()` drops
-//! to the reserve, deliveries force-copy (Mode C) instead of pinning. The mio
+//! to the reserve, deliveries force-copy instead of pinning. The mio
 //! backend has no provided-buffer ring, so it does not consult this (dead there
 //! outside the unit tests).
 #![cfg_attr(not(has_io_uring), allow(dead_code))]
