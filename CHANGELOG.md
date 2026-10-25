@@ -704,9 +704,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: `send_chain` and `send_chain_nowait` on a plaintext connection
-  did not check the handle's generation. A stale handle (its connection
-  closed and the slot reused) submitted the chain on the slot's new
+- io_uring: `send_chain` and `send_chain_nowait` did not check the
+  handle's generation when the handle's slot held a plaintext connection. A
+  stale handle (its connection closed, with or without TLS, and the slot
+  reused by a plaintext connection) submitted the chain on the slot's new
   occupant, so the bytes went to that connection's socket. The completion
   handlers discarded the chain's CQEs, which carried the old generation, so
   the chain stayed active on the new occupant. Until the worker exited, the
