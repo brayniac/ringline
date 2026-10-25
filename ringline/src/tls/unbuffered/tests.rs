@@ -950,3 +950,89 @@ fn close_notify_reports_a_dropped_queued_record() {
         "no alert was sent, so the close deadline must not be armed"
     );
 }
+
+/// A client that rustls holds a partial post-handshake handshake message
+/// for: the server's NewSessionTicket is split across 32-byte records, and
+/// only the first has been fed. rustls keeps its offset into the buffer it
+/// was handed.
+#[cfg(has_io_uring)]
+fn client_with_partial_ticket() -> TlsConn {
+    let (mut server, mut client) = conn_pair_with_fragment(Some(32));
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    let (_, hello) = pump(&mut client, &[], &mut accs);
+    let (_, flight) = pump(&mut server, &hello, &mut accs);
+    let mut finished = Vec::new();
+    // One record at a time, so no single feed is large.
+    for record in split_records(&flight) {
+        let (outcome, out) = pump(&mut client, record, &mut accs);
+        assert!(!matches!(outcome, DriveOutcome::Error(_)), "{outcome:?}");
+        finished.extend_from_slice(&out);
+    }
+    assert!(!client.conn.is_handshaking());
+    let (_, tickets) = pump(&mut server, &finished, &mut accs);
+    let records = split_records(&tickets);
+    assert!(
+        records.len() >= 2,
+        "the ticket spans {} records",
+        records.len()
+    );
+    let (outcome, _) = pump(&mut client, records[0], &mut accs);
+    assert!(!matches!(outcome, DriveOutcome::Error(_)), "{outcome:?}");
+    let (_, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+    assert!(
+        !incoming.is_empty(),
+        "rustls keeps the partial ticket's record"
+    );
+    client
+}
+
+/// Split a buffer of whole TLS records into the records.
+#[cfg(has_io_uring)]
+fn split_records(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut records = Vec::new();
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        let len = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as usize;
+        records.push(&bytes[i..i + 5 + len]);
+        i += 5 + len;
+    }
+    records
+}
+
+/// A send while a receive is in flight hands rustls the same unprocessed
+/// bytes as without one. rustls keeps an offset into those bytes for a
+/// partial handshake message; handing it fewer panics in rustls.
+#[cfg(has_io_uring)]
+#[test]
+fn a_send_while_a_receive_is_in_flight_sees_the_partial_message() {
+    let mut client = client_with_partial_ticket();
+    let (_, room) = client
+        .conn
+        .as_unbuffered_mut()
+        .unwrap()
+        .arm_recv(32 * 1024)
+        .expect("room");
+    assert!(room > 0);
+    let mut dst = [0u8; 4096];
+    encrypt_chunk(&mut client, b"hello", &mut dst).expect("encrypt during the receive");
+    // SAFETY: nothing was written.
+    unsafe { client.conn.as_unbuffered_mut().unwrap().recv_done(0) };
+}
+
+/// As for a send, a close_notify while a receive is in flight.
+#[cfg(has_io_uring)]
+#[test]
+fn a_close_notify_while_a_receive_is_in_flight_sees_the_partial_message() {
+    let mut client = client_with_partial_ticket();
+    client
+        .conn
+        .as_unbuffered_mut()
+        .unwrap()
+        .arm_recv(32 * 1024)
+        .expect("room");
+    let mut out = Vec::new();
+    queue_close_notify(&mut client, &mut out).expect("close_notify during the receive");
+    assert!(!out.is_empty(), "the alert was produced");
+    // SAFETY: nothing was written.
+    unsafe { client.conn.as_unbuffered_mut().unwrap().recv_done(0) };
+}

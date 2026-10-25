@@ -29,11 +29,11 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
-/// Direct receives, on plaintext connections from `connect` and
-/// `connect_unix`.
+/// Direct receives on io_uring: into a plaintext connection's accumulator,
+/// or into a TLS connection's ciphertext buffer.
 #[metric(
     name = "ringline/recv_direct",
-    description = "Direct receives into connection accumulators: armed, sized for a known length, bytes, stale, pooled buffers reused and allocated"
+    description = "Direct receives into connection accumulators and TLS ciphertext buffers: armed, sized for a known length, bytes, stale, pooled buffers reused and allocated"
 )]
 pub static RECV_DIRECT: ShardedCounterGroup = ShardedCounterGroup::new(recv_direct::COUNT);
 
@@ -328,7 +328,7 @@ pub mod recv_direct {
     /// at least `recv_direct_region`, into a buffer grown to hold the rest of
     /// the message.
     pub const KNOWN_LENGTH: usize = 1;
-    /// Bytes the kernel wrote into accumulators.
+    /// Bytes the kernel wrote into accumulators and TLS ciphertext buffers.
     pub const BYTES: usize = 2;
     /// Completions whose connection had closed or whose slot was reused.
     pub const STALE: usize = 3;

@@ -73,7 +73,7 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 
 | Operation | Syscalls per event | Mechanism |
 |---|---:|---|
-| Receive a message | **0** | A plaintext connection submits a one-shot `RECV` into its accumulator when a read parks (`docs/recv-direct-design.md`): 1 SQE per completion, plus one `POLL_ADD(POLLRDHUP)` per connection, armed when it opens. When the poll fires with no receive in flight, a `MSG_PEEK` recv checks for bytes queued ahead of the end. A TLS connection arms a one-shot buffer-select recv (`Op::RecvSelect` + provided buffers), 1 SQE per received buffer, submitted by the iteration's shared enter. During the handshake it is re-armed when it completes; after it, when a read parks. It arms the same `POLL_ADD(POLLRDHUP)`, and when the poll fires a receive reads the rest of the stream; there is no peek. |
+| Receive a message | **0** | A plaintext connection submits a one-shot `RECV` into its accumulator when a read parks (`docs/recv-direct-design.md`): 1 SQE per completion, plus one `POLL_ADD(POLLRDHUP)` per connection, armed when it opens. When the poll fires with no receive in flight, a `MSG_PEEK` recv checks for bytes queued ahead of the end. A TLS connection submits the same one-shot `RECV`, into its TLS engine's ciphertext buffer, 1 SQE per completion, submitted by the iteration's shared enter. During the handshake it is re-armed when it completes; after it, when a read parks. It arms the same `POLL_ADD(POLLRDHUP)`, and when the poll fires a receive reads the rest of the stream; there is no peek. |
 | Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_WAITALL`, so the kernel retries short sends in place), and a send wider than one send-pool slot goes out as `opcode::SendMsg` SQEs of up to 32 slots each (per-slot `opcode::Send`s if the send slab is full); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | Timeout SQE / timeout CQE. |
@@ -174,13 +174,13 @@ count; zero-copy send is the exception the ZC rows note.
 
 | Step | Copies | Mechanism |
 |---|---:|---|
-| Kernel → provided buffer (TLS, io_uring) | 0 | The receive fills a `ProvidedBufRing` buffer selected at completion time; the ciphertext goes to rustls (the TLS receive rows). |
+| Kernel → TLS engine buffer (TLS, io_uring) | 0 | A one-shot `RECV` of ciphertext, armed when a read parks: into the unbuffered engine's `CiphertextBuf`, or with `tls-buffered` into a worker buffer that `read_tls` reads (the TLS receive rows). |
 | Kernel → read buffer (TLS, mio) | 0 | `read()` into the per-worker 8192-byte buffer; the ciphertext goes to rustls (the TLS receive rows). |
 | Read buffer → `RecvAccumulator` (mio) | 1 | `read()` into a per-worker buffer, then `extend_from_slice` into the per-connection contiguous accumulator. |
 | Kernel → `RecvAccumulator` (plaintext, io_uring) | 0 | A one-shot `RECV` into the accumulator's free space, armed when a read parks. Growing the accumulator for a longer message can copy the part already received (`docs/recv-direct-design.md`). |
 | Accumulator → `with_data(\|&[u8]\|)` | 0 borrowed | The parser sees a borrowed slice and must copy anything it keeps. |
 | Accumulator → `with_bytes(\|Bytes\|)` | 0 | `BytesMut::freeze()` and `Bytes::slice()` are O(1) refcount operations; parsed values are refcounted sub-slices that stay valid after the accumulator advances. |
-| TLS receive, unbuffered engine (default) | +3 | Ciphertext is copied into `CiphertextBuf`; rustls decrypts in place there, then copies each record's plaintext into a new `Vec` that `ReadTraffic::next_record` lends out; ringline copies it into the accumulator. `CiphertextBuf::compact` moves ciphertext too: measured 0.94× the payload at 16 KiB records arriving in 16 KiB buffers, 0.02–0.04× at 1 KiB. |
+| TLS receive, unbuffered engine (default) | +2 on io_uring, +3 on mio | On io_uring the receive writes ciphertext into `CiphertextBuf`; on mio `append` copies it there from the read buffer. rustls decrypts in place there, then copies each record's plaintext into a new `Vec` that `ReadTraffic::next_record` lends out; ringline copies it into the accumulator. `CiphertextBuf::compact` moves ciphertext too: measured 0.94× the payload at 16 KiB records arriving in 16 KiB buffers, 0.02–0.04× at 1 KiB, before TLS received directly (receives are now up to `recv_direct_region`, 32 KiB by default; not remeasured). |
 | TLS receive, buffered engine (`tls-buffered`) | +3 | Ciphertext is copied into rustls' deframer buffer (`read_tls`); rustls decrypts in place and copies each record's plaintext into a new `Vec` (`take_received_plaintext`, one allocation per record); `drain_tls_plaintext` copies it into the accumulator. `DeframerVecBuffer::discard` also memmoves the ciphertext behind each processed record: measured 0.12× the payload at 16 KiB records, 2.3× at 1 KiB. |
 
 `with_data` vs `with_bytes` is the single biggest receive-side copy decision a
@@ -251,11 +251,14 @@ fully zero-copy.
 > [`tls-unbuffered-design.md`](tls-unbuffered-design.md) and
 > [`journal/2026-09-unbuffered-tls.md`](journal/2026-09-unbuffered-tls.md).
 
-TLS *receive* costs 3 copies on both engines, measured with rustls 0.23.46 on
-both backends: ciphertext into a contiguous buffer (`CiphertextBuf`, or rustls'
-deframer buffer), decrypted plaintext into a per-record `Vec`
-(`CommonState::take_received_plaintext` → `Payload::into_vec`, where the payload
-is always `Borrowed`), and that `Vec` into the accumulator.
+TLS *receive* costs 3 copies on mio with either engine and on io_uring with
+`tls-buffered`, measured with rustls 0.23.46: ciphertext into a contiguous
+buffer (`CiphertextBuf`, or rustls' deframer buffer), decrypted plaintext into
+a per-record `Vec` (`CommonState::take_received_plaintext` →
+`Payload::into_vec`, where the payload is always `Borrowed`), and that `Vec`
+into the accumulator. With the unbuffered engine on io_uring the receive
+writes the ciphertext into `CiphertextBuf`, so the first copy is not made and
+a TLS receive costs 2 (from the code; not measured).
 The unbuffered engine decrypts in place, but `ReadTraffic::next_record` hands
 out the copied `Vec` (the incoming-ciphertext buffer is kept only "for forwards
 compatibility"). Each record also costs one heap allocation. `note_copied` counts only ringline's own copy.

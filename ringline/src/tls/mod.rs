@@ -487,6 +487,11 @@ pub struct TlsTable {
     /// `PoolWriter` and don't need it.
     #[cfg(not(has_io_uring))]
     write_buf: Vec<u8>,
+    /// Free buffers for direct receives on the buffered engine, which reads
+    /// ciphertext from a slice rather than receiving into its own buffer.
+    /// One is taken per receive in flight and returned on its completion.
+    #[cfg(all(has_io_uring, feature = "tls-buffered"))]
+    recv_buffers: Vec<Vec<u8>>,
 }
 
 impl TlsTable {
@@ -520,6 +525,8 @@ impl TlsTable {
             client_config,
             #[cfg(not(has_io_uring))]
             write_buf: Vec::new(),
+            #[cfg(all(has_io_uring, feature = "tls-buffered"))]
+            recv_buffers: Vec::new(),
         }
     }
 
@@ -922,6 +929,26 @@ mod tests {
             TlsTable::with_listener_configs(4, Some(config), Some(client_config()), Vec::new());
         table.create(0, None).expect("create a server connection");
         table
+    }
+
+    /// With the buffered engine a receive takes a buffer from the table's
+    /// free list and gives it back when it ends, so the list holds at most
+    /// as many buffers as receives were in flight at once.
+    #[cfg(all(has_io_uring, feature = "tls-buffered"))]
+    #[test]
+    fn buffered_receives_reuse_the_free_buffers() {
+        let mut table = table_with_server(None);
+        table.create(1, None).expect("create a second connection");
+        let a = tls_recv_arm(&mut table, 0, 1024).expect("arm");
+        let b = tls_recv_arm(&mut table, 1, 1024).expect("arm");
+        assert!(a.len == 1024 && a.buf.as_ref().is_some_and(|b| b.capacity() >= 1024));
+        tls_recv_cancel(&mut table, 0, a.buf);
+        tls_recv_cancel(&mut table, 1, b.buf);
+        assert_eq!(table.recv_buffers.len(), 2);
+        let c = tls_recv_arm(&mut table, 0, 1024).expect("arm");
+        assert_eq!(table.recv_buffers.len(), 1, "a free buffer was reused");
+        tls_recv_cancel(&mut table, 0, c.buf);
+        assert_eq!(table.recv_buffers.len(), 2);
     }
 
     // The whole point of storing the fragment size already subtracted. The

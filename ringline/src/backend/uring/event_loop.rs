@@ -1314,6 +1314,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             cs.recv_direct_armed = false;
         }
+        let buf = match entry.buf {
+            crate::backend::uring::driver::DirectRecvBuf::Accumulator(buf) => buf,
+            crate::backend::uring::driver::DirectRecvBuf::Tls(buf) => {
+                if !live {
+                    metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
+                    // A closing connection still has its TLS state: end the
+                    // receive there (`tls_recv_cancel`) so `release_tls_state`
+                    // finds none in flight. Once the state is gone, `buf`
+                    // holds whatever the receive owned and drops here.
+                    let same = self.driver.connections.generation(conn_index) == entry.generation;
+                    if same
+                        && let Some(t) =
+                            self.driver.tls_table.as_mut().filter(|t| t.has(conn_index))
+                    {
+                        crate::tls::tls_recv_cancel(t, conn_index, buf);
+                    }
+                    return;
+                }
+                self.handle_tls_recv_direct(conn_index, entry.generation, buf, result);
+                return;
+            }
+        };
         if !live {
             if let Some(cs) = self.driver.connections.get_mut(conn_index)
                 && cs.generation == entry.generation
@@ -1321,7 +1343,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 cs.recv_direct_held = 0;
             }
             metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
-            self.driver.accumulators.recycle_direct(entry.buf);
+            self.driver.accumulators.recycle_direct(buf);
             return;
         }
         let received = result.max(0) as usize;
@@ -1333,7 +1355,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         unsafe {
             self.driver
                 .accumulators
-                .attach_received(conn_index, entry.buf, received);
+                .attach_received(conn_index, buf, received);
         }
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_direct_held = 0;
@@ -1383,11 +1405,184 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.close_connection(conn_index);
     }
 
+    /// Act on what feeding received ciphertext to a TLS connection
+    /// produced: finish the handshake (wake the connect waiter or spawn the
+    /// accept task), wake the reader, or close the connection on an error or
+    /// the peer's close_notify.
+    fn apply_tls_recv_result(&mut self, conn_index: u32, result: crate::tls::TlsRecvResult) {
+        match result {
+            crate::tls::TlsRecvResult::HandshakeJustCompleted { peer_closed } => {
+                let is_outbound = self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .map(|c| c.outbound)
+                    .unwrap_or(false);
+
+                if is_outbound {
+                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                        cs.established = true;
+                    }
+                    // Wake connect waiter.
+                    self.executor.wake_connect(conn_index, Ok(()));
+                } else {
+                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                        cs.established = true;
+                    }
+                    metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
+                    metrics::CONNECTIONS_ACTIVE.increment();
+                    // Spawn async task for accepted connection.
+                    self.spawn_accept_task(conn_index);
+                }
+
+                // Wake recv waiter if data accumulated during handshake.
+                self.executor.wake_recv(conn_index);
+
+                // The peer's close_notify came in the same feed as its
+                // last handshake flight. Handle it as the `Closed` arm
+                // does: the task reads what arrived, then EOF.
+                if peer_closed {
+                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                        cs.note_eof(false);
+                    }
+                    self.driver.close_connection(conn_index);
+                }
+            }
+            crate::tls::TlsRecvResult::Ok => {
+                self.executor.wake_recv(conn_index);
+            }
+            crate::tls::TlsRecvResult::Error(e) => {
+                // Wake connect waiter if handshake hasn't completed yet.
+                let established = self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .map(|c| c.established)
+                    .unwrap_or(false);
+                if !established {
+                    let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
+                    self.executor.wake_connect(conn_index, Err(err));
+                }
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+            }
+            crate::tls::TlsRecvResult::Closed => {
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.note_eof(false);
+                }
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+            }
+        }
+    }
+
+    /// Completion of a live TLS connection's direct receive
+    /// (`tls_recv_arm`): `buf` is what the receive owned, and `result` the
+    /// bytes the kernel wrote, or an error. The bytes are fed to the engine,
+    /// and the receive is re-armed while the handshake runs or after a hangup
+    /// (`rearms_after_completion`); otherwise the next parked read arms it.
+    /// Every path ends the receive in the engine.
+    fn handle_tls_recv_direct(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        buf: Option<Vec<u8>>,
+        result: i32,
+    ) {
+        if result <= 0 {
+            if let Some(t) = self.driver.tls_table.as_mut() {
+                crate::tls::tls_recv_cancel(t, conn_index, buf);
+            }
+            if result == 0 {
+                // TCP FIN. Only a clean end of stream if the peer's
+                // close_notify was processed first; otherwise a truncation,
+                // which reads resolve to as `UnexpectedEof`.
+                let close_notify_seen = self
+                    .driver
+                    .tls_table
+                    .as_mut()
+                    .and_then(|t| t.get_mut(conn_index))
+                    .map(|tc| tc.peer_sent_close_notify);
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.note_eof(close_notify_seen == Some(false));
+                }
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+                return;
+            }
+            if -result == libc::ECANCELED {
+                // Cancelled by a close or `cancel`: a parked reader resolves.
+                self.executor.wake_recv(conn_index);
+                return;
+            }
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.read = ReadHalf::Error;
+            }
+            let established = self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.established);
+            if !established {
+                self.executor
+                    .wake_connect(conn_index, Err(io::Error::from_raw_os_error(-result)));
+            }
+            self.executor.fail_recv(
+                conn_index,
+                generation,
+                io::Error::from_raw_os_error(-result),
+            );
+            self.driver.close_connection(conn_index);
+            return;
+        }
+        let received = result as usize;
+        metrics::BYTES.add(metrics::bytes::RECEIVED, received as u64);
+        metrics::RECV_DIRECT.add(metrics::recv_direct::BYTES, received as u64);
+        self.withdraw_park_offer(conn_index);
+        // The feed's plaintext is recorded as the growth of `recv_buffered`,
+        // all at this batch's time.
+        let buffered_before_feed = self.driver.arrival_feed_start(conn_index);
+        let Some(tls_table) = self.driver.tls_table.as_mut() else {
+            return;
+        };
+        // SAFETY: the receive came from `tls_recv_arm` for this connection,
+        // and the kernel wrote `received` bytes at its target, within the
+        // length it was armed with.
+        let tls_result = unsafe {
+            crate::tls::feed_tls_received(
+                tls_table,
+                &mut self.driver.accumulators,
+                &mut self.driver.send_copy_pool,
+                conn_index,
+                generation,
+                buf,
+                received,
+                &mut self.driver.tls_out_scratch,
+            )
+        };
+        self.driver
+            .arrival_feed_end(conn_index, buffered_before_feed);
+        // TLS output (handshake responses, alerts) goes through the send
+        // queue, including on the error path, where an alert should still go
+        // out before the close.
+        if !self.driver.tls_out_scratch.is_empty() {
+            let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
+            self.driver.queue_built_sends(conn_index, &mut sends);
+            self.driver.tls_out_scratch = sends;
+        }
+        self.apply_tls_recv_result(conn_index, tls_result);
+        if self.driver.rearms_after_completion(conn_index)
+            && self.driver.arm_direct_recv_or_close(conn_index, None)
+        {
+            self.executor.wake_recv(conn_index);
+        }
+    }
+
     /// Completion of a direct or TLS connection's hangup poll
     /// (`OpTag::HangupPoll`): the peer sent a FIN or a reset, or the socket
     /// has an error. On a TLS connection it sets `hangup_seen` and arms a
-    /// ring receive, which is then re-armed after each completion until the
-    /// end is read. On a direct connection: with a receive in flight, that
+    /// receive, which is then re-armed after each completion until the end
+    /// is read. On a direct connection: with a receive in flight, that
     /// receive sees it, and the
     /// connection goes on `hangup_rechecks` in case the receive returns bytes
     /// queued ahead of the end. With none, the hangup peek finds out whether
@@ -1407,11 +1602,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         if !cs.recv_direct {
-            // A TLS connection reads the rest of the stream through its ring
+            // A TLS connection reads the rest of the stream through its
             // receive: re-armed after every completion from here until it reads
             // the close_notify, returns 0 at the FIN, or fails.
             cs.hangup_seen = true;
-            self.driver.arm_tls_recv_if_idle(conn_index);
+            if self.driver.arm_direct_recv_or_close(conn_index, None) {
+                self.executor.wake_recv(conn_index);
+            }
             return;
         }
         if cs.hangup_peek_armed {
@@ -1853,109 +2050,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .is_some_and(|t| t.has(conn_index));
 
         // Every plaintext delivery is recorded before the bytes are lent or
-        // go to the accumulator. TLS records the plaintext the feed delivers,
-        // below.
+        // go to the accumulator.
         if !is_tls_conn {
             self.driver
                 .record_arrival(conn_index, bytes_received as usize);
         }
 
         if is_tls_conn {
-            // The ciphertext bid is replenished immediately (TLS decrypts into
-            // rustls's own buffer, so the provided buffer is free at feed time).
+            // A TLS connection receives directly (`handle_tls_recv_direct`),
+            // and `submit_tcp_recv` asserts that none is armed on the ring.
+            debug_assert!(false, "ring receive completed on a TLS connection");
             self.driver.pending_replenish.push(bid);
-            // The feed's plaintext is recorded as the growth of
-            // `recv_buffered`, all at this batch's time.
-            let buffered_before_feed = self.driver.arrival_feed_start(conn_index);
-            {
-                let tls_table = self.driver.tls_table.as_mut().unwrap();
-                let result = crate::tls::feed_tls_recv(
-                    tls_table,
-                    &mut self.driver.accumulators,
-                    &mut self.driver.send_copy_pool,
-                    conn_index,
-                    self.driver.connections.generation(conn_index),
-                    data,
-                    &mut self.driver.tls_out_scratch,
-                );
-                self.driver
-                    .arrival_feed_end(conn_index, buffered_before_feed);
-
-                // Route collected TLS output (handshake responses, alerts)
-                // through the per-connection send queue — including on the
-                // Error path, where an alert should still go out before the
-                // close below.
-                if !self.driver.tls_out_scratch.is_empty() {
-                    let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
-                    self.driver.queue_built_sends(conn_index, &mut sends);
-                    self.driver.tls_out_scratch = sends;
-                }
-
-                match result {
-                    crate::tls::TlsRecvResult::HandshakeJustCompleted { peer_closed } => {
-                        let is_outbound = self
-                            .driver
-                            .connections
-                            .get(conn_index)
-                            .map(|c| c.outbound)
-                            .unwrap_or(false);
-
-                        if is_outbound {
-                            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                                cs.established = true;
-                            }
-                            // Wake connect waiter.
-                            self.executor.wake_connect(conn_index, Ok(()));
-                        } else {
-                            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                                cs.established = true;
-                            }
-                            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
-                            metrics::CONNECTIONS_ACTIVE.increment();
-                            // Spawn async task for accepted connection.
-                            self.spawn_accept_task(conn_index);
-                        }
-
-                        // Wake recv waiter if data accumulated during handshake.
-                        self.executor.wake_recv(conn_index);
-
-                        // The peer's close_notify came in the same feed as its
-                        // last handshake flight. Handle it as the `Closed` arm
-                        // does: the task reads what arrived, then EOF.
-                        if peer_closed {
-                            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                                cs.note_eof(false);
-                            }
-                            self.driver.close_connection(conn_index);
-                        }
-                    }
-                    crate::tls::TlsRecvResult::Ok => {
-                        self.executor.wake_recv(conn_index);
-                    }
-                    crate::tls::TlsRecvResult::Error(e) => {
-                        // Wake connect waiter if handshake hasn't completed yet.
-                        let established = self
-                            .driver
-                            .connections
-                            .get(conn_index)
-                            .map(|c| c.established)
-                            .unwrap_or(false);
-                        if !established {
-                            let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
-                            self.executor.wake_connect(conn_index, Err(err));
-                        }
-                        self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
-                    }
-                    crate::tls::TlsRecvResult::Closed => {
-                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                            cs.note_eof(false);
-                        }
-                        self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
-                    }
-                }
-            }
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
         } else {
             // Zero-copy fast path: if no pending buffer AND accumulator is
             // empty, hold the kernel buffer in-place instead of copying.
@@ -2696,7 +2804,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // The handshake's receives are armed after each completion; once
             // it is done, a parked read arms them. The hangup poll covers a
             // peer close while nothing reads.
-            self.arm_recv(conn_index);
+            let _ = self.driver.arm_direct_recv_or_close(conn_index, None);
             self.driver.arm_hangup_poll(conn_index);
             return;
         }
@@ -4177,7 +4285,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.mark_connected();
             }
-            self.arm_recv(conn_index);
+            if self.driver.arm_direct_recv_or_close(conn_index, None) {
+                let err = std::io::Error::other("TLS receive could not be armed");
+                self.executor.wake_connect(conn_index, Err(err));
+                return;
+            }
             self.driver.arm_hangup_poll(conn_index);
             return;
         }
@@ -4260,9 +4372,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        if let Some(ref mut tls_table) = self.driver.tls_table {
-            tls_table.remove(conn_index);
-        }
+        self.driver.release_tls_state(conn_index);
 
         if was_established {
             metrics::CONNECTIONS.increment(metrics::conn::CLOSED);
@@ -9372,7 +9482,12 @@ mod tests {
     /// buffer held by direct-receive entry `slot`.
     fn write_direct_landing(el: &mut AsyncEventLoop<NoopHandler>, slot: usize, data: &[u8]) {
         let entry = el.driver.direct_recvs[slot].as_mut().expect("entry in use");
-        let spare = entry.buf.spare_capacity_mut();
+        let spare = match &mut entry.buf {
+            crate::backend::uring::driver::DirectRecvBuf::Accumulator(b) => b.spare_capacity_mut(),
+            crate::backend::uring::driver::DirectRecvBuf::Tls(_) => {
+                unreachable!("a plaintext direct receive")
+            }
+        };
         for (d, &b) in spare.iter_mut().zip(data) {
             d.write(b);
         }
@@ -14793,6 +14908,57 @@ mod tests {
         };
         el.driver.tls_table = Some(table);
         peer
+    }
+
+    /// A Close that completes before the TLS receive it cancelled moves the
+    /// receive's buffer allocation out of the dropped TLS state into the
+    /// receive's entry, which frees it when the receive completes. The
+    /// receive's SQE is pushed but never submitted, so the kernel never writes
+    /// into the allocation this test frees.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn a_close_before_the_tls_receive_completes_moves_the_allocation() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(UserData::encode(OpTag::Close, conn_index, 0).raw(), 0, 0);
+        assert!(matches!(
+            &el.driver.direct_recvs[slot as usize],
+            Some(crate::backend::uring::driver::DirectRecv {
+                buf: crate::backend::uring::driver::DirectRecvBuf::Tls(Some(_)),
+                ..
+            })
+        ));
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::ECANCELED,
+            0,
+        );
+        assert!(el.driver.direct_recvs[slot as usize].is_none());
+    }
+
+    /// Worker shutdown with a TLS receive in flight ends the receive in the TLS
+    /// state before the Close drops it, so the Close finds none in flight.
+    #[test]
+    fn shutdown_ends_an_in_flight_tls_receive() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        el.driver.ring.flush().unwrap();
+        el.driver.run_shutdown();
+        assert!(el.driver.direct_recvs.iter().all(Option::is_none));
+        assert!(el.driver.connections.get(conn_index).is_none());
+        assert!(!el.driver.tls_table.as_ref().unwrap().has(conn_index));
     }
 
     /// Run `conn_index`'s queued sends through the real ring until it is idle,

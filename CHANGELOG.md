@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `connect_unix`, receives into its own accumulator instead of the shared
   provided buffer ring: a one-shot `RECV` into the accumulator's free space,
   armed when a read parks. There is no option to turn it off; a TLS
-  connection receives through the ring. `with_data`, `with_bytes`,
+  connection receives directly too (see Changed). `with_data`, `with_bytes`,
   `with_data_result` and `recv_ready` read it unchanged, without the copy
   from a provided buffer. An idle connection holds a buffer of
   `ConfigBuilder::recv_direct_region` bytes (default 32 KiB), or of
@@ -219,6 +219,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: a TLS connection receives ciphertext directly, with a one-shot
+  `RECV` of up to `recv_direct_region` bytes, instead of through the
+  provided-buffer ring. With the default (unbuffered) engine the receive
+  writes into the buffer rustls processes records in, which removes one copy
+  per received byte; a TLS receive costs 2 copies instead of 3. With
+  `tls-buffered` it writes into a worker buffer that `read_tls` copies from,
+  as from a provided buffer before. The ring that `recv_buffer` and
+  `recv_incremental` configure is still registered, but no TCP connection
+  receives into it. `ringline/recv_direct` counts TLS receives and their
+  bytes. With `tls-buffered`, each TLS receive in flight holds a pooled
+  buffer of `recv_direct_region` bytes; the unbuffered engine receives into
+  its existing ciphertext buffer. A TLS receive that cannot be submitted
+  closes the connection, as a plaintext one does; before, it was retried.
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
   buffered engine; `tls-unbuffered` has no effect and is kept so builds that
@@ -238,7 +251,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   slot (16448 bytes) holds one whole record.
   With the `tls-buffered` feature any slot size works. On io_uring,
   handshake output pays one more copy than on the buffered engine.
-- io_uring: a TLS connection's ring receive is armed when a read parks once
+- io_uring: a TLS connection's receive is armed when a read parks once
   its handshake is done, as a plaintext connection's direct receive is, so a
   task that does not read stops its peer instead of buffering up to
   `recv_accumulator_max` (1 GiB by default). During the handshake and after
@@ -247,8 +260,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   on a plaintext connection. A TLS connection now arms the `POLLRDHUP`
   hangup poll, so a peer FIN or reset is seen, and `is_alive` returns
   `false`, while nothing reads. The poll does not fire on a close_notify the
-  peer sends without closing TCP: that alert is read when a ring receive
-  next completes; on mio it is read when it arrives. `forward_to_conn` from
+  peer sends without closing TCP: that alert is read when a receive next
+  completes; on mio it is read when it arrives. `forward_to_conn` from
   a TLS source takes the bytes from the accumulator and sends them through
   the sink's send queue, as from a plaintext source: ordered with other
   sends on the sink, with one chunk buffered, and below `send_zc_threshold`

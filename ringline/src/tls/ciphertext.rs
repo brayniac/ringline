@@ -73,8 +73,9 @@ pub(crate) const INITIAL_SHRINK_TO: usize = 32 * 1024;
 ///
 /// The backing `Vec<u8>` is never zero-filled: reserved-but-unwritten
 /// capacity is left uninitialized (demand-paged, untouched by the CPU) and
-/// `buf.len()` is kept equal to `end` at all times, extended only by
-/// `Vec::extend_from_slice` writing the bytes actually received. See
+/// `buf.len()` is kept equal to `end` at all times, extended only over bytes
+/// actually received: by `Vec::extend_from_slice` in `append`, or by
+/// `recv_done` over bytes a receive wrote. See
 /// `reserved`'s doc comment for why the allocation ceiling this type reports
 /// is tracked as a separate field rather than read back off `Vec::capacity()`.
 pub(crate) struct CiphertextBuf {
@@ -84,7 +85,8 @@ pub(crate) struct CiphertextBuf {
     /// One past the last byte written. Invariant: `buf.len() == end` always
     /// (compaction truncates to match; growth only reserves capacity, it
     /// never extends `len`) — so the only bytes ever exposed as "logically
-    /// present" in `buf` are bytes this type actually wrote via `append`.
+    /// present" in `buf` are bytes written by `append`, or by a receive and
+    /// committed with `recv_done`.
     end: usize,
     /// Hard ceiling on `reserved`.
     cap: usize,
@@ -109,6 +111,12 @@ pub(crate) struct CiphertextBuf {
     /// Total bytes relocated by compaction. Diagnostic; asserted by tests to
     /// stay linear in throughput.
     bytes_moved: u64,
+    /// A receive is writing into the spare capacity behind `end`
+    /// (`arm_recv` until `recv_done`). Meanwhile the unprocessed bytes stay
+    /// readable and `discard` advances past them, but nothing may move or
+    /// free the allocation: `append` is refused, a full `discard` does not
+    /// reset or reallocate, and dropping the buffer leaks the allocation.
+    recv_in_flight: bool,
 }
 
 impl CiphertextBuf {
@@ -136,6 +144,7 @@ impl CiphertextBuf {
             initial,
             reserved,
             bytes_moved: 0,
+            recv_in_flight: false,
         }
     }
 
@@ -184,7 +193,7 @@ impl CiphertextBuf {
             self.len()
         );
         self.start += n;
-        if self.start == self.end {
+        if self.start == self.end && !self.recv_in_flight {
             self.start = 0;
             self.end = 0;
             // Keep the `buf.len() == end` invariant. Free: no data movement,
@@ -227,6 +236,13 @@ impl CiphertextBuf {
     /// `ErrorKind::InvalidData` means the append cannot ever fit within `cap`
     /// — a protocol error; close the connection.
     pub(crate) fn append(&mut self, src: &[u8]) -> io::Result<()> {
+        if self.recv_in_flight {
+            debug_assert!(false, "append while a receive writes into the buffer");
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TLS ciphertext buffer is held by a receive",
+            ));
+        }
         debug_assert!(
             src.len() <= MAX_SINGLE_APPEND,
             "append of {} bytes exceeds MAX_SINGLE_APPEND ({MAX_SINGLE_APPEND}); \
@@ -238,6 +254,75 @@ impl CiphertextBuf {
         }
         self.write_tail(src);
         Ok(())
+    }
+
+    /// Make room for a receive that writes into this buffer, behind the
+    /// unprocessed bytes, and mark it in flight. Room for up to `want` bytes
+    /// is made within `cap`, as `append` makes it: compacting only when that
+    /// moves no more bytes than it reclaims, unless growing would pass `cap`.
+    /// Returns where the receive writes and how many bytes it may write.
+    /// Until [`recv_done`](Self::recv_done), the allocation does not move.
+    ///
+    /// `None` when the unprocessed bytes already fill `cap`, or when a
+    /// receive is already in flight.
+    #[cfg(has_io_uring)]
+    pub(crate) fn arm_recv(&mut self, want: usize) -> Option<(*mut u8, usize)> {
+        if self.recv_in_flight {
+            return None;
+        }
+        let live = self.len();
+        let room = want.min(self.cap - live);
+        if room == 0 {
+            return None;
+        }
+        if self.make_room(room).is_err() {
+            // Growing at the tail would pass `cap`; `live + room` fits once
+            // the unprocessed bytes are at the front.
+            self.compact();
+            if self.end + room > self.buf.capacity() {
+                self.grow_to(self.end + room);
+            }
+        }
+        debug_assert!(self.buf.capacity() >= self.end + room);
+        self.recv_in_flight = true;
+        // SAFETY: `end == buf.len()`, and `room` bytes are reserved behind it.
+        Some((unsafe { self.buf.as_mut_ptr().add(self.end) }, room))
+    }
+
+    /// The receive [`arm_recv`](Self::arm_recv) started has completed, with
+    /// `received` bytes written behind the unprocessed bytes.
+    ///
+    /// # Safety
+    ///
+    /// The `received` bytes at the pointer `arm_recv` returned must have been
+    /// written, and `received` must not exceed the room it returned.
+    #[cfg(has_io_uring)]
+    pub(crate) unsafe fn recv_done(&mut self, received: usize) {
+        debug_assert!(self.recv_in_flight, "recv_done without arm_recv");
+        debug_assert!(self.end + received <= self.buf.capacity());
+        // SAFETY: the caller guarantees the bytes are written and in bounds.
+        unsafe { self.buf.set_len(self.end + received) };
+        self.end += received;
+        self.recv_in_flight = false;
+        // A full `discard` during the receive left `start == end` without
+        // resetting; do it now.
+        if self.start == self.end {
+            self.discard(0);
+        }
+    }
+
+    /// Take the allocation from under an in-flight receive, so that it
+    /// outlives this buffer until the receive completes. Leaves this buffer
+    /// empty. `None` when no receive is in flight.
+    #[cfg(has_io_uring)]
+    pub(crate) fn take_in_flight(&mut self) -> Option<Vec<u8>> {
+        if !self.recv_in_flight {
+            return None;
+        }
+        self.recv_in_flight = false;
+        self.start = 0;
+        self.end = 0;
+        Some(std::mem::take(&mut self.buf))
     }
 
     /// Write `src` at `end`, extending `buf`'s logical length to match.
@@ -363,9 +448,128 @@ impl CiphertextBuf {
     }
 }
 
+impl Drop for CiphertextBuf {
+    /// An in-flight receive still writes into the allocation, so it is
+    /// leaked rather than freed. The driver takes it first
+    /// ([`take_in_flight`](Self::take_in_flight)) whenever it drops TLS state
+    /// with a receive in flight.
+    fn drop(&mut self) {
+        if self.recv_in_flight {
+            // Not while unwinding a worker panic: a second panic aborts.
+            if !std::thread::panicking() {
+                debug_assert!(false, "TLS state dropped with a receive in flight");
+            }
+            std::mem::forget(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `data` where the kernel would, at the pointer `arm_recv`
+    /// returned.
+    #[cfg(has_io_uring)]
+    fn write_at(ptr: *mut u8, data: &[u8]) {
+        // SAFETY: the test arms with at least `data.len()` bytes of room.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+    }
+
+    /// A receive writes behind the unprocessed bytes, which stay readable and
+    /// discardable while it is in flight; its bytes become pending behind
+    /// whatever is left.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_receive_writes_behind_the_unprocessed_bytes() {
+        let mut b = CiphertextBuf::with_cap_unchecked(256, 1024);
+        b.append(b"abcdef").unwrap();
+        b.discard(2);
+        let (ptr, room) = b.arm_recv(100).expect("room");
+        assert_eq!(room, 100);
+        assert!(b.arm_recv(100).is_none(), "one receive at a time");
+        assert_eq!(b.pending(), b"cdef", "the unprocessed bytes stay readable");
+        b.discard(2);
+        write_at(ptr, b"ghi");
+        // SAFETY: three bytes were written at `ptr`.
+        unsafe { b.recv_done(3) };
+        assert_eq!(b.pending(), b"efghi");
+        b.append(b"j").unwrap();
+        assert_eq!(b.pending(), b"efghij");
+        assert_eq!(
+            b.bytes_moved(),
+            0,
+            "a receive with room at the tail moves nothing"
+        );
+    }
+
+    /// A full `discard` while a receive is in flight keeps the write position;
+    /// the received bytes are all that is pending afterwards.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_full_discard_during_a_receive_keeps_the_write_position() {
+        let mut b = CiphertextBuf::with_cap_unchecked(256, 1024);
+        b.append(b"abc").unwrap();
+        let (ptr, _) = b.arm_recv(10).expect("room");
+        b.discard(3);
+        assert!(b.is_empty());
+        write_at(ptr, b"xy");
+        // SAFETY: two bytes were written at `ptr`.
+        unsafe { b.recv_done(2) };
+        assert_eq!(b.pending(), b"xy");
+    }
+
+    /// When growing at the tail would pass `cap`, the unprocessed bytes move
+    /// to the front to make the room.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_receive_compacts_when_the_tail_would_pass_the_cap() {
+        let mut b = CiphertextBuf::with_cap_unchecked(16, 64);
+        b.append(&[7u8; 40]).unwrap();
+        b.discard(15);
+        // 25 unprocessed bytes after a 15-byte prefix: 30 more at the tail
+        // would end at 70, past the cap, so the 25 move to the front.
+        let (ptr, room) = b.arm_recv(30).expect("room");
+        assert_eq!(room, 30);
+        assert_eq!(b.pending(), [7u8; 25]);
+        write_at(ptr, &[8u8; 30]);
+        // SAFETY: 30 bytes were written at `ptr`.
+        unsafe { b.recv_done(30) };
+        let mut want = vec![7u8; 25];
+        want.extend_from_slice(&[8u8; 30]);
+        assert_eq!(b.pending(), &want[..]);
+    }
+
+    /// The room is bounded by what `cap` leaves behind the unprocessed bytes,
+    /// and none at all is a refusal.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_receive_gets_at_most_the_room_under_the_cap() {
+        let mut b = CiphertextBuf::with_cap_unchecked(16, 64);
+        b.append(&[1u8; 60]).unwrap();
+        let (_, room) = b.arm_recv(100).expect("room");
+        assert_eq!(room, 4);
+        // SAFETY: nothing was written.
+        unsafe { b.recv_done(0) };
+        b.append(&[2u8; 4]).unwrap();
+        assert!(b.arm_recv(100).is_none(), "the cap is full");
+        assert_eq!(b.len(), 64, "a refusal leaves the bytes in place");
+    }
+
+    /// Taking the allocation from under a receive leaves the buffer empty
+    /// and returns the allocation the receive writes into.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn take_in_flight_hands_over_the_allocation() {
+        let mut b = CiphertextBuf::with_cap_unchecked(256, 1024);
+        b.append(b"abc").unwrap();
+        assert!(b.take_in_flight().is_none(), "no receive in flight");
+        let (ptr, _) = b.arm_recv(10).expect("room");
+        let taken = b.take_in_flight().expect("in flight");
+        // SAFETY: `ptr` points 3 bytes into the allocation that `taken` owns.
+        assert_eq!(unsafe { taken.as_ptr().add(3) }, ptr.cast_const());
+        assert!(b.is_empty());
+    }
 
     #[test]
     fn append_then_pending_returns_what_was_written() {

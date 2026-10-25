@@ -4,6 +4,10 @@ Note (2026-10-25): `segments`, `recv_owned_segment`, `with_segments`,
 `with_bytes_segments` and `forward_to` were removed; no read holds provided
 buffers.
 
+Note (2026-10-25): TLS connections receive directly too, into their TLS
+engine's ciphertext buffer (`tls_recv_buffer`), and no TCP connection uses
+the provided-buffer ring.
+
 Status: merged (#684). Since decisions 11 and 15, every plaintext
 connection on io_uring, outbound or accepted, receives this way, with no
 option. Measured through build C8 and at 250 and 1,000 connections per
