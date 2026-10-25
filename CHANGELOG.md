@@ -594,14 +594,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), and
   `ConfigBuilder::recv_segment_reserve`, which applied only to `forward_to`
   sources. In 0.6 `forward_to` took any io_uring connection as a source and
-  wrote its received buffers to a socket or buffered file with no userspace
-  copy. There is no replacement for a sink that is not a ringline
-  connection: read with `with_bytes` and write the bytes yourself; for a
-  file opened through `ringline::fs`, `fs::write_from` takes a `BytesMut`,
-  so it costs one copy. For a connection sink use `forward_to_conn`, which
-  on io_uring sends from the source's accumulator through the sink's send
-  queue. `forward_hold_cap` now applies only to the mio `forward_to_conn`;
-  on io_uring no TCP connection lends a receive buffer, so it has no effect.
+  wrote its provided buffers to a socket or buffered file without copying
+  them, except a TLS source's plaintext and buffers copied when the ring fell
+  below `recv_segment_reserve`. There is no replacement for a sink that is
+  not a ringline connection: read with `with_bytes` and write the bytes
+  yourself. For a file opened through `ringline::fs`, `fs::write` (unsafe)
+  writes from a `Bytes` without a copy if the caller holds it until the
+  write completes, and `fs::write_from` takes a `BytesMut` and costs one
+  copy. For a connection sink use `forward_to_conn` (new in this release),
+  which on io_uring sends from the source's accumulator through the sink's
+  send queue. `forward_hold_cap` now applies only to the mio
+  `forward_to_conn`; on io_uring no connection lends a receive buffer, so it
+  has no effect.
 - **Breaking:** the segment readers `segments`, `recv_owned_segment`,
   `with_segments` and `end_segments` (on `ConnCtx` in 0.6, io_uring only),
   and the types only they used: `SegmentReader`, `RecvSegment`,
@@ -810,10 +814,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   slot on every running worker before returning the error.
 
 - io_uring: a park (connection rebalancing, #443) sends its fd install only
-  while the connection has no receive armed. Four paths could re-arm a
+  while the connection has no receive armed. Three paths could re-arm a
   receive during the drain: the end-of-completion re-arm after a receive
-  ended with data (on a full completion queue), the throttle and
-  end-of-forward re-arms once a held backlog drained, and the starved pass
+  ended with data (on a full completion queue), the throttle re-arm once a
+  held backlog drained, and the starved pass
   once buffers returned after an `ENOBUFS` end. The install then went out
   with the receive live, so this worker could read bytes after the socket
   moved. An install that fails, or that finds the connection no longer

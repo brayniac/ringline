@@ -1852,8 +1852,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .as_ref()
             .is_some_and(|t| t.has(conn_index));
 
-        // Every plaintext delivery is recorded before the bytes go to a
-        // segment hold, a lend or the accumulator. TLS records the plaintext
+        // Every plaintext delivery is recorded before the bytes are lent or
+        // go to the accumulator. TLS records the plaintext
         // the feed delivers, below.
         if !is_tls_conn {
             self.driver
@@ -1862,8 +1862,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if is_tls_conn {
             // The ciphertext bid is replenished immediately (TLS decrypts into
-            // rustls's own buffer, so the provided buffer is free at feed time);
-            // TLS segments never pin the ring.
+            // rustls's own buffer, so the provided buffer is free at feed time).
             self.driver.pending_replenish.push(bid);
             // The feed's plaintext is recorded as the growth of
             // `recv_buffered`, all at this batch's time.
@@ -10829,6 +10828,10 @@ mod tests {
         let first = with_driver_state(&mut el, || source.forward_to_conn(&sink_ctx, 5));
         assert!(marked(&el, src), "an accepted forward marks its source");
         assert_eq!(refused(&mut el, source, sink_ctx), Some(libc::EBUSY));
+        assert!(
+            marked(&el, src),
+            "a refused forward cleared the running one's mark"
+        );
         with_driver_state(&mut el, || drop(first));
         assert!(!marked(&el, src), "dropping the forward clears the mark");
     }

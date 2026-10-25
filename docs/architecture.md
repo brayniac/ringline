@@ -122,7 +122,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | Concern | io_uring | Mio |
 | --- | --- | --- |
 | Socket readiness/completion | CQEs identified by `UserData` and `OpTag` | `mio::Poll` readable/writable events |
-| TCP receive | Plaintext: one-shot receive into the connection's accumulator, and a `POLLRDHUP` poll for the peer's close. TLS: one-shot receive with provided buffers, re-armed after each completion during the handshake, in the segmented domain and after a hangup, otherwise armed when a read parks, and a `POLLRDHUP` poll | Readiness read into owned memory |
+| TCP receive | Plaintext: one-shot receive into the connection's accumulator, and a `POLLRDHUP` poll for the peer's close. TLS: one-shot receive with provided buffers, re-armed after each completion during the handshake and after a hangup, otherwise armed when a read parks, and a `POLLRDHUP` poll | Readiness read into owned memory |
 | File descriptors | Fixed-file table for connections | Registered ordinary sockets |
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
 | Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |
@@ -229,7 +229,7 @@ the TCP connection and TLS handshake complete. Handshake messages and alerts
 use the normal per-connection send queue.
 
 Receive ciphertext is fed to rustls, and decrypted plaintext is copied from
-rustls into the accumulator or owned segmented chunks. Send plaintext is
+rustls into the accumulator. Send plaintext is
 encrypted into send-copy-pool storage. Guarded plaintext cannot remain
 zero-copy through encryption. All TLS ciphertext chunks are serialized through
 the same connection queue: independent io_uring SQEs are not wire-ordered, so
@@ -255,8 +255,7 @@ Backpressure is bounded and explicit at each layer:
   connection.
 - Receive accumulation is bounded by configuration. io_uring provided-buffer
   starvation (`ENOBUFS`) parks receive until returned buffers are replenished;
-  it is not retried in a busy loop. Segmented receive has reserve and per-flow
-  hold limits so one slow consumer cannot pin the whole shared ring.
+  it is not retried in a busy loop.
 - `ConnSendState` permits at most one in-flight send per connection and queues
   later sends in a `VecDeque`. This preserves stream and TLS order.
 - Send-copy-pool, zero-copy slab, task-slab, and timer-slot exhaustion surface
@@ -273,8 +272,7 @@ Backpressure is bounded and explicit at each layer:
 
 An application's connection future returning is a close request, not permission
 to discard queued bytes. The io_uring driver marks `close_pending`, drains
-queued and in-flight sends in order, waits for any forwarded-buffer write,
-cancels an armed receive, and only then finalizes close. Stale CQEs
+queued and in-flight sends in order, cancels an armed receive, and only then finalizes close. Stale CQEs
 are normal during teardown and must release only their own backing without
 touching a reused connection.
 

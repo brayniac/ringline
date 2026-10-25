@@ -7507,8 +7507,7 @@ fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool, case: &
 /// Run twice against the same backend. The second proxy sets
 /// `forward_hold_cap(1)`, which is what actually exercises backpressure: on
 /// mio the source stops reading after a single queued send and only resumes
-/// when the sink drains, and on io_uring it holds one provided buffer at a
-/// time. At the default cap a localhost sink never backs up, so the resume
+/// when the sink drains; on io_uring the cap has no effect. At the default cap a localhost sink never backs up, so the resume
 /// path would go untested.
 #[test]
 fn forward_to_conn_proxies_both_directions() {

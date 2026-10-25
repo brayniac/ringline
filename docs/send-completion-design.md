@@ -97,11 +97,11 @@ Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
 | `Writev` | waits | `-EAGAIN` |
 | `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
 
-So a vectored send (`sendmsg`, `SendMsgZc`, `writev`) that returns `-EAGAIN`
+So a vectored send (`sendmsg`, `SendMsgZc`) that returns `-EAGAIN`
 is not retried behind a `POLLOUT` poll: that loop never waits and spins the
 worker's event loop (#603). The handler instead submits a plain `send` of the
 entry's first non-empty unsent iovec, under a `*Drain` tag
-(`SendMsgCoalescedDrain`, `SendMsgZcDrain`, `ForwardWriteDrain`). Its result
+(`SendMsgCoalescedDrain`, `SendMsgZcDrain`). Its result
 is a partial write of the same entry, so the drain tag's completion goes
 through the entry's own handler, which advances the iovecs and resubmits the
 rest with the entry's own operation. The entry stays the one operation in
