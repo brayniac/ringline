@@ -177,8 +177,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
   listener can be named before any connection has arrived.
 - `metrics::recv_ring::BYTES_COPIED` counts bytes copied into receive
-  storage (the accumulator, owned held entries, owned forward copies and
-  queued TLS plaintext) on both backends.
+  storage (the accumulator and queued TLS plaintext) on both backends.
 - `metrics::CQE_BY_TAG`: completions processed, split by `OpTag`, with
   `metrics::cqe_tag::COUNT` sizing the group. The slot index is the tag's
   discriminant, and `CQE_BY_TAG` plus `ring::CQE_UNKNOWN_TAG` partition
@@ -592,15 +591,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
-- **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), which
-  wrote a connection's received bytes to a socket or file descriptor, and
+- **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), and
   `ConfigBuilder::recv_segment_reserve`, which applied only to `forward_to`
-  sources. On io_uring only a TLS connection could be a `forward_to`
-  source. Read with `with_bytes` and write the bytes to the descriptor, or
-  forward to another connection with `forward_to_conn`, which on io_uring
-  sends from the source's accumulator through the sink's send queue.
-  `forward_hold_cap` now bounds the mio `forward_to_conn` and, on io_uring,
-  the receive buffers lent to `forward_recv_buf` sends.
+  sources. In 0.6 `forward_to` took any io_uring connection as a source and
+  wrote its received buffers to a socket or buffered file with no userspace
+  copy. There is no replacement for a sink that is not a ringline
+  connection: read with `with_bytes` and write the bytes yourself; for a
+  file opened through `ringline::fs`, `fs::write_from` takes a `BytesMut`,
+  so it costs one copy. For a connection sink use `forward_to_conn`, which
+  on io_uring sends from the source's accumulator through the sink's send
+  queue. `forward_hold_cap` now applies only to the mio `forward_to_conn`;
+  on io_uring no TCP connection lends a receive buffer, so it has no effect.
 - **Breaking:** the segment readers `segments`, `recv_owned_segment`,
   `with_segments` and `end_segments` (on `ConnCtx` in 0.6, io_uring only),
   and the types only they used: `SegmentReader`, `RecvSegment`,
@@ -627,6 +628,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   receive.
 - **Breaking:** `metrics::park_abandon::DIRECT_ECHO` and the `direct_echo`
   op of `ringline/park_abandoned`.
+- **Breaking:** `metrics::park_abandon::FORWARD_WRITE` and the
+  `forward_write` op of `ringline/park_abandoned`. Slot 8 is unused.
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
   ringline-redis `Client::get_stream` and `Pool::get_stream` (and

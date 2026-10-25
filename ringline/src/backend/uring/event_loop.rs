@@ -1134,9 +1134,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Whether a parked connection may take the fallback recv path:
-    /// plaintext accumulator route only (no TLS or segmented delivery —
-    /// those paths keep the park-until-replenish behavior) with a partial
-    /// message already
+    /// plaintext accumulator route only (not TLS, which keeps the
+    /// park-until-replenish behavior), with a partial message already
     /// accumulated. The caller has already checked liveness and that no
     /// fallback is in flight.
     fn fallback_eligible(&mut self, conn_index: u32) -> bool {
@@ -5550,8 +5549,7 @@ mod tests {
         make_test_loop_with_config(test_config())
     }
 
-    /// Create a test event loop from an explicit config (e.g. to exercise the
-    /// segmented-recv low-water reserve, which `test_config` pins to 0).
+    /// Create a test event loop from an explicit config.
     fn make_test_loop_with_config(config: Config) -> AsyncEventLoop<NoopHandler> {
         // Parallel release-mode test runs can transiently exhaust kernel memory
         // for io_uring_setup while sibling tests hold their rings — the daily
@@ -9997,7 +9995,7 @@ mod tests {
         );
     }
 
-    // ── Test helpers for driving receive futures and segmented delivery ──
+    // ── Test helpers for driving receive futures and ring delivery ──
 
     /// A minimal no-op waker for driving receive futures in tests. The
     /// futures park via `recv_waiters` and are re-polled manually, so the waker
@@ -10028,10 +10026,9 @@ mod tests {
         f()
     }
 
-    /// Deliver one segmented recv buffer to `conn_index` via a synthetic
-    /// multishot-recv CQE (`bid`, `data`). The connection must already be in the
-    /// `Segmented` domain. Mirrors the real `handle_recv_multi` hold path.
-    fn deliver_segment(
+    /// Deliver `data` in ring buffer `bid` to `conn_index` via a synthetic
+    /// multishot-recv CQE.
+    fn deliver_ring_buffer(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
         bid: u16,
@@ -10781,6 +10778,61 @@ mod tests {
         );
     }
 
+    /// `forward_to_conn` refuses at the call, without marking either slot: a
+    /// stale source or sink with `EPIPE`, and a sink whose send half is out
+    /// with `EBUSY`. An accepted forward marks its source, so a second
+    /// forward from it gets `EBUSY` until the first is dropped.
+    #[test]
+    fn forward_to_conn_refuses_stale_slots_and_a_claimed_sink() {
+        let mut el = make_test_loop();
+        let src = accept_connection(&mut el);
+        let sink = accept_connection(&mut el);
+        let src_gen = el.driver.connections.generation(src);
+        let sink_gen = el.driver.connections.generation(sink);
+        let source = ConnCtx::new(src, src_gen);
+        let sink_ctx = ConnCtx::new(sink, sink_gen);
+        let waker = noop_waker();
+        let refused = |el: &mut AsyncEventLoop<NoopHandler>, from: ConnCtx, to: ConnCtx| {
+            with_driver_state(el, || {
+                let mark = || {
+                    crate::runtime::io::with_state(|d, _| {
+                        d.connections.get(src).is_some_and(|c| c.direct_forwarding)
+                    })
+                };
+                let before = mark();
+                let mut fut = Box::pin(from.forward_to_conn(&to, 5));
+                assert_eq!(mark(), before, "a refused forward changed the mark");
+                let mut cx = std::task::Context::from_waker(&waker);
+                match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(Err(e)) => e.raw_os_error(),
+                    other => panic!("not refused: {other:?}"),
+                }
+            })
+        };
+        let marked = |el: &AsyncEventLoop<NoopHandler>, i: u32| {
+            el.driver
+                .connections
+                .get(i)
+                .is_some_and(|c| c.direct_forwarding)
+        };
+
+        let stale_source = ConnCtx::new(src, src_gen.wrapping_add(1));
+        assert_eq!(refused(&mut el, stale_source, sink_ctx), Some(libc::EPIPE));
+        assert!(!marked(&el, src), "a stale source marked the occupant");
+        let stale_sink = ConnCtx::new(sink, sink_gen.wrapping_add(1));
+        assert_eq!(refused(&mut el, source, stale_sink), Some(libc::EPIPE));
+        el.driver.send_half_taken[sink as usize] = true;
+        assert_eq!(refused(&mut el, source, sink_ctx), Some(libc::EBUSY));
+        el.driver.send_half_taken[sink as usize] = false;
+        assert!(!marked(&el, src), "a refusal marked the source");
+
+        let first = with_driver_state(&mut el, || source.forward_to_conn(&sink_ctx, 5));
+        assert!(marked(&el, src), "an accepted forward marks its source");
+        assert_eq!(refused(&mut el, source, sink_ctx), Some(libc::EBUSY));
+        with_driver_state(&mut el, || drop(first));
+        assert!(!marked(&el, src), "dropping the forward clears the mark");
+    }
+
     /// A stale handle's `forward_recv_buf` must not send the slot's new
     /// occupant's pending recv buffer (#544).
     #[test]
@@ -11435,7 +11487,7 @@ mod tests {
         time: Instant,
     ) {
         el.driver.recv_batch.begin_at(time);
-        deliver_segment(el, conn_index, bid, data);
+        deliver_ring_buffer(el, conn_index, bid, data);
     }
 
     /// Read one line with `with_data` and return the bytes consumed and the
@@ -11480,7 +11532,7 @@ mod tests {
         // Two completions in one batch: the first is lent, the second moves
         // both into the accumulator.
         deliver_in_batch(&mut el, conn_index, 2, b"c\n", at(base, 3));
-        deliver_segment(&mut el, conn_index, 3, b"d\n");
+        deliver_ring_buffer(&mut el, conn_index, 3, b"d\n");
         let (_, a) = read_line(&mut el, ctx);
         assert_eq!(times(a), Some((at(base, 3), at(base, 3))));
         let (_, a) = read_line(&mut el, ctx);

@@ -126,7 +126,7 @@ pub struct UnbufferedConn {
     incoming: CiphertextBuf,
     /// Plaintext popped from `ReadTraffic` while no accumulator was
     /// available (i.e. the send path drove the state machine and found
-    /// application data pending). The recv path drains this into the sink
+    /// application data pending). The recv path drains this into the accumulator
     /// before touching rustls again, so the byte stream keeps its order.
     ///
     /// Expected to stay empty: the recv path always drives until no plaintext

@@ -1832,8 +1832,8 @@ impl ConnCtx {
             driver.forward_done[src] = None;
 
             // Bytes the connection already received but the handler never
-            // consumed are part of the forward — the same bytes the io_uring
-            // path picks up out of the accumulator when the domain flips. This
+            // consumed are part of the forward, as on io_uring, where the
+            // forward sends from the accumulator. This
             // also settles a forward that is satisfied on the spot (`len == 0`,
             // or the accumulator already covered it), which must not park for a
             // read that is never coming.
@@ -2928,7 +2928,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 /// # How much the compiler actually enforces
 ///
 /// `&mut self` only prevents a second call while the **return value carries the
-/// borrow**. On io_uring two methods do that, and for them the conflict is a
+/// borrow**. On io_uring one method does that, and for it the conflict is a
 /// compile error rather than a runtime refusal:
 ///
 /// - [`forward_to_conn`](Self::forward_to_conn) — returns `ForwardToFuture<'_>`
@@ -2941,7 +2941,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 /// wrapper is what would make the type enforce the whole rule; until then this
 /// section is the honest statement of what it buys.
 ///
-/// The ones that are enforced:
+/// The one that is enforced:
 ///
 /// ```ignore
 /// let mut rx = conn.take_recv()?;

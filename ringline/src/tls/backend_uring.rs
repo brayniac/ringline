@@ -107,8 +107,8 @@ pub(super) fn ciphertext_to_sends(
 }
 
 /// Feed received ciphertext into the TLS connection, append decrypted
-/// plaintext to the connection's recv accumulator, and append any TLS output (handshake responses, alerts) to
-/// `out_sends`.
+/// plaintext to the connection's recv accumulator, and append any TLS output
+/// (handshake responses, alerts) to `out_sends`.
 ///
 /// The output is appended whatever the outcome — an alert generated on the way
 /// to a fatal error still has to reach the peer — and the caller must queue it

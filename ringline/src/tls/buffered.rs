@@ -158,7 +158,6 @@ fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
 /// Any TLS output produced (handshake responses, alerts) is appended to
 /// `out_sends`; the caller must route those through the per-connection send
 /// queue whatever the return value (dropping them leaks their pool slots).
-///
 #[cfg(has_io_uring)]
 pub(super) fn feed_tls_recv_buffered(
     tls_table: &mut TlsTable,
@@ -852,8 +851,8 @@ mod drain_tests {
     use super::*;
     use std::io::Cursor;
 
-    // The outstanding-plaintext bound is enforced: a chunk that would push held
-    // plaintext past `max` is NOT consumed and the drain returns false (the
+    // The accumulator bound is enforced: a chunk that would take the
+    // accumulator past its `max_size` is NOT consumed and the drain returns false (the
     // caller's connection-kill signal), mirroring the accumulator `append`
     // contract.
     #[test]

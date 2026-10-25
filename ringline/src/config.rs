@@ -1107,12 +1107,9 @@ impl ConfigBuilder {
     /// On mio, a [`forward_to_conn`](crate::ConnCtx::forward_to_conn) source
     /// stops reading once its sink has this many sends queued, so its TCP
     /// receive window closes, and reads again once the sink drains. On
-    /// io_uring, a connection whose unfinished `forward_recv_buf` sends hold
-    /// this many lent receive buffers, or a quarter of the recv ring's
-    /// buffers if that is fewer, has its recv stopped until they complete
-    /// (#638). No TCP connection a task can read from lends one on io_uring,
-    /// since plaintext connections receive into their accumulators and TLS
-    /// ones copy. Must be `>= 1`.
+    /// io_uring it has no effect: no TCP connection a task can read from
+    /// lends a receive buffer, since plaintext connections receive into their
+    /// accumulators and TLS ones copy. Must be `>= 1`.
     ///
     /// Default: 64.
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {

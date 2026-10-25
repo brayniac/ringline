@@ -430,7 +430,9 @@ pub mod pool {
     /// mean a consumer is slower than its peer for large
     /// objects; unlike `RECV_PARKED` (ENOBUFS starvation) this is *deliberate*
     /// per-connection backpressure that prevents one slow consumer from depleting
-    /// the shared recv ring.
+    /// the shared recv ring. Only a connection holding lent receive buffers
+    /// can reach the cap, and no TCP connection a task can read from lends
+    /// one, so this does not count on io_uring TCP or on mio.
     pub const FORWARD_THROTTLED: usize = 6;
     // Slot 7 is unused.
     /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
