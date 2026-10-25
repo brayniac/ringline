@@ -28,9 +28,11 @@ per core. SystemsLab experiments `01a12a6d-1a82-71a5-329e-d642483b6a9a`
 | 64 KiB | tokio | 72.0k | 259 µs | 34.7 µs | 26.4 µs |
 
 Of the functions in the profile, user `memmove` differs most: 1.31 µs per
-op at 4 KiB and 25.6 µs at 64 KiB. Two copies on ringline's side have no
-tokio counterpart: the response buffer into the send pool, and the provided
-receive buffer into the accumulator. With 80% GETs, response bytes per
+op at 4 KiB and 25.6 µs at 64 KiB. In the profiled build, two copies on
+ringline's side had no tokio counterpart: the response buffer into the send
+pool, and the provided receive buffer into the accumulator. Since #699 a
+plaintext io_uring connection receives directly into its accumulator, so on
+main only the send copy remains. With 80% GETs, response bytes per
 operation are about four times request bytes, so most of the extra
 `memmove` is the send copy. That split is inferred from the byte counts;
 the profile has no call graph that separates the two copies.
@@ -39,8 +41,8 @@ An arm of the same server that sent GET values of 4 KiB and up zero-copy
 (`send_parts` with guards; experiments
 `01a12922-edca-71fc-d27a-3071b58fdf46` and
 `01a12922-ef13-713f-9990-ac7d71c006cf`)
-matched tokio's throughput at 4 KiB (1082k against 1080k ops/s) and beat it
-at 64 KiB (84k against 73k). It used 9.95 cores of softirq at 4 KiB and
+matched tokio's throughput at 4 KiB (1082k against 1080k ops/s for tokio in
+the same experiments) and beat it at 64 KiB (84k against 73k). It used 9.95 cores of softirq at 4 KiB and
 18.43 at 64 KiB. In the profile above, at 4 KiB, the copy arm used 7.44
 cores of softirq and tokio 6.06; the zero-copy arm's figures come from a
 different run. Guards also require the value to live in memory the
@@ -49,8 +51,7 @@ arrives, which a cache whose values move or expire does not offer cheaply.
 
 This document proposes a send API that removes the application-to-pool copy
 without zero-copy: the application encodes into pool slots directly, and the
-slots are submitted as they are today. The receive copy is a separate
-problem and is not addressed here.
+slots are submitted as they are today.
 
 ## API
 
@@ -167,8 +168,8 @@ none of them:
   the head's slots (`SendCompletions::turn`). Every slot outside a
   reservation is freed today by kernel progress. A held writer's slots are
   freed only by the task holding it. A task that holds a writer and then
-  awaits `send_backpressured` for more than the remaining free slots waits
-  for itself. A task that holds a writer and awaits a message from another
+  awaits `send_backpressured` for more than the remaining free slots never
+  completes: the slots it waits for are the ones it holds. A task that holds a writer and awaits a message from another
   task, while that task is the FIFO head waiting for capacity, waits
   forever, and every sender behind that head stalls.
 - A writer carrying only a connection token can be committed after its
@@ -219,8 +220,8 @@ against the pool from the moment they are taken.
   (`docs/copied-send-reservation-design.md`). The application can run its
   encoder again. A failed writer is never committed, so a frame cut short
   by a failed write cannot reach the wire.
-- A writer whose slots would exceed the pool's slot count fails with
-  `InvalidInput`, matching `send`'s refusal of a buffer wider than the
+- On io_uring, a writer whose slots would exceed the pool's slot count fails
+  with `InvalidInput`, matching `send`'s refusal of a buffer wider than the
   pool.
 - `contiguous` with `max` larger than the slot size returns `InvalidInput`
   and does not mark the writer failed.
@@ -232,8 +233,10 @@ against the pool from the moment they are taken.
   reservation can need more slots than it reserved; those come from the
   free pool and can fail. An application that wants a guarantee for
   `contiguous` writes calls `reserve_slots` with one slot per `contiguous`
-  call that can start a new slot. Unused reserved slots go back through
-  `release_reservation` when the call ends.
+  call that can start a new slot. The writer holds a list of reservations:
+  the backpressured form's admission reservation and one per `reserve` call.
+  Writes take reserved slots from them in order, and the unused slots of
+  each go back through `release_reservation` when the call ends.
 - `SendWriter`'s `Drop` releases its slot chain and any outstanding
   reservation. That covers a panic inside the closure: the default
   `TaskPanicPolicy::Contain` catches it and keeps the worker running, and
@@ -298,9 +301,7 @@ no per-send heap allocation on the copy path). `SendCopyPool` gains a
 `next: Vec<u16>` with one entry per slot. The writer keeps the first
 slot, the slot being filled, its base pointer, capacity and fill level, and
 the slot count. Sealing a slot
-sets its filled length (`set_filled`) and links it to the next one. The
-internal TLS `PoolWriter` (`tls/buffered.rs`) keeps the same state in a
-`Vec`. It can move to the chain afterwards; that is not required here.
+sets its filled length (`set_filled`) and links it to the next one.
 
 ### Pool access
 
@@ -312,9 +313,9 @@ goes through `with_state`, once per slot.
 
 A `send_with` inside a `with_data` closure reaches the driver from inside
 that closure's `with_state`, as `send_nowait` already does in the
-documented split-echo pattern (`Connection::split`). That pattern's
-soundness under Rust's aliasing rules predates this change and is unchanged
-by it.
+documented split-echo pattern (`Connection::split`). Whether that nesting
+is sound under Rust's aliasing rules has not been checked; `send_with`
+nests the same way.
 
 ### Commit
 
@@ -324,8 +325,9 @@ the send's id and total length (`set_send_id`), so the send settles once.
 Inside one `with_state`, each slot becomes one `Sqe::stream_send` entry, as
 in `DriverCtx::send_inner` after its copy step. A chain of one slot goes
 through `submit_or_queue`. A longer chain is queued whole and submitted by
-`submit_queued_run` (#697), so with nothing in flight up to 32 slots go to
-the kernel as one `sendmsg`; a longer chain continues through the queue's
+`submit_queued_run` (#697), so with nothing in flight, no chain active and
+a free send-slab entry, up to 32 slots (`MAX_IOVECS`) go to the kernel as
+one `sendmsg`; a longer chain continues through the queue's
 coalescing in `submit_next_queued`. A slot the writer took and left empty
 is released at the commit and not sent.
 
@@ -380,13 +382,13 @@ is queued, and the capacity release is flagged (`capacity_released`) so
 the FIFO head is woken, as the TLS branch of mio's `send_bounded` does.
 When `f` writes more, the permit is grown in place with a new
 `SendCopyPool::grow_reservation(&mut SlotReservation, more) -> Result<(),
-ReserveError>` (mio-only, like `shrink_reservation`), which reserves the
+ReserveError>` (mio-only, like `shrink_reservation`). It reserves the
 shortfall and adds it to the permit. It returns `TooLarge` when the
 permit's slots plus the shortfall exceed the pool, which maps to
 `InvalidInput`. On either error the call releases the permit
-(`release_permit`), cancels the id while it is still waiting, which wakes
-the next head, and the future resolves to `Err` with nothing queued (the
-closure's `R` is dropped).
+(`release_permit`) and cancels the id while it is still waiting, which
+wakes the next head. The future then resolves to `Err` with nothing queued,
+and the closure's `R` is dropped.
 
 ## Protocol clients
 
@@ -398,10 +400,10 @@ which removes that copy.
 With coalescing (`max_batch_size` > 1), the client keeps one buffer across
 several `fire_*` calls and sends it when the batch fills. A scoped writer
 cannot span those calls, so the coalescing path keeps its buffer. A
-holdable writer would also not cover it as it stands: the redis client
+holdable writer would not cover it as it stands either. The redis client
 mixes guard parts into a batch (`fire_set_with_guard`, sent through
-`send_parts().submit_batch`), which a writer does not carry, and pool
-exhaustion would move from `flush()` to `fire_*`, which changes the
+`send_parts().submit_batch`), which a writer does not carry. Pool
+exhaustion would also move from `flush()` to `fire_*`, which changes the
 client's recovery path (`pending.truncate`).
 
 ## Relation to the other send methods
@@ -415,28 +417,31 @@ above `send_zc_threshold`).
 The writer becomes the documented first choice for responses an application
 encodes, in the crate docs and in `docs/syscalls-and-copies.md`. Its row in
 the CLAUDE.md copy table is "user encode → `SendCopyPool` slot: 0 copies
-beyond the encode".
+beyond the encode (plaintext; TLS as `send`)".
 
 ## Measurement
 
 The prototype goes on an experiment branch with the io_uring path only. It
 adds a `--writer` arm to the RESP server benchmark that encodes responses
 with `send_with` through `io::Write`: header with `write!`, value with
-`write_all`, as the server's copy arm builds its buffer today. Runs: the
-rig setup of the profile above, 4 KiB and 64 KiB values, the writer arm
-against the copy arm and tokio, three reps each, with a server profile per
-arm.
+`write_all`, as the server's copy arm builds its buffer today. The
+prototype is based on main, where the copy arm receives directly and sends a
+multi-slot send as one `sendmsg` (#697, #699); the profile above predates
+both. Runs: the rig setup of the profile above, 4 KiB and 64 KiB values,
+the writer arm against the copy arm, the zero-copy arm and tokio, three reps
+each, with a server profile per arm. Every comparison is against arms from
+the same runs.
 
 Predictions, recorded before the runs:
 
-- User `memmove` per op falls by most of the difference to tokio: by at
-  least 0.9 µs at 4 KiB and at least 18 µs at 64 KiB.
+- User `memmove` per op falls below the same-run copy arm's by at least
+  0.9 µs at 4 KiB and at least 18 µs at 64 KiB, most of the send copy as
+  estimated from the profile above.
 - Throughput rises at both sizes and stays below the zero-copy arm at
-  64 KiB. At 4 KiB, softirq CPU stays near the copy arm's 7.44 cores and
-  below the zero-copy arm's 9.95. At 64 KiB the comparison needs the copy
-  arm's softirq from the same run.
+  64 KiB. Softirq CPU stays near the same-run copy arm's and below the
+  same-run zero-copy arm's at both sizes.
 - If `memmove` falls and throughput does not, the send copy was not what
-  limited throughput, and the next candidate is the receive copy.
+  limited throughput.
 - If `memmove` does not fall, the inference above that most of the extra
   `memmove` is the send copy is wrong.
 
@@ -460,10 +465,8 @@ Predictions, recorded before the runs:
 
 ## Not in scope
 
-- The receive copy into the accumulator.
 - Zero-copy parts inside a writer (a guard between two filled slots). It
   would merge the writer with `send_parts`, and the measurement above
   decides whether it is wanted.
-- Moving the TLS `PoolWriter` to the slot chain.
 - A gauge for slots held by writers: a scoped writer holds slots only
   during one synchronous call.
