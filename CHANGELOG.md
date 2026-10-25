@@ -257,16 +257,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`TlsInfo::sni_hostname`): ringline clones each server config and wraps
   its certificate resolver to record the name the ClientHello carries, so a
   `ServerConfig` passed in is not the one the connection uses. On the
-  unbuffered engine a TLS record cannot span send-pool slots: a bounded send
-  (`send_backpressured`) on a TLS connection is refused when
-  `send_copy_slot_size` is below one whole record (16413 bytes at the
-  default fragment size), and below that size plain TLS sends emit one
-  record per slot; on io_uring such a send that finds the pool short returns
-  an error and closes the connection, and if it had already sealed records
-  the peer reports a decryption failure instead of receiving close_notify.
-  The default slot (16448 bytes) holds one whole record.
-  `send_copy_slot_size` below 64 is rejected at build time when TLS is
-  configured, and at launch when a `bind_tls` listener is. On io_uring,
+  unbuffered engine a TLS record cannot span send-pool slots, so a
+  `send_copy_slot_size` smaller than one whole record for a configured
+  rustls config is rejected: by `ConfigBuilder::build` for the server and
+  client configs, and by `launch()` for a `bind_tls` listener's. One whole
+  record is `F + 29` bytes, where `F` is the config's `max_fragment_size`
+  minus its 5-byte header: 16413 bytes at the default fragment size, so a
+  TLS config with a 16384-byte slot no longer builds. Below that size the
+  engine cannot bound in advance how many slots a send uses. The default
+  slot (16448 bytes) holds one whole record.
+  With the `tls-buffered` feature any slot size works. On io_uring,
   handshake output pays one more copy than on the buffered engine.
 - io_uring: a TLS connection's ring receive is armed when a read parks once
   its handshake is done, as a plaintext connection's direct receive is, so a
@@ -1209,11 +1209,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   against the same ciphertext bound `send_backpressured` uses, before
   anything is encrypted: `Err` while the pool is short (retryable, nothing
   committed) and `InvalidInput` for a message the whole pool could never
-  hold, as on the plaintext path. With the unbuffered engine and a
-  `send_copy_slot_size` too small to hold one whole record, no bound
-  exists; such sends are still attempted, and a shortfall found
-  mid-encryption now closes the connection instead of leaving it open to
-  send records the peer will reject.
+  hold, as on the plaintext path. On the unbuffered engine a
+  `send_copy_slot_size` too small to hold one whole record is rejected at
+  build or launch (see Changed), so every such send has a bound.
 
 - Copied sends can no longer transmit a prefix and then fail. Pool slots for
   a multi-chunk copy send are reserved up front, so the send is admitted

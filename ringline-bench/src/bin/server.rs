@@ -792,7 +792,14 @@ fn run_ringline(cfg: EchoCfg) {
         .prefault_buffers(prefault_buffers)
         .recv_multishot(recv_multishot)
         .max_connections(16384)
-        .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
+        // With --tls the slot must hold one whole TLS record (16413 bytes at
+        // the default fragment size), which the unbuffered engine requires.
+        .send_pool(
+            512,
+            msg_size
+                .next_power_of_two()
+                .max(if tls { 16448 } else { 4096 }) as u32,
+        )
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
         .tick_timeout_us(tick_timeout_us);

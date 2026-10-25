@@ -70,19 +70,17 @@ one slot. The byte formula therefore *under*-estimates it. A worked case:
 at `slot_size` 32768 and 49152 bytes of plaintext, the byte formula says 2
 slots; the engine takes 3.
 
-The engine's real per-slot capacity is not a closed form. It is a cached
-`max_plaintext_per_chunk` that only ever shrinks for a given basis, and the
-hint that seeds it hardcodes the default fragment constants — so with an
-overridden fragment size the hint is wrong and the shrink loop converges
-instead. A bound derived from that cache would be coupling admission to an
-internal heuristic that is allowed to become pessimistic.
+The bound below holds while each slot carries at least `F` plaintext, apart
+from the last and from calls that also carry records rustls had queued (a
+key_update); the slack record (the `+ 1` added under "Slack for
+`sendable_tls`" below) covers the plaintext those calls give up.
 
 **Decision: bound the unbuffered slot count at one record per slot**,
-`slots = records`. That is the engine's own worst case and is always safe,
-whatever the cache does. It over-reserves when slots are large enough to
-hold several records, which costs admission latency and nothing else — the
-right side of the asymmetry. If a later measurement shows the waste matters,
-the fix is a tighter *measured* bound, not a cleverer formula.
+`slots = records`. It is safe under the condition above. It over-reserves
+when slots are large enough to hold several records, which costs admission
+latency and nothing else — the right side of the asymmetry. If a later
+measurement shows the waste matters, the fix is a tighter *measured* bound,
+not a cleverer formula.
 
 **Slack for `sendable_tls`.** rustls drains anything already queued — a TLS
 1.3 `key_update`, an alert — into the front of the same destination, and its
@@ -96,7 +94,10 @@ therefore adds **one whole record** of headroom unconditionally.
 slot, i.e. `slot_size >= F + 29`. In the shipped default that is
 `send_copy_slot_size = 16448` against `F + 29 = 16413` — **a margin of 35
 bytes**. Any configuration that lowers the slot size a little, or raises the
-fragment size, makes the bound inexpressible.
+fragment size, makes the bound inexpressible. On the unbuffered engine
+`Config::validate` rejects such a configuration for every configured rustls
+config, so the refusal below is reached only by TLS state installed without
+validation (unit tests).
 
 What matters is what happens below that threshold, and it is not a progress
 failure: the unbuffered engine still encrypts (its shrink loop converges,
@@ -173,10 +174,10 @@ Bounds that are checked only by the tests that were written for them tend to
 drift. Both bounded paths therefore `debug_assert` that the slots actually
 consumed did not exceed the bound — io_uring by comparing the pool's free
 count before and after `encrypt_to_sends`, mio by comparing the ciphertext
-length against the byte bound. If any of the three modelled hazards is ever
-beaten (unbuffered record waste, a pessimistic cache, an unmodelled
-`sendable_tls` drain), a debug build says so loudly instead of closing a
-connection in production. This is the same technique as #384's release
+length against the byte bound. If either of the two modelled hazards is
+ever beaten (unbuffered record waste, a `sendable_tls` drain into the same
+destination), a debug build says so loudly instead of closing a connection
+in production. This is the same technique as #384's release
 guard, for the same reason.
 
 ## Forward coupling with PR 9

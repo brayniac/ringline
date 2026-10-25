@@ -180,6 +180,67 @@ fn the_chunk_hint_never_caches_less_than_one_record() {
     );
 }
 
+/// A peer KeyUpdate makes rustls queue a key_update reply, which it writes
+/// into the front of the next `encrypt` destination. At a slot of `F + 29`
+/// one TLS 1.3 record plus that reply does not fit, so that one call takes
+/// less than a record. Later calls must take a whole record again: a cached
+/// smaller size would make `slots = records` an under-estimate for the rest
+/// of the connection.
+#[test]
+fn a_queued_key_update_reply_does_not_shrink_later_chunks() {
+    const FRAGMENT: usize = 2048;
+    let f = crate::tls::plaintext_per_record(Some(FRAGMENT));
+    let dst_len = f + crate::tls::MAX_RECORD_OVERHEAD;
+
+    let (mut server, mut client) = conn_pair_with_fragment(Some(FRAGMENT));
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+
+    // The client requests a key update; the server reads it and queues its
+    // own key_update in reply.
+    {
+        let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+        let super::UnbufferedKind::Client(c) = kind else {
+            panic!("the client side is a client connection");
+        };
+        let status = super::UnbufferedEngine::process(c, incoming.pending());
+        match status.state {
+            Ok(rustls::unbuffered::ConnectionState::WriteTraffic(wt)) => wt
+                .refresh_traffic_keys()
+                .expect("a TLS 1.3 connection can request a key update"),
+            _ => panic!("a handshaked client with no input is in WriteTraffic"),
+        }
+    }
+    let (_, key_update) = pump(&mut client, &[], &mut accs);
+    assert!(!key_update.is_empty(), "the client emits its key_update");
+    pump(&mut server, &key_update, &mut accs);
+
+    let plaintext = vec![0xC3u8; 64 * 1024];
+    let mut dst = vec![0u8; dst_len];
+    let (first, _) = encrypt_chunk(&mut server, &plaintext, &mut dst).expect("encrypt");
+    assert!(
+        first < f,
+        "the premise: the reply shares the first slot, so it takes {first} < {f} bytes"
+    );
+    for _ in 0..2 {
+        let (chunk, _) = encrypt_chunk(&mut server, &plaintext, &mut dst).expect("encrypt");
+        assert!(
+            chunk >= f,
+            "after the reply went out a slot of {dst_len} bytes took {chunk} plaintext \
+             bytes, under one {f}-byte record"
+        );
+    }
+    let cached = server
+        .conn
+        .as_unbuffered_mut()
+        .unwrap()
+        .max_plaintext_per_chunk;
+    assert!(
+        cached == 0 || cached >= f,
+        "the cache keeps {cached} plaintext bytes per slot, under one {f}-byte record"
+    );
+}
+
 /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its
 /// own output. Returns (outcome, output ciphertext).
 fn pump(to: &mut TlsConn, bytes: &[u8], accs: &mut AccumulatorTable) -> (DriveOutcome, Vec<u8>) {

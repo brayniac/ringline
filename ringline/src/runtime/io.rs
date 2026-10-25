@@ -2452,10 +2452,7 @@ impl ConnCtx {
     /// transmitted on `Err`, so the same buffer may be sent again later. On a
     /// TLS connection the pool is checked against the *ciphertext* bound
     /// before anything is encrypted, which is what keeps that true there.
-    /// The one exception is the unbuffered TLS engine with a
-    /// `send_copy_slot_size` too small to hold one whole record, where no
-    /// bound exists: a shortfall found mid-encryption closes the connection
-    /// and returns `Err`. Submission-queue pressure is not an error: the send is queued
+    /// Submission-queue pressure is not an error: the send is queued
     /// and retried. Persistent submission-queue starvation is reported like
     /// a write error: the awaited `SendFuture` resolves `Err` and the
     /// connection is closed.

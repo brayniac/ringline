@@ -72,7 +72,8 @@ fn test_config_builder() -> ConfigBuilder {
         .sq_entries(64)
         .recv_buffer(64, 4096)
         .max_connections(64)
-        .send_pool(64, 16384)
+        // One whole TLS record per slot, which the unbuffered engine needs.
+        .send_pool(64, 16448)
 }
 
 fn wait_for_server(addr: &str) {
@@ -393,12 +394,12 @@ fn tls_echo_large_multichunk() {
 
     // The 1 MiB payload needs > 64 in-flight echo chunks at peak (the
     // synchronous client writes the whole payload before reading, so echo
-    // sends queue until it turns around). The default 64×16 KiB test pool is
-    // exactly 1 MiB — sitting on the exhaustion cliff, and TlsEchoHandler's
+    // sends queue until it turns around). The default 64-slot test pool is
+    // about 1 MiB — sitting on the exhaustion cliff, and TlsEchoHandler's
     // send_nowait errors are swallowed, which turned exhaustion into a
     // silent short echo. Give this test 4× headroom.
     let config = test_config_builder()
-        .send_pool(256, 16384)
+        .send_pool(256, 16448)
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
@@ -754,15 +755,15 @@ fn tls_info_accessors_with(per_listener: bool) {
     );
 }
 
-/// A send-pool slot too small for the unbuffered engine to encrypt into is
-/// refused at launch when the only TLS is a per-listener config (`bind_tls`),
-/// as it is for a process-wide one.
+/// A send-pool slot one byte smaller than one whole TLS record is refused at
+/// launch when the only TLS is a per-listener config (`bind_tls`), as it is
+/// for a process-wide one.
 #[cfg(not(feature = "tls-buffered"))]
 #[test]
 fn a_bind_tls_listener_with_a_slot_too_small_for_tls_is_refused() {
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .send_pool(64, 32)
+        .send_pool(64, 16412)
         .build()
         .expect("valid without TLS");
     let result = RinglineBuilder::new(config)
@@ -777,7 +778,7 @@ fn a_bind_tls_listener_with_a_slot_too_small_for_tls_is_refused() {
             for h in handles {
                 let _ = h.join();
             }
-            panic!("launched with a 32-byte send slot and a TLS listener");
+            panic!("launched with a 16412-byte send slot and a TLS listener");
         }
         Err(e) => e,
     };

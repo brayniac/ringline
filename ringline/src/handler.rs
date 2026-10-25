@@ -406,13 +406,13 @@ impl<'a> DriverCtx<'a> {
     /// check is enough for the reason `send_bounded` gives: the worker is
     /// single-threaded and nothing allocates between the check and the call.
     ///
-    /// Where no bound is expressible (the unbuffered engine with a slot too
-    /// small for one whole record) the send is attempted without one, as
-    /// before — refusing would break deployments running such slots, and the
-    /// bounded path already refuses them itself. If encryption fails after
-    /// rustls has sealed anything, the connection is closed: by departure 1 a
-    /// record gap is fatal, and leaving the connection open only lets it emit
-    /// records the peer will reject.
+    /// No bound is expressible for the unbuffered engine with a slot too small
+    /// for one whole record. `Config::validate` rejects such a slot for every
+    /// configured rustls config, so a runtime does not reach that case; if it
+    /// did, the send would be attempted without a bound. If encryption fails
+    /// after rustls has sealed anything, the connection is closed: by
+    /// departure 1 a record gap is fatal, and leaving the connection open only
+    /// lets it emit records the peer will reject.
     ///
     /// The caller has checked that `conn` is current and has TLS state.
     fn encrypt_tls_send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
@@ -749,13 +749,12 @@ impl<'a> DriverCtx<'a> {
                         return Err(e);
                     }
                 };
-                // The tripwire. Three hazards are modelled rather than
-                // measured — unbuffered record waste, a pessimistic
-                // `max_plaintext_per_chunk` cache, and rustls draining a
-                // queued alert or key_update into the same destination — and
-                // a bound that is only checked by the tests written for it
-                // drifts. If any of them is ever beaten, a debug build says
-                // so here instead of closing a connection in production.
+                // The tripwire. Two hazards are modelled rather than measured
+                // — unbuffered record waste, and rustls draining a queued
+                // alert or key_update into the same destination — and a bound
+                // that is only checked by the tests written for it drifts. If
+                // either is ever beaten, a debug build says so here instead of
+                // closing a connection in production.
                 debug_assert!(
                     free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
                     "TLS ciphertext bound beaten: reserved {needed} slots, encryption took {}",
@@ -3010,12 +3009,12 @@ impl<'a> DriverCtx<'a> {
                     return Err(e);
                 }
             };
-            // The tripwire. Three hazards are modelled rather than measured —
-            // unbuffered record waste, a pessimistic `max_plaintext_per_chunk`
-            // cache, and rustls draining a queued alert or key_update into the
-            // same destination. A bound checked only by the tests written for
-            // it drifts; if one is ever beaten, a debug build says so here
-            // rather than closing a connection in production.
+            // The tripwire. Two hazards are modelled rather than measured —
+            // unbuffered record waste, and rustls draining a queued alert or
+            // key_update into the same destination. A bound checked only by
+            // the tests written for it drifts; if one is ever beaten, a debug
+            // build says so here rather than closing a connection in
+            // production.
             debug_assert!(
                 ciphertext.len() <= bound.bytes(),
                 "TLS ciphertext bound beaten: bounded {} bytes, rustls produced {}",
