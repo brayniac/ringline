@@ -24,6 +24,9 @@ pub(crate) struct ParkedFd {
     pub pending: Vec<bytes::Bytes>,
     /// What the handler deposited via `offer_for_park`.
     pub state: Option<ParkState>,
+    /// The connection's TLS state, for a TLS connection: its session, and
+    /// any ciphertext received but not yet processed.
+    pub tls: Option<crate::tls::TlsConn>,
     /// Worker index this connection is bound for.
     pub target: usize,
 }

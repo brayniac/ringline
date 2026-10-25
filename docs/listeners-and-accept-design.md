@@ -314,10 +314,12 @@ handler payload → close A's fixed-file slot without a shutdown → send
 registers the fd, seeds the accumulator, arms the hangup poll, and calls
 `on_adopt`; the new task's first parked read arms a receive.
 
-A TLS connection is not parked (`ParkBlocker::TlsSession`). Carrying its
-session would move the whole `UnbufferedConn` (or its buffered counterpart)
-as one value rather than reconstructing it (open question 4); that transfer
-is not implemented.
+A TLS connection's session moves with it: `handle_park_install` takes its
+`TlsConn` (the rustls session, and with the unbuffered engine the ciphertext
+buffer with any partial record) out of A's TLS table into the `ParkedFd`, and
+B installs it in its own table, marks the connection established and calls
+`on_adopt` without a handshake. The drain has already ended A's receive, so
+nothing is writing into the ciphertext buffer that moves.
 
 **Park is opt-in** (owner decision, 2026-09-23). The future is dropped and
 recreated, so a handler that kept anything — negotiated protocol,

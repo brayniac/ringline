@@ -1226,6 +1226,10 @@ impl ConnCtx {
     /// `with_bytes`, or requests the handler has queued. Do not offer while
     /// holding any.
     ///
+    /// An accepted TLS connection is parked once its handshake is done. Its
+    /// TLS session moves with it, with any ciphertext received but not yet
+    /// decrypted, so the peer sees no new handshake.
+    ///
     /// Park also requires the io_uring backend and a kernel with
     /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
     /// nothing; on io_uring without that operation the offer is recorded

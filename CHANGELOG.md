@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- io_uring: an accepted TLS connection can be parked (connection
+  rebalancing, #443) once its handshake is done. Its TLS session moves to the
+  adopting worker with it, including ciphertext received but not yet
+  decrypted, and the handler there reads and sends without a new handshake.
+  Plaintext the unbuffered engine decrypted on the send path and has not yet
+  delivered counts as unread data, which blocks an offer or a park.
 - `forward_to_conn` on `ConnCtx`, `Connection` and `RecvHalf` forwards the
   next `len` received bytes to another connection on the same worker, on
   both backends. On io_uring it sends from the source's accumulator through
@@ -646,6 +652,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   op of `ringline/park_abandoned`.
 - **Breaking:** `metrics::park_abandon::FORWARD_WRITE` and the
   `forward_write` op of `ringline/park_abandoned`. Slot 8 is unused.
+- **Breaking:** `metrics::park_abandon::TLS_SESSION` and the `tls_session`
+  op of `ringline/park_abandoned`, which counted parks refused for a TLS
+  connection. Slot 5 is unused.
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
   ringline-redis `Client::get_stream` and `Pool::get_stream` (and

@@ -675,6 +675,42 @@ impl TlsTable {
         self.conns[conn_index as usize] = Some(conn);
     }
 
+    /// Take the TLS state of the connection at `conn_index` out of the table,
+    /// to move it with the connection to another worker (park).
+    #[cfg(has_io_uring)]
+    pub(crate) fn take(&mut self, conn_index: u32) -> Option<TlsConn> {
+        self.conns[conn_index as usize].take()
+    }
+
+    /// Install TLS state taken from another worker's table ([`Self::take`])
+    /// for the connection at `conn_index`.
+    #[cfg(has_io_uring)]
+    pub(crate) fn install(&mut self, conn_index: u32, conn: TlsConn) {
+        self.conns[conn_index as usize] = Some(conn);
+    }
+
+    /// Whether the connection at `conn_index` holds decrypted plaintext that
+    /// has not reached its accumulator: plaintext the unbuffered engine
+    /// found on the send path and stashed. The receive path drains it first,
+    /// so it is normally empty.
+    #[cfg(has_io_uring)]
+    pub(crate) fn has_undelivered_plaintext(&self, conn_index: u32) -> bool {
+        #[cfg(not(feature = "tls-buffered"))]
+        {
+            matches!(
+                self.conns[conn_index as usize].as_ref().map(|c| &c.conn),
+                Some(TlsConnKind::Unbuffered(u)) if u.has_stashed_plaintext()
+            )
+        }
+        // The buffered engine's plaintext is drained into the accumulator
+        // on every feed.
+        #[cfg(feature = "tls-buffered")]
+        {
+            let _ = conn_index;
+            false
+        }
+    }
+
     /// Get a mutable reference to the TLS connection at the given index.
     pub fn get_mut(&mut self, conn_index: u32) -> Option<&mut TlsConn> {
         self.conns[conn_index as usize].as_mut()

@@ -211,6 +211,13 @@ impl UnbufferedConn {
         &self.kind
     }
 
+    /// Whether plaintext found on the send path is waiting in
+    /// [`Self::pending_plaintext`] for the receive path.
+    #[cfg(has_io_uring)]
+    pub(crate) fn has_stashed_plaintext(&self) -> bool {
+        !self.pending_plaintext.is_empty()
+    }
+
     /// See [`CiphertextBuf::arm_recv`].
     #[cfg(has_io_uring)]
     pub(crate) fn arm_recv(&mut self, want: usize) -> Option<(*mut u8, usize)> {

@@ -2235,13 +2235,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 peer,
                 pending,
                 state,
+                tls,
                 ..
             } = parked;
             // `install_accepted_with_pending` registers the fd and closes this
             // handle, exactly as it does for a freshly accepted one.
             let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
             metrics::CONNECTIONS.increment(metrics::conn::ADOPTED);
-            self.install_accepted_with_pending(raw, listener, peer, pending, Some(state));
+            self.install_accepted_with_pending(
+                raw,
+                listener,
+                peer,
+                pending,
+                Some(crate::backend::uring::driver::Adopt { state, tls }),
+            );
         }
     }
 
@@ -2656,6 +2663,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
         let pending = self.driver.take_pending_for_park(conn_index);
         let state = self.driver.park_carry.remove(&conn_index);
+        // A TLS connection's session and unprocessed ciphertext move with
+        // it. No receive is in flight (checked above), so the ciphertext
+        // buffer is not being written into.
+        let tls = self
+            .driver
+            .tls_table
+            .as_mut()
+            .and_then(|t| t.take(conn_index));
 
         // Ordinary teardown. It closes the fixed-file entry and drops the
         // handler future, but does *not* FIN: `fd` above is a second
@@ -2675,6 +2690,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             peer,
             pending,
             state,
+            tls,
             target: in_flight.target,
         });
     }
@@ -2703,10 +2719,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         listener: crate::ListenerId,
         peer_addr: crate::connection::PeerAddr,
         pending: Vec<bytes::Bytes>,
-        // `adopt` is `Some` when this install is an adopt; the inner value is
-        // what the handler deposited. Recorded per connection so the TLS
-        // branch's deferred spawn still finds it.
-        adopt: Option<Option<crate::park::ParkState>>,
+        // `Some` when this install is an adopt: what the handler deposited,
+        // recorded per connection for the spawn, and the TLS state that
+        // moved with the connection.
+        adopt: Option<crate::backend::uring::driver::Adopt>,
     ) {
         // An adopted connection already ran a handler on the worker that
         // parked it, so a close here is not a drop at accept.
@@ -2762,14 +2778,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // this worker, and on the adopt path the caller arms recv itself.
         self.driver.set_park_drain(conn_index, None);
         self.driver.park_carry.remove(&conn_index);
-        match adopt {
-            Some(state) => {
+        let adopted_tls = match adopt {
+            Some(crate::backend::uring::driver::Adopt { state, tls }) => {
                 self.driver.adopt_pending.insert(conn_index, state);
+                tls
             }
             None => {
                 self.driver.adopt_pending.remove(&conn_index);
+                None
             }
-        }
+        };
         // Bytes a park carried arrive here at this batch's time.
         // `park_blocker` refuses a connection with bytes buffered, so this is
         // normally zero.
@@ -2777,6 +2795,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .record_arrival(conn_index, pending.iter().map(bytes::Bytes::len).sum());
         for chunk in &pending {
             self.driver.accumulators.append(conn_index, chunk);
+        }
+        // An adopted TLS connection brings its established session: install
+        // it and start the handler, as for an established plaintext one. Its
+        // first parked read arms a receive.
+        if let Some(tls) = adopted_tls {
+            let Some(tls_table) = self.driver.tls_table.as_mut() else {
+                // No TLS on this worker: the session has nowhere to go.
+                self.driver.close_connection(conn_index);
+                return;
+            };
+            tls_table.install(conn_index, tls);
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.established = true;
+            }
+            self.driver.arm_hangup_poll(conn_index);
+            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
+            metrics::CONNECTIONS_ACTIVE.increment();
+            self.spawn_accept_task(conn_index);
+            return;
         }
         let tls_listener = self
             .driver
@@ -3668,11 +3705,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// multishot mode, or is throttled by the hold cap — that last one
     /// owns its own re-arm and must not have a second multishot armed under it.
     fn rearm_multishot_if_idle(&mut self, conn_index: u32) {
-        if self
+        let tls = self
             .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_direct)
+            .tls_table
+            .as_ref()
+            .is_some_and(|t| t.has(conn_index));
+        if tls
+            || self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_direct)
         {
             self.rearm_direct_after_park(conn_index);
             return;
@@ -3698,7 +3741,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Give a direct connection back what a park cancelled or held off: its
+    /// Give a direct or TLS connection back what a park cancelled or held off: its
     /// hangup poll, and a wake for a reader that parked during the drain,
     /// whose receive was refused then and is armed when it polls again. A
     /// hangup the poll missed while it was cancelled is still pending on the
@@ -7188,20 +7231,162 @@ mod tests {
         );
     }
 
-    /// TLS state does not travel yet, so parking would hand the peer an
-    /// established session to a worker that knows nothing about it. Refused
-    /// loudly rather than silently renegotiating.
+    /// An established, quiescent TLS connection the handler offered is
+    /// parkable: its session travels with it.
     #[test]
-    fn a_tls_connection_is_not_parkable_yet() {
+    fn a_quiescent_tls_connection_is_parkable() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         el.driver.park_offered[conn_index as usize] = true;
         install_handshaked_tls(&mut el, conn_index);
+        assert_eq!(el.driver.park_blocker(conn_index), None);
+    }
+
+    /// Plaintext the unbuffered engine stashed on the send path is unread
+    /// data, so the park waits for the reader.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn stashed_tls_plaintext_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        install_handshaked_tls(&mut el, conn_index);
+        let (_, _, stash) = el
+            .driver
+            .tls_table
+            .as_mut()
+            .unwrap()
+            .get_mut(conn_index)
+            .unwrap()
+            .conn
+            .as_unbuffered_mut()
+            .unwrap()
+            .split_mut();
+        stash.push_back(b"early".to_vec());
         assert_eq!(
             el.driver.park_blocker(conn_index),
-            Some(ParkBlocker::TlsSession),
-            "carrying the session is unimplemented, so park must refuse"
+            Some(ParkBlocker::DataPending)
         );
+    }
+
+    /// Park a handshaked TLS connection through `handle_park_install` and
+    /// return what it put on `park_ready`, and the client end of the session.
+    fn park_a_tls_connection(
+        el: &mut AsyncEventLoop<NoopHandler>,
+    ) -> (crate::park::ParkedFd, TlsTestPeer) {
+        let conn_index = accept_connection(el);
+        let peer = install_handshaked_tls_with_peer(el, conn_index);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 0,
+                generation,
+            });
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
+        std::mem::forget(probe); // the fd now belongs to the ParkedFd
+        let parked = el.driver.park_ready.pop().expect("lifted off");
+        assert!(
+            !el.driver.tls_table.as_ref().unwrap().has(conn_index),
+            "the session left this worker's table"
+        );
+        (parked, peer)
+    }
+
+    /// A park of a TLS connection with a receive in flight cancels the
+    /// receive first, and sends the install only once the receive has ended,
+    /// so the ciphertext buffer that moves with the session is not being
+    /// written into.
+    #[test]
+    fn a_tls_park_waits_for_the_receive_to_end() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        el.driver.park_offered[conn_index as usize] = true;
+        let target = if el.driver.worker_index == 0 { 1 } else { 0 };
+        assert!(el.begin_park(conn_index, target), "the park starts");
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "no install while the receive is in flight"
+        );
+        el.drive_park_drains();
+        assert!(el.driver.park_in_flight[conn_index as usize].is_none());
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::ECANCELED,
+            0,
+        );
+        el.drive_park_drains();
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_some(),
+            "the install goes out once the receive has ended"
+        );
+    }
+
+    /// The TLS session is taken out of the parking worker's table and put in
+    /// the entry for the adopting worker.
+    #[test]
+    fn the_tls_session_travels_with_the_park() {
+        let mut el = make_test_loop();
+        let (parked, _peer) = park_a_tls_connection(&mut el);
+        assert!(parked.tls.is_some(), "the session travels with the fd");
+    }
+
+    /// An adopted TLS connection gets the session it had, established, and
+    /// reaches `on_adopt`. Records the client sends after the move decrypt on
+    /// the adopting side, so the record sequence carried over too.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn an_adopted_tls_connection_keeps_its_session() {
+        let mut el = make_test_loop();
+        let (parked, mut peer) = park_a_tls_connection(&mut el);
+        ADOPTS.with(|n| n.set(0));
+        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        el.driver.park_rx = Some(rx);
+        tx.try_send(parked).expect("queue");
+        drop(tx);
+        el.drain_adopted();
+        assert_eq!(ADOPTS.with(|n| n.get()), 1, "the handler is adopted");
+        let max = el.driver.connections.max_slots();
+        let adopted = (0..max)
+            .find(|&i| el.driver.tls_table.as_ref().unwrap().has(i))
+            .expect("the session was installed");
+        let cs = el.driver.connections.get(adopted).expect("open");
+        assert!(cs.established, "no new handshake");
+        assert!(!cs.recv_direct, "a TLS connection, not a plaintext one");
+
+        let mut dst = [0u8; 4096];
+        let (_, n) = crate::tls::unbuffered::encrypt_chunk(&mut peer.conn, b"hello", &mut dst)
+            .expect("client encrypts");
+        let tls_conn = el
+            .driver
+            .tls_table
+            .as_mut()
+            .unwrap()
+            .get_mut(adopted)
+            .unwrap();
+        let mut out = Vec::new();
+        let outcome = crate::tls::unbuffered::feed(
+            tls_conn,
+            Some(&mut el.driver.accumulators),
+            &mut out,
+            &dst[..n],
+            adopted,
+        );
+        assert!(
+            !matches!(outcome, crate::tls::unbuffered::DriveOutcome::Error(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(el.driver.accumulators.data(adopted), b"hello");
     }
 
     /// The carry round trip had no coverage at all: the deposited state was
@@ -7297,6 +7482,7 @@ mod tests {
                 vec![bytes::Bytes::copy_from_slice(bytes)]
             },
             state: None,
+            tls: None,
             target,
         }
     }
