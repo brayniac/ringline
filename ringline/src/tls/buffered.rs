@@ -265,15 +265,19 @@ pub(super) fn feed_tls_recv_buffered(
         ));
     }
 
+    let peer_closed = state.peer_has_closed();
+    if peer_closed {
+        tls_conn.peer_sent_close_notify = true;
+    }
+
     // Check if handshake just completed.
     if was_handshaking && !tls_conn.conn.is_handshaking() {
         tls_conn.handshake_complete = true;
-        return TlsRecvResult::HandshakeJustCompleted;
+        return TlsRecvResult::HandshakeJustCompleted { peer_closed };
     }
 
     // Check for clean close.
-    if state.peer_has_closed() {
-        tls_conn.peer_sent_close_notify = true;
+    if peer_closed {
         return TlsRecvResult::Closed;
     }
 
@@ -592,7 +596,7 @@ pub(super) fn feed_tls_recv_mio_buffered(
     // Check if handshake just completed.
     if was_handshaking && !tls_conn.conn.is_handshaking() {
         tls_conn.handshake_complete = true;
-        return TlsRecvResult::HandshakeJustCompleted;
+        return TlsRecvResult::HandshakeJustCompleted { peer_closed };
     }
 
     // Check for clean close.

@@ -533,8 +533,9 @@ fn drive_inner<C: UnbufferedEngine>(
 /// waiters either — so dropping the completion edge hangs an outbound TLS
 /// connect until its timeout. A peer can produce both in one feed by putting
 /// its last handshake flight and a close_notify in the same segment. The close
-/// is not lost: `peer_sent_close_notify` is set, so the following FIN reads as
-/// a clean close rather than a truncation.
+/// is not lost: `peer_sent_close_notify` is set, and the backend wiring reports
+/// it as `TlsRecvResult::HandshakeJustCompleted { peer_closed: true }`, which
+/// the backends handle as a close after the completion.
 ///
 /// `Error` outranks everything, though `feed` returns early on it today.
 fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {

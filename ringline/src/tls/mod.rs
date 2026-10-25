@@ -775,8 +775,11 @@ impl TlsTable {
 pub enum TlsRecvResult {
     /// Data processed successfully.
     Ok,
-    /// TLS handshake just completed — caller should fire on_accept.
-    HandshakeJustCompleted,
+    /// TLS handshake just completed — caller should fire on_accept, or wake
+    /// the connect waiter. `peer_closed` is set when the same feed also
+    /// carried the peer's close_notify; the caller then handles the close as
+    /// it handles [`Closed`](Self::Closed), after the completion.
+    HandshakeJustCompleted { peer_closed: bool },
     /// TLS error occurred.
     #[allow(dead_code)] // variant matched; inner value reserved for future error reporting
     Error(rustls::Error),
