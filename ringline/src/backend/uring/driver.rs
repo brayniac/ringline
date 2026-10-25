@@ -2235,14 +2235,10 @@ impl Driver {
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
-        // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
-        // this close, a running Mode A forward must still write the bytes
-        // already held: a data CQE and the FIN can land in the same batch, and
-        // `close_connection` runs before `poll_ready_tasks`. `advance_forward`
-        // writes the hold and resolves short once it is empty and the recv side
-        // has finished; any buffers still held are reclaimed at `handle_close`
-        // (teardown). The delivery domain is reset at slot reuse
-        // (`reset_segment_state`).
+        // Held segmented-recv buffers are not drained here. A close cancels an
+        // in-flight forward write and clears an idle forward's progress; the
+        // forward's held bytes are released at `handle_close` (teardown). The
+        // delivery domain is reset at slot reuse (`reset_segment_state`).
         // An in-flight Mode A forward write's backing is still owned by the kernel
         // (it is the write's *source* memory) until the write CQE arrives —
         // reclaiming it now would either return a provided bid to the ring while

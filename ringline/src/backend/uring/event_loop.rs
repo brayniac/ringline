@@ -3690,7 +3690,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Release the backing of the in-flight forward write, settle the source
     /// (`settle_forward_end`, closing the connection if its accumulator
     /// overflows), record an error for the `ForwardToFuture`, and wake it. A
-    /// pinned bid returns to the ring.
+    /// pinned bid returns to the ring. On a closing connection it only
+    /// continues the deferred close.
     fn fail_forward_write(&mut self, conn_index: u32, errno: i32) {
         if let Some(state) = self.driver.forward_write[conn_index as usize].take() {
             // A batch holds several bids; every pinned one goes back, exactly
@@ -3711,8 +3712,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.forward_progress[conn_index as usize] = None;
         // Held bytes not yet written go to the accumulator and the source
         // leaves the segmented domain, as at the end of any other forward, so
-        // `with_data` reads what follows. The result is recorded after a
-        // close, which clears `forward_done`.
+        // `with_data` reads what follows. Recorded after the settle: the close
+        // an overflow triggers clears `forward_done`.
         if !self.driver.settle_forward_end(conn_index) {
             self.driver.close_connection(conn_index);
         }
