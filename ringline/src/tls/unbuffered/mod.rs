@@ -211,21 +211,27 @@ impl UnbufferedConn {
         &self.kind
     }
 
-    /// See [`CiphertextBuf::detach_for_recv`].
+    /// See [`CiphertextBuf::arm_recv`].
     #[cfg(has_io_uring)]
-    pub(crate) fn detach_for_recv(&mut self, want: usize) -> Option<(Vec<u8>, usize)> {
-        self.incoming.detach_for_recv(want)
+    pub(crate) fn arm_recv(&mut self, want: usize) -> Option<(*mut u8, usize)> {
+        self.incoming.arm_recv(want)
     }
 
-    /// See [`CiphertextBuf::attach_received`].
+    /// See [`CiphertextBuf::recv_done`].
     ///
     /// # Safety
     ///
-    /// As for [`CiphertextBuf::attach_received`].
+    /// As for [`CiphertextBuf::recv_done`].
     #[cfg(has_io_uring)]
-    pub(crate) unsafe fn attach_received(&mut self, buf: Vec<u8>, received: usize) {
+    pub(crate) unsafe fn recv_done(&mut self, received: usize) {
         // SAFETY: forwarded to the caller.
-        unsafe { self.incoming.attach_received(buf, received) }
+        unsafe { self.incoming.recv_done(received) }
+    }
+
+    /// See [`CiphertextBuf::take_in_flight`].
+    #[cfg(has_io_uring)]
+    pub(crate) fn take_in_flight(&mut self) -> Option<Vec<u8>> {
+        self.incoming.take_in_flight()
     }
 
     /// Borrow the rustls connection, the ciphertext buffer and the deferred
@@ -561,7 +567,7 @@ fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {
 /// `ciphertext` is chunked at [`MAX_SINGLE_APPEND`]: `CiphertextBuf::append`
 /// `debug_assert`s that bound (silent in release). On io_uring the receive
 /// path does not come here: it receives into the buffer
-/// ([`UnbufferedConn::detach_for_recv`]) and calls [`drive`].
+/// ([`UnbufferedConn::arm_recv`]) and calls [`drive`].
 ///
 /// `append` is all-or-nothing and returns `WouldBlock` when the buffer holds
 /// only live data. That is backpressure, not an error: drive first (which

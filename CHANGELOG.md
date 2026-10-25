@@ -225,11 +225,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   writes into the buffer rustls processes records in, which removes one copy
   per received byte; a TLS receive costs 2 copies instead of 3. With
   `tls-buffered` it writes into a worker buffer that `read_tls` copies from,
-  as from a provided buffer before. The ring `recv_buffer` and
+  as from a provided buffer before. The ring that `recv_buffer` and
   `recv_incremental` configure is still registered, but no TCP connection
   receives into it. `ringline/recv_direct` counts TLS receives and their
-  bytes. A TLS connection waiting in a read holds a buffer of at least
-  `recv_direct_region` bytes in its receive.
+  bytes. With `tls-buffered`, each TLS receive in flight holds a pooled
+  buffer of `recv_direct_region` bytes; the unbuffered engine receives into
+  its existing ciphertext buffer. A TLS receive that cannot be submitted
+  closes the connection, as a plaintext one does; before, it was retried.
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
   buffered engine; `tls-unbuffered` has no effect and is kept so builds that

@@ -7,6 +7,9 @@ segment readers.
 Note (2026-10-25): `forward_to` (Mode A), the segment hold
 (`segment_hold`, `HeldRecvBuf`) and `recv_segment_reserve` were removed.
 
+Note (2026-10-25): TLS connections receive directly into their TLS engine's
+ciphertext buffer, so no TCP connection receives into the TCP ring.
+
 Status: steps 0, 2 and 3 are implemented (#632, #633), and step 4 behind
 `recv_incremental` (#634–#636; 4b-2's recv-forward and direct-echo paths
 were removed in 0.7.0-alpha.5). Steps 1, 5, 6 and 7 are not. The receive

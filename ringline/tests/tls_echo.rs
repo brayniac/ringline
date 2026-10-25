@@ -1880,12 +1880,12 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
 fn a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     tls_forward_to_stuck_sink(false);
-    // `recv_multishot` has no effect on a TLS connection's receive.
+    // `recv_multishot` has no effect.
     tls_forward_to_stuck_sink(true);
 }
 
-/// One run of `a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer`, with
-/// one-shot or multishot ring receives.
+/// One run of `a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer`,
+/// with `recv_multishot` off or on.
 fn tls_forward_to_stuck_sink(multishot: bool) {
     const LIMIT: u64 = 64 << 20;
 
@@ -2509,4 +2509,161 @@ fn tls_sends_while_a_receive_is_in_flight() {
         h.join().expect("worker panicked").expect("worker failed");
     }
     assert_eq!(result, Ok(b"done".to_vec()));
+}
+
+// ── A send or close during a read, with a partial handshake message ─────
+
+static PARTIAL_TICKET_SERVER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static PARTIAL_TICKET_SEND: Mutex<bool> = Mutex::new(true);
+
+/// Splits whole TLS records.
+fn split_tls_records(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut records = Vec::new();
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        let len = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as usize;
+        records.push(bytes[i..i + 5 + len].to_vec());
+        i += 5 + len;
+    }
+    records
+}
+
+/// Connects with TLS, parks a read, and from another task sends `hello` or
+/// closes while the read is parked.
+struct PartialTicketClient;
+
+impl AsyncEventHandler for PartialTicketClient {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let addr = PARTIAL_TICKET_SERVER.lock().unwrap().expect("server addr");
+        let send = *PARTIAL_TICKET_SEND.lock().unwrap();
+        Some(Box::pin(async move {
+            let Ok(conn) = ringline::connect(addr).tls("localhost").await else {
+                return;
+            };
+            let (mut tx, mut rx) = conn.split();
+            let _ = ringline::spawn(async move {
+                ringline::sleep(Duration::from_millis(300)).await;
+                if send {
+                    if let Ok(f) = tx.send(b"hello") {
+                        let _ = f.await;
+                    }
+                } else {
+                    tx.close();
+                }
+            });
+            let _ = ringline::timeout(
+                Duration::from_secs(5),
+                rx.with_data(|d| ParseResult::Consumed(d.len())),
+            )
+            .await;
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        PartialTicketClient
+    }
+}
+
+/// The server fragments its NewSessionTicket into 32-byte records, sends the
+/// first, and holds the rest while the ringline client, with a read parked,
+/// sends or closes. Returns the plaintext the server read, and whether it
+/// read a close_notify.
+fn partial_ticket_exchange(send: bool) -> (Vec<u8>, bool) {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *PARTIAL_TICKET_SEND.lock().unwrap() = send;
+    let (certs, key) = generate_self_signed();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    *PARTIAL_TICKET_SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    let server_certs = certs.clone();
+    let server = std::thread::spawn(move || {
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(server_certs, key)
+            .unwrap();
+        config.max_fragment_size = Some(32);
+        let mut tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = vec![0u8; 65536];
+        while tls.is_handshaking() {
+            let mut out = Vec::new();
+            while tls.wants_write() {
+                tls.write_tls(&mut out).unwrap();
+            }
+            tcp.write_all(&out).unwrap();
+            if !tls.is_handshaking() {
+                break;
+            }
+            let n = tcp.read(&mut buf).expect("read the client's flight");
+            assert!(n > 0, "the client closed during the handshake");
+            tls.read_tls(&mut &buf[..n]).unwrap();
+            tls.process_new_packets().unwrap();
+        }
+        let mut tickets = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut tickets).unwrap();
+        }
+        let records = split_tls_records(&tickets);
+        assert!(
+            records.len() >= 2,
+            "the ticket spans {} records",
+            records.len()
+        );
+        tcp.write_all(&records[0]).unwrap();
+        // Read what the client sends while the rest of the ticket is held.
+        let mut got = Vec::new();
+        let mut closed = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !closed && got.len() < 5 {
+            let n = match tcp.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            tls.read_tls(&mut &buf[..n]).unwrap();
+            let state = tls.process_new_packets().expect("the client's records");
+            let pending = state.plaintext_bytes_to_read();
+            let mut plain = vec![0u8; pending];
+            tls.reader().read_exact(&mut plain).unwrap();
+            got.extend_from_slice(&plain);
+            closed = state.peer_has_closed();
+        }
+        for record in &records[1..] {
+            let _ = tcp.write_all(record);
+        }
+        (got, closed)
+    });
+
+    let config = test_config_builder()
+        .tls_client(ringline::TlsClientConfig::new(client_tls_config(&certs)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .launch::<PartialTicketClient>()
+        .expect("launch failed");
+    let result = server.join().expect("server thread");
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    result
+}
+
+/// A send while a read is parked and rustls holds part of a handshake
+/// message reaches the peer.
+#[test]
+fn a_send_during_a_read_with_a_partial_handshake_message() {
+    let (got, _) = partial_ticket_exchange(true);
+    assert_eq!(got, b"hello");
+}
+
+/// A close in the same state sends close_notify.
+#[test]
+fn a_close_during_a_read_with_a_partial_handshake_message() {
+    let (_, closed) = partial_ticket_exchange(false);
+    assert!(closed, "the server did not read a close_notify");
 }

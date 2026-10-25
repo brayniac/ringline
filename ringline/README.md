@@ -8,9 +8,9 @@ ringline is a thread-per-core I/O framework. It provides an async/await API
 
 ## What ringline is
 
-- An io_uring backend that exploits advanced kernel features: plaintext
-  receives directly into each connection's buffer, ring-provided buffers for
-  TLS and UDP, SendMsgZc (zero-copy send), fixed file table
+- An io_uring backend that exploits advanced kernel features: TCP receives
+  directly into each connection's buffer, ring-provided buffers for UDP,
+  SendMsgZc (zero-copy send), fixed file table
 - A Mio backend for macOS and other Unix targets, for Linux kernels older
   than 6.1 (automatic build-time fallback), and for Linux builds using
   `force-mio`
@@ -89,7 +89,7 @@ Each worker thread owns its backend driver, executor, connection table
 io_uring backend, each worker also owns:
 
 - A dedicated **io_uring** instance (SQ + CQ)
-- A **ring-provided buffer pool** for TLS and UDP receives (kernel selects buffers at completion time); a plaintext TCP or Unix connection receives into its own accumulator
+- A **ring-provided buffer pool** for UDP receives (kernel selects buffers at completion time); a plaintext TCP or Unix connection receives into its own accumulator, and a TLS connection into its TLS engine's ciphertext buffer
 - A **send copy pool** for small sends and a **send slab** for scatter-gather zero-copy sends
 - A **fixed file table** for O(1) fd lookups (no per-syscall fd table traversal)
 
@@ -98,7 +98,7 @@ io_uring backend, each worker also owns:
 | Feature | Purpose |
 |---------|---------|
 | One-shot recv into the connection's buffer | Plaintext TCP and Unix receives, armed when a read parks — no copy from a shared buffer |
-| Ring-provided buffers | Kernel-managed recv buffer pool for TLS and UDP — kernel picks buffer at completion time |
+| Ring-provided buffers | Kernel-managed recv buffer pool for UDP — kernel picks buffer at completion time |
 | Multishot recv | UDP — one SQE, many completions |
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |
 | Fixed file table | Direct descriptors — no per-syscall fd table lookup |

@@ -185,9 +185,8 @@ occupant.
 
 A plaintext connection on io_uring, accepted or outbound, receives directly
 into its accumulator (`docs/recv-direct-design.md`). A TLS connection on
-io_uring receives ciphertext into a provided buffer, feeds it to rustls and
-returns the buffer to the ring; rustls copies the plaintext into the
-accumulator. `with_bytes` provides zero-copy slicing of the accumulator, not a
+io_uring receives ciphertext directly into its TLS engine's buffer and feeds
+it to rustls; rustls copies the plaintext into the accumulator. `with_bytes` provides zero-copy slicing of the accumulator, not a
 reference to kernel-owned ring memory.
 
 `send_nowait` eagerly submits an owned copy and returns without a future.
@@ -223,7 +222,7 @@ See `docs/tls-premutation-bound-design.md`.
 
 TLS is implemented with rustls in the worker thread; it is not a separate
 thread or executor. Inbound TLS connections create a `TlsConn` after slot
-allocation but defer `on_accept` until `feed_tls_recv` reports
+allocation but defer `on_accept` until feeding received ciphertext reports
 `HandshakeJustCompleted`. An outbound `connect(addr).tls(..)` similarly resolves only after
 the TCP connection and TLS handshake complete. Handshake messages and alerts
 use the normal per-connection send queue.

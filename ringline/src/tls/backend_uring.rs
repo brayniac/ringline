@@ -133,28 +133,45 @@ fn finish_unbuffered_feed(
     }
 }
 
-/// The buffer a direct receive on `conn_index` writes ciphertext into, and
-/// how many bytes it may write behind the buffer's length. The unbuffered
-/// engine lends its own incoming-ciphertext buffer, holding any partial
-/// record at its front, so the receive costs no copy into it; the buffered
-/// engine takes a free buffer from the table. `want` is the receive size the
-/// caller asks for.
+/// Where a direct receive on a TLS connection writes ciphertext.
+pub struct TlsRecvTarget {
+    /// A buffer the receive owns while it is in flight: with the buffered
+    /// engine, a buffer from the table's free list. `None` with the
+    /// unbuffered engine, whose receive writes into the connection's own
+    /// ciphertext buffer.
+    pub buf: Option<Vec<u8>>,
+    /// Where the receive writes.
+    pub ptr: *mut u8,
+    /// How many bytes it may write.
+    pub len: usize,
+}
+
+/// Start a direct receive on `conn_index`, asking for up to `want` bytes.
+/// The unbuffered engine receives behind the unprocessed bytes of its
+/// incoming-ciphertext buffer, so no copy is made into it, and keeps those
+/// bytes readable while the receive is in flight; the buffered engine
+/// receives into a free buffer from the table, which `read_tls` copies from.
 ///
 /// `None` if the slot has no TLS state, or if the unbuffered engine's buffer
 /// is already full of unprocessed bytes, which a conforming peer cannot
 /// cause.
-pub fn tls_recv_buffer(
+pub fn tls_recv_arm(
     tls_table: &mut TlsTable,
     conn_index: u32,
     want: usize,
-) -> Option<(Vec<u8>, usize)> {
+) -> Option<TlsRecvTarget> {
     #[cfg(not(feature = "tls-buffered"))]
     {
-        tls_table
+        let (ptr, len) = tls_table
             .get_mut(conn_index)?
             .conn
             .as_unbuffered_mut()?
-            .detach_for_recv(want)
+            .arm_recv(want)?;
+        Some(TlsRecvTarget {
+            buf: None,
+            ptr,
+            len,
+        })
     }
     #[cfg(feature = "tls-buffered")]
     {
@@ -164,40 +181,71 @@ pub fn tls_recv_buffer(
         let mut buf = tls_table.recv_buffers.pop().unwrap_or_default();
         buf.clear();
         buf.reserve(want);
-        Some((buf, want))
+        let ptr = buf.as_mut_ptr();
+        Some(TlsRecvTarget {
+            buf: Some(buf),
+            ptr,
+            len: want,
+        })
     }
 }
 
-/// Give back a buffer from [`tls_recv_buffer`] whose receive wrote nothing.
-/// A connection whose TLS state is gone drops it.
-pub fn tls_recv_return(tls_table: &mut TlsTable, conn_index: u32, buf: Vec<u8>) {
+/// End a receive from [`tls_recv_arm`] that wrote nothing, giving back what
+/// it held. A buffered-engine buffer goes back to the free list.
+pub fn tls_recv_cancel(tls_table: &mut TlsTable, conn_index: u32, buf: Option<Vec<u8>>) {
     #[cfg(not(feature = "tls-buffered"))]
-    if let Some(conn) = tls_table
-        .get_mut(conn_index)
-        .and_then(|c| c.conn.as_unbuffered_mut())
     {
-        // SAFETY: nothing was written behind the buffer's length.
-        unsafe { conn.attach_received(buf, 0) };
+        debug_assert!(buf.is_none());
+        if let Some(conn) = tls_table
+            .get_mut(conn_index)
+            .and_then(|c| c.conn.as_unbuffered_mut())
+        {
+            // SAFETY: nothing was written.
+            unsafe { conn.recv_done(0) };
+        }
     }
     #[cfg(feature = "tls-buffered")]
     {
         let _ = conn_index;
-        tls_table.recv_buffers.push(buf);
+        if let Some(buf) = buf {
+            tls_table.recv_buffers.push(buf);
+        }
     }
 }
 
-/// Feed the `received` bytes a direct receive wrote into `buf` (from
-/// [`tls_recv_buffer`]) to the TLS connection: decrypted plaintext goes to
-/// the accumulator, and TLS output (handshake responses, alerts) is appended
-/// to `out_sends`. The output is appended whatever the outcome, since an
-/// alert generated on the way to a fatal error still has to reach the peer,
-/// and the caller must queue it whatever the result, or the pool slots leak.
+/// Take the allocation an in-flight receive on `conn_index` writes into out
+/// of the connection's TLS state, so that dropping the state does not free
+/// it. `None` when no receive is in flight, and always with the buffered
+/// engine, whose receive owns its buffer.
+pub fn tls_take_recv_allocation(tls_table: &mut TlsTable, conn_index: u32) -> Option<Vec<u8>> {
+    #[cfg(not(feature = "tls-buffered"))]
+    {
+        tls_table
+            .get_mut(conn_index)?
+            .conn
+            .as_unbuffered_mut()?
+            .take_in_flight()
+    }
+    #[cfg(feature = "tls-buffered")]
+    {
+        let _ = (tls_table, conn_index);
+        None
+    }
+}
+
+/// Feed the `received` bytes a receive from [`tls_recv_arm`] wrote to the
+/// TLS connection: decrypted plaintext goes to the accumulator, and TLS
+/// output (handshake responses, alerts) is appended to `out_sends`. The
+/// output is appended whatever the outcome, since an alert generated on the
+/// way to a fatal error still has to reach the peer, and the caller must
+/// queue it whatever the result, or the pool slots leak. `buf` is the
+/// target's `buf`.
 ///
 /// # Safety
 ///
-/// `buf` must come from [`tls_recv_buffer`] for this connection, and the
-/// `received` bytes at `buf.len()` must have been written, within the room
-/// `tls_recv_buffer` returned.
+/// The receive must come from [`tls_recv_arm`] for this connection, and the
+/// `received` bytes at the target's `ptr` must have been written, within its
+/// `len`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn feed_tls_received(
     tls_table: &mut TlsTable,
@@ -205,12 +253,13 @@ pub unsafe fn feed_tls_received(
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
-    buf: Vec<u8>,
+    buf: Option<Vec<u8>>,
     received: usize,
     out_sends: &mut Vec<BuiltSend>,
 ) -> TlsRecvResult {
     #[cfg(not(feature = "tls-buffered"))]
     {
+        debug_assert!(buf.is_none());
         let Some(tls_conn) = tls_table.get_mut(conn_index) else {
             return TlsRecvResult::Closed;
         };
@@ -218,7 +267,7 @@ pub unsafe fn feed_tls_received(
             return TlsRecvResult::Closed;
         };
         // SAFETY: forwarded to the caller.
-        unsafe { conn.attach_received(buf, received) };
+        unsafe { conn.recv_done(received) };
         let mut scratch = Vec::new();
         let outcome = unbuffered::drive(tls_conn, Some(accumulators), &mut scratch, conn_index);
         finish_unbuffered_feed(
@@ -233,10 +282,12 @@ pub unsafe fn feed_tls_received(
     }
     #[cfg(feature = "tls-buffered")]
     {
-        let mut buf = buf;
-        // SAFETY: forwarded to the caller; `tls_recv_buffer` hands out an
+        let Some(mut buf) = buf else {
+            return TlsRecvResult::Closed;
+        };
+        // SAFETY: forwarded to the caller; `tls_recv_arm` hands out an
         // empty buffer, so the received bytes start at 0.
-        unsafe { buf.set_len(buf.len() + received) };
+        unsafe { buf.set_len(received) };
         let result = buffered::feed_tls_recv_buffered(
             tls_table,
             accumulators,

@@ -47,8 +47,8 @@ On io_uring a plaintext connection receives directly into its accumulator:
 the kernel copies from its socket buffers into the accumulator, and no copy
 follows in user space, except when the accumulator grows to fit a longer
 message and moves the part already received. A TLS connection's ciphertext
-lands in a provided buffer and goes to rustls; the copies on that path are
-counted in `docs/syscalls-and-copies.md`.
+is received into its TLS engine's buffer and goes to rustls; the copies on
+that path are counted in `docs/syscalls-and-copies.md`.
 io_uring zcrx (`IORING_OP_RECV_ZC`, netdev queue + refill ring, merged
 ~6.15) removes the kernel's copy: it DMA-places packet payload into
 user-registered memory; completions carry

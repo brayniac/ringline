@@ -1319,6 +1319,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             crate::backend::uring::driver::DirectRecvBuf::Tls(buf) => {
                 if !live {
                     metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
+                    // A closing connection still has its TLS state, which
+                    // must leave the in-flight state. Once the state is gone,
+                    // `buf` holds whatever the receive owned, and drops here.
+                    let same = self.driver.connections.generation(conn_index) == entry.generation;
+                    if same
+                        && let Some(t) =
+                            self.driver.tls_table.as_mut().filter(|t| t.has(conn_index))
+                    {
+                        crate::tls::tls_recv_cancel(t, conn_index, buf);
+                    }
                     return;
                 }
                 self.handle_tls_recv_direct(conn_index, entry.generation, buf, result);
@@ -1465,22 +1475,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Completion of a TLS connection's direct receive: `buf` is the buffer
-    /// its TLS engine lent (`tls_recv_buffer`), and `result` the bytes the
-    /// kernel wrote behind its contents, or an error. The bytes are fed to
-    /// the engine, and the receive is re-armed while the handshake runs or
-    /// after a hangup (`rearms_after_completion`); otherwise the next parked
-    /// read arms it. The buffer goes back to the engine on every path.
+    /// Completion of a live TLS connection's direct receive
+    /// (`tls_recv_arm`): `buf` is what the receive owned, and `result` the
+    /// bytes the kernel wrote, or an error. The bytes are fed to the engine,
+    /// and the receive is re-armed while the handshake runs or after a hangup
+    /// (`rearms_after_completion`); otherwise the next parked read arms it.
+    /// Every path ends the receive in the engine.
     fn handle_tls_recv_direct(
         &mut self,
         conn_index: u32,
         generation: u32,
-        buf: Vec<u8>,
+        buf: Option<Vec<u8>>,
         result: i32,
     ) {
         if result <= 0 {
             if let Some(t) = self.driver.tls_table.as_mut() {
-                crate::tls::tls_recv_return(t, conn_index, buf);
+                crate::tls::tls_recv_cancel(t, conn_index, buf);
             }
             if result == 0 {
                 // TCP FIN. Only a clean end of stream if the peer's
@@ -1534,9 +1544,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let Some(tls_table) = self.driver.tls_table.as_mut() else {
             return;
         };
-        // SAFETY: `buf` came from `tls_recv_buffer` for this connection, and
-        // the kernel wrote `received` bytes behind its length, within the
-        // room the receive was armed with.
+        // SAFETY: the receive came from `tls_recv_arm` for this connection,
+        // and the kernel wrote `received` bytes at its target, within the
+        // length it was armed with.
         let tls_result = unsafe {
             crate::tls::feed_tls_received(
                 tls_table,
@@ -4361,9 +4371,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        if let Some(ref mut tls_table) = self.driver.tls_table {
-            tls_table.remove(conn_index);
-        }
+        self.driver.release_tls_state(conn_index);
 
         if was_established {
             metrics::CONNECTIONS.increment(metrics::conn::CLOSED);
@@ -9475,7 +9483,9 @@ mod tests {
         let entry = el.driver.direct_recvs[slot].as_mut().expect("entry in use");
         let spare = match &mut entry.buf {
             crate::backend::uring::driver::DirectRecvBuf::Accumulator(b) => b.spare_capacity_mut(),
-            crate::backend::uring::driver::DirectRecvBuf::Tls(b) => b.spare_capacity_mut(),
+            crate::backend::uring::driver::DirectRecvBuf::Tls(_) => {
+                unreachable!("a plaintext direct receive")
+            }
         };
         for (d, &b) in spare.iter_mut().zip(data) {
             d.write(b);
