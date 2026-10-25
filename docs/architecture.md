@@ -229,8 +229,8 @@ the TCP connection and TLS handshake complete. Handshake messages and alerts
 use the normal per-connection send queue.
 
 Receive ciphertext is fed to rustls, and decrypted plaintext is copied from
-rustls into the accumulator. Send plaintext is
-encrypted into send-copy-pool storage. Guarded plaintext cannot remain
+rustls into the accumulator. Send plaintext is encrypted into send-copy-pool
+storage. Guarded plaintext cannot remain
 zero-copy through encryption. All TLS ciphertext chunks are serialized through
 the same connection queue: independent io_uring SQEs are not wire-ordered, so
 parallel TLS record submissions can interleave records.
@@ -272,8 +272,8 @@ Backpressure is bounded and explicit at each layer:
 
 An application's connection future returning is a close request, not permission
 to discard queued bytes. The io_uring driver marks `close_pending`, drains
-queued and in-flight sends in order, cancels an armed receive, and only then finalizes close. Stale CQEs
-are normal during teardown and must release only their own backing without
+queued and in-flight sends in order, cancels an armed receive, and only then
+finalizes close. Stale CQEs are normal during teardown and must release only their own backing without
 touching a reused connection.
 
 `Runtime::shutdown` sets a shared atomic flag, releases the listen gates, sets

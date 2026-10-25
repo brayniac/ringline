@@ -1853,8 +1853,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .is_some_and(|t| t.has(conn_index));
 
         // Every plaintext delivery is recorded before the bytes are lent or
-        // go to the accumulator. TLS records the plaintext
-        // the feed delivers, below.
+        // go to the accumulator. TLS records the plaintext the feed delivers,
+        // below.
         if !is_tls_conn {
             self.driver
                 .record_arrival(conn_index, bytes_received as usize);

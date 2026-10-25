@@ -7505,10 +7505,11 @@ fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool, case: &
 /// span many reads.
 ///
 /// Run twice against the same backend. The second proxy sets
-/// `forward_hold_cap(1)`, which is what actually exercises backpressure: on
-/// mio the source stops reading after a single queued send and only resumes
-/// when the sink drains; on io_uring the cap has no effect. At the default cap a localhost sink never backs up, so the resume
-/// path would go untested.
+/// `forward_hold_cap(1)`, which exercises backpressure on mio: the source stops
+/// reading after a single queued send and resumes when the sink drains. At the
+/// default cap a localhost sink never backs up, so the resume path would go
+/// untested. On io_uring the cap has no effect, and both runs take the same
+/// path.
 #[test]
 fn forward_to_conn_proxies_both_directions() {
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())

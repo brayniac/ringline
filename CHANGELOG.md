@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `forward_to_conn` on `ConnCtx`, `Connection` and `RecvHalf` forwards the
+  next `len` received bytes to another connection on the same worker, on
+  both backends. On io_uring it sends from the source's accumulator through
+  the sink's send queue; on mio it copies the bytes into sends queued on the
+  sink. A TLS sink is refused with `EPROTOTYPE`.
 - `metrics::park_abandon::RECEIVE_ARMED` (14, `op=receive_armed` on
   `ringline/park_abandoned`): a park whose install found a receive, hangup
   poll or hangup peek armed.
@@ -591,21 +596,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
-- **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), and
-  `ConfigBuilder::recv_segment_reserve`, which applied only to `forward_to`
-  sources. In 0.6 `forward_to` took any io_uring connection as a source and
-  wrote its provided buffers to a socket or buffered file without copying
-  them, except a TLS source's plaintext and buffers copied when the ring fell
-  below `recv_segment_reserve`. There is no replacement for a sink that is
-  not a ringline connection: read with `with_bytes` and write the bytes
-  yourself. For a file opened through `ringline::fs`, `fs::write` (unsafe)
-  writes from a `Bytes` without a copy if the caller holds it until the
-  write completes, and `fs::write_from` takes a `BytesMut` and costs one
-  copy. For a connection sink use `forward_to_conn` (new in this release),
-  which on io_uring sends from the source's accumulator through the sink's
-  send queue. `forward_hold_cap` now applies only to the mio
-  `forward_to_conn`; on io_uring no connection lends a receive buffer, so it
-  has no effect.
+- **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), which
+  wrote a connection's received bytes to a socket or file descriptor, and
+  `ConfigBuilder::recv_segment_reserve`, which in 0.6 applied to `forward_to`
+  sources and to the segment readers removed below. Nothing replaces
+  `forward_to` for a sink that is not a ringline connection: read with
+  `with_bytes` and write the bytes. For a connection sink use
+  `forward_to_conn` (see Added). `forward_hold_cap` now has no effect on
+  io_uring.
 - **Breaking:** the segment readers `segments`, `recv_owned_segment`,
   `with_segments` and `end_segments` (on `ConnCtx` in 0.6, io_uring only),
   and the types only they used: `SegmentReader`, `RecvSegment`,
@@ -812,17 +810,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `register_region` and `unregister_region` now still reach the remaining
   workers when one worker has exited, and `unregister_region` then clears the
   slot on every running worker before returning the error.
-
-- io_uring: a park (connection rebalancing, #443) sends its fd install only
-  while the connection has no receive armed. Three paths could re-arm a
-  receive during the drain: the end-of-completion re-arm after a receive
-  ended with data (on a full completion queue), the throttle re-arm once a
-  held backlog drained, and the starved pass
-  once buffers returned after an `ENOBUFS` end. The install then went out
-  with the receive live, so this worker could read bytes after the socket
-  moved. An install that fails, or that finds the connection no longer
-  parkable, now re-arms the receive; before, the connection could stay
-  open with none armed.
 
 - io_uring: a zero-copy send (`SendMsgZc`) that returned `-ENOMEM`, because
   the pages it pins did not fit under `RLIMIT_MEMLOCK`, was dropped together
