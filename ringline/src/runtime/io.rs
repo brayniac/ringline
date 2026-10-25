@@ -1198,6 +1198,10 @@ impl ConnCtx {
     /// [`AsyncEventHandler::on_adopt`](crate::AsyncEventHandler::on_adopt),
     /// so `state` is the only thing that survives.
     ///
+    /// Once the connection is parked, sends on this handle, from the handler,
+    /// a spawned task or `on_tick`, return `NotConnected` until the future is
+    /// dropped.
+    ///
     /// **This is the opt-in.** A connection whose handler never calls this is
     /// never parked, whatever the load imbalance.
     ///

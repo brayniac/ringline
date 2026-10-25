@@ -2685,8 +2685,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // The socket belongs to the target worker from here. Commit the Close
         // now so every send path refuses (`close_submitted`) instead of
         // queueing bytes, unencrypted once the TLS state has left, onto it.
-        // The gate guaranteed no sends, chain or shutdown, so this submits.
+        // The gate guaranteed no sends, chain or shutdown, so this sets
+        // `close_submitted` and pushes the Close, or queues it on
+        // `pending_close_retries` when the SQ is full.
         self.driver.try_finalize_close(conn_index);
+        debug_assert!(self.driver.send_queues[conn_index as usize].close_submitted);
 
         metrics::CONNECTIONS.increment(metrics::conn::PARK_COMPLETED);
         self.driver.park_ready.push(crate::park::ParkedFd {
