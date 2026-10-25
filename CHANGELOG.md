@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `forward_to_conn` on `ConnCtx`, `Connection` and `RecvHalf` forwards the
+  next `len` received bytes to another connection on the same worker, on
+  both backends. On io_uring it sends from the source's accumulator through
+  the sink's send queue; on mio it copies the bytes into sends queued on the
+  sink. A TLS sink is refused with `EPROTOTYPE`. On mio the source stops
+  reading while the sink has `forward_hold_cap` sends queued.
 - `metrics::park_abandon::RECEIVE_ARMED` (14, `op=receive_armed` on
   `ringline/park_abandoned`): a park whose install found a receive, hangup
   poll or hangup peek armed.
@@ -31,9 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   region; a larger message borrows a buffer from a per-worker pool of up to
   `ConfigBuilder::recv_direct_pool_max` free bytes (default 16 MiB) and gives
   it back when nothing is buffered and no `Bytes` read from it is alive. A
-  `ConnStream` read arms the receive the same way. `forward_to`, which needs
-  provided buffers, returns `io::ErrorKind::Unsupported` on such a
-  connection. `forward_to_conn` from such a connection sends each
+  `ConnStream` read arms the receive the same way. `forward_to_conn` from
+  such a connection sends each
   received chunk from the accumulator through the sink's send queue,
   zero-copy at or above `send_zc_threshold`. Counters in
   `ringline/recv_direct`. `ConnCtx::is_recv_direct` (also on `Connection`
@@ -110,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Data is lent (held in place) only while at most half the ring's buffers
   have a hold (a lend, or a completion whose release is queued for the
   next flush), and copied above that (`ringline/recv_ring`
-  `lend_refused`); `recv_segment_reserve` is ignored, and the fallback
+  `lend_refused`), and the fallback
   receive reads 1 MiB chunks, re-arming the multishot instead when the
   ring's free buffers hold more. With `prefault_buffers(true)` the plain
   geometry makes 256 MiB per worker resident.
@@ -178,8 +183,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
   listener can be named before any connection has arrived.
 - `metrics::recv_ring::BYTES_COPIED` counts bytes copied into receive
-  storage (the accumulator, owned held entries, owned forward copies and
-  queued TLS plaintext) on both backends.
+  storage (the accumulator and queued TLS plaintext) on both backends.
 - `metrics::CQE_BY_TAG`: completions processed, split by `OpTag`, with
   `metrics::cqe_tag::COUNT` sizing the group. The slot index is the tag's
   discriminant, and `CQE_BY_TAG` plus `ring::CQE_UNKNOWN_TAG` partition
@@ -237,9 +241,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - io_uring: a TLS connection's ring receive is armed when a read parks once
   its handshake is done, as a plaintext connection's direct receive is, so a
   task that does not read stops its peer instead of buffering up to
-  `recv_accumulator_max` (1 GiB by default). During the handshake, in the
-  segmented domain (a `forward_to` source), and after the peer closes, the
-  receive is re-armed after each completion. A loop that polls
+  `recv_accumulator_max` (1 GiB by default). During the handshake and after
+  the peer closes, the receive is re-armed after each completion. A loop that polls
   `try_with_data` without ever parking a read no longer sees new bytes, as
   on a plaintext connection. A TLS connection now arms the `POLLRDHUP`
   hangup poll, so a peer FIN or reset is seen, and `is_alive` returns
@@ -248,22 +251,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   next completes; on mio it is read when it arrives. `forward_to_conn` from
   a TLS source takes the bytes from the accumulator and sends them through
   the sink's send queue, as from a plaintext source: ordered with other
-  sends on the sink, with one chunk buffered rather than up to
-  `forward_hold_cap` entries, and below `send_zc_threshold` copied into a
-  pool slot. A zero-copy send of such a forward to a sink that does not read
-  holds worker exit for up to its bound, as any guarded send does. A
-  `forward_to` started while a `forward_to_conn` sends from the accumulator
-  gets `EBUSY`. `recv_multishot` has no effect: TLS connections, the only
+  sends on the sink, with one chunk buffered, and below `send_zc_threshold`
+  copied into a pool slot. A zero-copy send of such a forward to a sink that
+  does not read holds worker exit for up to its bound, as any guarded send
+  does. `recv_multishot` has no effect: TLS connections, the only
   ones it affected, always arm one-shot receives.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from
   `connect` or `connect_unix`, receives directly into its accumulator (see
   Added), and no option gives it the provided-buffer ring. On such a
-  connection `forward_to` returns `io::ErrorKind::Unsupported`, and
-  `try_with_data` returns `None` while a receive is in flight. `forward_to`
-  works on TLS connections. There is no replacement for it on a plaintext
-  connection on io_uring. Such a
+  connection `try_with_data` returns `None` while a receive is in flight.
+  Such a
   connection has a receive armed only when a read parks, and a `POLLRDHUP`
   poll armed when it opens. A FIN or reset from the peer closes a connection
   that nothing reads, and `is_alive` returns `false`. If bytes the peer sent
@@ -398,9 +397,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Pending` (#617).
 
 - The per-operation completion counters (`op` label) for io_uring rename
-  `send_msg_coalesced_poll_out`, `send_recv_bufs_coalesced_poll_out` and
-  `forward_write_poll_out` to `send_msg_coalesced_drain`,
-  `send_recv_bufs_coalesced_drain` and `forward_write_drain`, and add
+  `send_msg_coalesced_poll_out` and `send_recv_bufs_coalesced_poll_out` to
+  `send_msg_coalesced_drain` and `send_recv_bufs_coalesced_drain`, and add
   `send_msg_zc_drain`. Those operations are now plain sends, not `POLLOUT`
   polls (#603).
 
@@ -599,6 +597,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), which
+  wrote a connection's received bytes to a socket or a buffered file, and
+  `ConfigBuilder::recv_segment_reserve`, which in 0.6 applied to `forward_to`
+  sources and to the segment readers removed below. Nothing replaces
+  `forward_to` for a sink that is not a ringline connection: read with
+  `with_bytes` and write the bytes. For a connection sink use
+  `forward_to_conn` (see Added). `forward_hold_cap` now has no effect on
+  io_uring.
 - **Breaking:** the segment readers `segments`, `recv_owned_segment`,
   `with_segments` and `end_segments` (on `ConnCtx` in 0.6, io_uring only),
   and the types only they used: `SegmentReader`, `RecvSegment`,
@@ -606,7 +612,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   They read held buffers of the provided-buffer ring, which on io_uring only
   a TLS connection receives through. Parse with `with_bytes`, whose parser
   gets the buffered bytes as one `Bytes` it can slice without copying, or
-  with `with_data`. `forward_to` and `forward_to_conn` remain.
+  with `with_data`.
 - **Breaking:** `metrics::pool::SEGMENT_STRANDED_ADOPTED`, the
   `segment_stranded_adopted` op of `ringline/pool`, which counted bytes a
   segment reader found in the accumulator. Slot 7 of the group is unused.
@@ -625,6 +631,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   receive.
 - **Breaking:** `metrics::park_abandon::DIRECT_ECHO` and the `direct_echo`
   op of `ringline/park_abandoned`.
+- **Breaking:** `metrics::park_abandon::FORWARD_WRITE` and the
+  `forward_write` op of `ringline/park_abandoned`. Slot 8 is unused.
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
   ringline-redis `Client::get_stream` and `Pool::get_stream` (and
@@ -697,14 +705,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A TLS send made after the alert is queued returns `NotConnected`, since
   the peer discards records that follow it; on mio such a send goes out
   ahead of the alert.
-- io_uring: a TLS connection that is a `forward_to` source stops receiving
-  once its hold reaches the hold cap (`forward_hold_cap`; without
-  `recv_incremental`, at most a quarter of the receive ring's buffers) and
-  receives again once the hold drains. Before, it kept receiving whatever
-  its sink did, its hold grew to
-  `recv_accumulator_max` (1 GiB by default), and the connection was then
-  closed. A plaintext connection receives only when a read or a forward asks
-  for bytes, so it was already stopped.
 - `ringline-redis`, `ringline-memcache` and `ringline-ping` `Pool::client`
   reconnect a slot whose connection is no longer alive (`is_alive()` is
   `false`) instead of handing it out. A connection the server closed while
@@ -716,11 +716,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   arrived while it had unread bytes. The reconnect runs inside `client()`,
   which waits for the connect (and AUTH on redis), bounded per slot by
   `connect_timeout_ms`; with the default of 0 there is no bound.
-- io_uring: `recv_ready` resolves for bytes in a lent receive buffer and in
-  the segment hold, as well as for bytes in the accumulator. It stayed pending
-  for a receive lent in place on a connection with an empty accumulator until
-  the next receive or the close, and for bytes in the segment hold until the
-  close or until the hold was moved into the accumulator. mio is unchanged.
+- io_uring: `recv_ready` resolves for bytes in a lent receive buffer, as
+  well as for bytes in the accumulator. It stayed pending for a receive lent
+  in place on a connection with an empty accumulator until the next receive
+  or the close. mio is unchanged.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::rx_bytes` is 0 for an operation that fails at send. It
   reported the previous operation's byte count. The guarded SET paths
@@ -813,17 +812,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   workers when one worker has exited, and `unregister_region` then clears the
   slot on every running worker before returning the error.
 
-- io_uring: a park (connection rebalancing, #443) sends its fd install only
-  while the connection has no receive armed. Four paths could re-arm a
-  receive during the drain: the end-of-completion re-arm after a receive
-  ended with data (on a full completion queue), the throttle and
-  end-of-forward re-arms once a held backlog drained, and the starved pass
-  once buffers returned after an `ENOBUFS` end. The install then went out
-  with the receive live, so this worker could read bytes after the socket
-  moved. An install that fails, or that finds the connection no longer
-  parkable, now re-arms the receive; before, the connection could stay
-  open with none armed.
-
 - io_uring: a zero-copy send (`SendMsgZc`) that returned `-ENOMEM`, because
   the pages it pins did not fit under `RLIMIT_MEMLOCK`, was dropped together
   with every send queued behind it, after `send_parts` had returned `Ok`.
@@ -890,9 +878,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   peer has half-closed, the kernel returns `EAGAIN` from `sendmsg` and
   completes a `POLLOUT` poll at once with `POLLRDHUP` (6.12 and 7.1), so the
   loop's `sendmsg`, poll, `sendmsg` retry never waited. Coalesced copy
-  sends and `forward_to` / `forward_to_conn` socket and connection sinks
-  now answer `EAGAIN` with a plain `send` of the first
-  unsent bytes, which waits for room, and then resubmit the rest. A guard
+  sends now answer `EAGAIN` with a plain `send` of the first unsent bytes,
+  which waits for room, and then resubmit the rest. A guard
   send (`SendMsgZc`) outside `send_chain` failed with `WouldBlock` in the
   same state; it now waits and delivers as well. While a send waits on a
   half-closed socket it holds an io-wq kernel thread, as plain copy and TLS

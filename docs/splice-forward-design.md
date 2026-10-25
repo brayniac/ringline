@@ -1,5 +1,9 @@
 # Splice-backed forwarding — designed, built, measured, rejected
 
+Note (2026-10-25): `forward_to` and `SinkFd` were removed. The baseline
+measured here no longer exists; `forward_to_conn` sends from the source's
+accumulator.
+
 **Status: rejected on measurement (#407). Do not re-propose for the io_uring
 backend without reading "What the measurements said".**
 

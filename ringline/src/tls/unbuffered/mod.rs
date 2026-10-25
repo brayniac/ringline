@@ -32,7 +32,7 @@
 //! [`feed`] ingests received ciphertext through
 //! [`super::ciphertext::CiphertextBuf`] and runs [`drive`], the
 //! `ConnectionState` loop, until it blocks; handshake records and alerts land
-//! in the caller's `out` buffer, decrypted plaintext in a [`PlaintextSink`].
+//! in the caller's `out` buffer, decrypted plaintext in the recv accumulator.
 //! [`encrypt_to_vec`]/[`encrypt_chunk`] are the send path, and
 //! [`queue_close_notify`] the shutdown one.
 
@@ -45,8 +45,9 @@ use rustls::pki_types::ServerName;
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
 
+use super::TlsConn;
 use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MAX_SINGLE_APPEND, MIN_CIPHERTEXT_CAP};
-use super::{PlaintextSink, TlsConn};
+use crate::accumulator::AccumulatorTable;
 
 /// A rustls connection driven through the *unbuffered* API
 /// (`process_tls_records` + `WriteTraffic::encrypt`).
@@ -123,9 +124,9 @@ pub struct UnbufferedConn {
     /// surface for it would be hard to walk back. Revisit if a rig sweep shows
     /// the cap binding — see `docs/journal/2026-09-unbuffered-tls.md`.
     incoming: CiphertextBuf,
-    /// Plaintext popped from `ReadTraffic` while no [`super::PlaintextSink`]
-    /// was available (i.e. the send path drove the state machine and found
-    /// application data pending). The recv path drains this into the sink
+    /// Plaintext popped from `ReadTraffic` while no accumulator was
+    /// available (i.e. the send path drove the state machine and found
+    /// application data pending). The recv path drains this into the accumulator
     /// before touching rustls again, so the byte stream keeps its order.
     ///
     /// Expected to stay empty: the recv path always drives until no plaintext
@@ -293,7 +294,7 @@ pub(crate) enum DriveOutcome {
 /// reasoning, and the rule is stated there alone so the two cannot drift.
 pub(crate) fn drive(
     tls_conn: &mut TlsConn,
-    sink: Option<&mut PlaintextSink<'_>>,
+    sink: Option<&mut AccumulatorTable>,
     out: &mut Vec<u8>,
     conn_index: u32,
 ) -> DriveOutcome {
@@ -314,7 +315,7 @@ pub(crate) fn drive(
 
 fn drive_records(
     tls_conn: &mut TlsConn,
-    mut sink: Option<&mut PlaintextSink<'_>>,
+    mut sink: Option<&mut AccumulatorTable>,
     out: &mut Vec<u8>,
     conn_index: u32,
 ) -> DriveOutcome {
@@ -365,7 +366,7 @@ fn drive_inner<C: UnbufferedEngine>(
     conn: &mut C,
     incoming: &mut CiphertextBuf,
     pending: &mut VecDeque<Vec<u8>>,
-    mut sink: Option<&mut PlaintextSink<'_>>,
+    mut sink: Option<&mut AccumulatorTable>,
     out: &mut Vec<u8>,
     conn_index: u32,
 ) -> (DriveOutcome, bool) {
@@ -401,27 +402,11 @@ fn drive_inner<C: UnbufferedEngine>(
                             // retry. Stashing would only defer bytes nobody
                             // will read.
                             match sink.as_deref_mut() {
-                                Some(PlaintextSink::Accumulator(accs)) => {
+                                Some(accs) => {
                                     if !accs.append(conn_index, r.payload) {
                                         sink_overflow = true;
                                         break;
                                     }
-                                }
-                                #[cfg(has_io_uring)]
-                                Some(PlaintextSink::Segments {
-                                    hold,
-                                    outstanding,
-                                    max,
-                                }) => {
-                                    if outstanding.saturating_add(r.payload.len()) > *max {
-                                        sink_overflow = true;
-                                        break;
-                                    }
-                                    hold.push_back(crate::backend::HeldRecvBuf::Owned(
-                                        bytes::Bytes::copy_from_slice(r.payload),
-                                    ));
-                                    crate::accumulator::note_copied(r.payload.len());
-                                    *outstanding += r.payload.len();
                                 }
                                 None => {
                                     crate::accumulator::note_copied(r.payload.len());
@@ -570,7 +555,7 @@ fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {
 /// from spinning the worker.
 pub(crate) fn feed(
     tls_conn: &mut TlsConn,
-    mut sink: Option<&mut PlaintextSink<'_>>,
+    mut sink: Option<&mut AccumulatorTable>,
     out: &mut Vec<u8>,
     ciphertext: &[u8],
     conn_index: u32,
@@ -1062,12 +1047,12 @@ fn close_notify_with<C: UnbufferedEngine>(
     (result, peer_closed)
 }
 
-/// Move any stashed plaintext into `sink`, oldest first. Returns `false` if
-/// the sink hit its bound — the chunk is left in the stash and the caller must
+/// Move any stashed plaintext into `accumulators`, oldest first. Returns
+/// `false` if the accumulator hit its bound — the chunk is left in the stash and the caller must
 /// kill the connection, matching `drain_tls_plaintext`'s contract.
 fn drain_pending_plaintext(
     tls_conn: &mut TlsConn,
-    sink: &mut PlaintextSink<'_>,
+    accumulators: &mut AccumulatorTable,
     conn_index: u32,
 ) -> bool {
     let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
@@ -1075,27 +1060,8 @@ fn drain_pending_plaintext(
     };
     let (_, _, pending) = conn.split_mut();
     while let Some(chunk) = pending.front() {
-        match sink {
-            PlaintextSink::Accumulator(accs) => {
-                if !accs.append(conn_index, chunk) {
-                    return false;
-                }
-            }
-            #[cfg(has_io_uring)]
-            PlaintextSink::Segments {
-                hold,
-                outstanding,
-                max,
-            } => {
-                if outstanding.saturating_add(chunk.len()) > *max {
-                    return false;
-                }
-                hold.push_back(crate::backend::HeldRecvBuf::Owned(
-                    bytes::Bytes::copy_from_slice(chunk),
-                ));
-                crate::accumulator::note_copied(chunk.len());
-                *outstanding += chunk.len();
-            }
+        if !accumulators.append(conn_index, chunk) {
+            return false;
         }
         pending.pop_front();
     }

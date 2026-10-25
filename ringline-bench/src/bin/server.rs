@@ -327,10 +327,8 @@ struct Args {
     proxy_api: ProxyApi,
 
     /// (ringline) Provided recv buffer size in bytes. 0 (default) derives it
-    /// from `--msg-size`, which is the right default for echo but ties Mode A's
-    /// per-completion payload to the message size — at 256 B messages it gets
-    /// 4 KiB buffers against splice's 64 KiB pipe chunk, so a forwarding A/B
-    /// that does not set this is partly measuring the harness.
+    /// from `--msg-size`. On io_uring only TLS connections receive through the
+    /// provided-buffer ring.
     #[arg(long, default_value_t = 0)]
     recv_buffer_bytes: u32,
 

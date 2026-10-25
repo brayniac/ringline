@@ -196,7 +196,7 @@ impl ArrivalLog {
     /// connection's `buffered` count at the start of the call's resolving poll
     /// and once it has applied the parser's result. `report` is false for a
     /// call that resolved without reporting (nothing buffered for
-    /// `try_with_data`, end of stream, a close, or a hold overflow).
+    /// `try_with_data`, end of stream, or a close).
     ///
     /// The bytes the call removed are `before - after`, starting at
     /// `delivered - before`. Their first and last times become `latest`, and

@@ -787,50 +787,22 @@ pub enum TlsRecvResult {
     Closed,
 }
 
-/// Where decrypted TLS plaintext chunks are delivered by [`drain_tls_plaintext`].
-///
-/// TLS recv is *copy-per-chunk*: rustls owns its decrypted-plaintext buffer, so
-/// the bytes must be copied out either way — there is no zero-copy TLS recv (see
-/// `docs/segmented-recv-design.md`, "## TLS"). The sink chooses the destination
-/// of that copy based on the connection's recv domain.
-pub(crate) enum PlaintextSink<'a> {
-    /// Default path: append each chunk into the connection's contiguous recv
-    /// accumulator (one copy). Bounded by the accumulator's `max_size`
-    /// (`Config::recv_accumulator_max`); `append` returning `false` is the
-    /// flood-kill signal.
-    Accumulator(&'a mut AccumulatorTable),
-    /// Segmented recv domain (io_uring only): each drained plaintext chunk is
-    /// copied into an owned [`Bytes`] and pushed as a `HeldRecvBuf::Owned`
-    /// segment to the connection's hold. TLS segments are *always* owned — the
-    /// decrypt copy is the release, so they never pin the provided ring. The
-    /// same outstanding bound as the accumulator path is enforced: `outstanding`
-    /// tracks total held owned bytes and `max` mirrors `recv_accumulator_max`;
-    /// exceeding it is the flood-kill signal.
-    #[cfg(has_io_uring)]
-    Segments {
-        hold: &'a mut std::collections::VecDeque<crate::backend::HeldRecvBuf>,
-        outstanding: usize,
-        max: usize,
-    },
-}
-
-/// Drain all currently-decrypted plaintext from a TLS connection into `sink`,
-/// with no intermediate scratch buffer.
+/// Drain all currently-decrypted plaintext from a TLS connection into its recv
+/// accumulator, with no intermediate scratch buffer.
 ///
 /// rustls's `Reader` implements `BufRead`: `fill_buf()` exposes the decrypted
 /// plaintext in rustls's own buffer, and `consume()` advances past what we copied.
 /// rustls 0.23 keeps one `Vec` per record and `fill_buf` returns the front
 /// one, so each chunk is one record's plaintext, at most 16 KiB.
 ///
-/// Returns `false` if the sink hit its outstanding bound (accumulator
-/// `max_size`, or the held-plaintext `max` for the segmented domain) — the
+/// Returns `false` if the accumulator hit its bound (`max_size`) — the
 /// plaintext was NOT consumed from rustls, and the caller must treat the
 /// connection as broken (silently consuming would put a permanent gap in the
 /// byte stream; an unbounded plaintext flood must kill the connection).
 #[must_use]
 fn drain_tls_plaintext(
     tls_conn: &mut TlsConn,
-    sink: &mut PlaintextSink<'_>,
+    accumulators: &mut AccumulatorTable,
     conn_index: u32,
 ) -> bool {
     use std::io::BufRead;
@@ -847,30 +819,8 @@ fn drain_tls_plaintext(
             Err(_) => break,
         };
         let n = chunk.len();
-        match sink {
-            PlaintextSink::Accumulator(accumulators) => {
-                if !accumulators.append(conn_index, chunk) {
-                    return false;
-                }
-            }
-            #[cfg(has_io_uring)]
-            PlaintextSink::Segments {
-                hold,
-                outstanding,
-                max,
-            } => {
-                // Bound total outstanding held plaintext exactly as the
-                // accumulator path bounds its buffer: an over-limit chunk is
-                // NOT consumed from rustls, and the caller kills the connection.
-                if outstanding.saturating_add(n) > *max {
-                    return false;
-                }
-                hold.push_back(crate::backend::HeldRecvBuf::Owned(
-                    bytes::Bytes::copy_from_slice(chunk),
-                ));
-                crate::accumulator::note_copied(n);
-                *outstanding += n;
-            }
+        if !accumulators.append(conn_index, chunk) {
+            return false;
         }
         reader.consume(n);
     }

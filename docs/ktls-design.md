@@ -1,5 +1,7 @@
 # Kernel TLS (kTLS) — scoping
 
+Note (2026-10-25): `ConnCtx::forward_to` was removed.
+
 **Status:** Scoping only. No code, no plan of tasks, no commitment. Every
 load-bearing premise below carries a verification record; the ones that could
 not be verified are labelled, not smoothed over.

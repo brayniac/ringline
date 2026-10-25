@@ -1,5 +1,7 @@
 # One driver: an io_uring engine and a userspace ring emulator
 
+Note (2026-10-25): segmented recv and `forward_to` were removed.
+
 Status: proposal. Nothing here is implemented.
 
 ## Goal

@@ -1,5 +1,8 @@
 # Unbuffered TLS send path — design
 
+Note (2026-10-25): `PlaintextSink` was removed; the TLS feed functions take
+the accumulator table.
+
 **Status:** Implemented (PRs #338, #341, #345, #350) and the default engine;
 the `tls-buffered` feature selects the buffered one, and
 `tls-unbuffered` has no effect. The unbuffered engine captures the SNI hostname

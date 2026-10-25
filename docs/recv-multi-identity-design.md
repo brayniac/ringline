@@ -1,5 +1,7 @@
 # RecvMulti completion identity: carrying the connection generation
 
+Note (2026-10-25): `forward_to` (Mode A) was removed.
+
 ## 1. The bug
 
 `OpTag::RecvMulti` (and its `timestamps` twin `OpTag::RecvMsgMultiTs`) is the

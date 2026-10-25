@@ -97,11 +97,11 @@ Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
 | `Writev` | waits | `-EAGAIN` |
 | `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
 
-So a vectored send (`sendmsg`, `SendMsgZc`, `writev`) that returns `-EAGAIN`
+So a vectored send (`sendmsg`, `SendMsgZc`) that returns `-EAGAIN`
 is not retried behind a `POLLOUT` poll: that loop never waits and spins the
 worker's event loop (#603). The handler instead submits a plain `send` of the
 entry's first non-empty unsent iovec, under a `*Drain` tag
-(`SendMsgCoalescedDrain`, `SendMsgZcDrain`, `ForwardWriteDrain`). Its result
+(`SendMsgCoalescedDrain`, `SendMsgZcDrain`). Its result
 is a partial write of the same entry, so the drain tag's completion goes
 through the entry's own handler, which advances the iovecs and resubmits the
 rest with the entry's own operation. The entry stays the one operation in
@@ -142,12 +142,10 @@ chain (#642).
 
 `run_shutdown` closes every connection with the `CancelAll` lead, on every
 kernel, so a send waiting for room on a connection is cancelled, and a
-coalesced send's slab entry is released on its completion. A
-forward write's operation is on its sink's file, which that lead does not
-reach, so it is cancelled by its user_data. Entries parked on a retry list,
-with no operation in flight, are released first. It then waits, for at most
-100 × 100 ms, until every connection's `Close` has completed, every send-slab
-entry is released, and every forward write has completed. A zero-copy entry is
+coalesced send's slab entry is released on its completion. Entries parked on
+a retry list, with no operation in flight, are released first. It then waits,
+for at most 100 × 100 ms, until every connection's `Close` has completed and
+every send-slab entry is released. A zero-copy entry is
 released only once its notifications land, and the kernel posts them when the
 peer has acknowledged the data and the kernel has freed it. A peer that does
 not read keeps that data queued after the close, so such an entry holds the

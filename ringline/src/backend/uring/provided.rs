@@ -262,9 +262,6 @@ impl ProvidedBufRing {
     }
 
     /// Buffers currently available in the ring for the kernel to select.
-    ///
-    /// Consumed by the segmented-recv low-water reserve (the hold branch in
-    /// `handle_recv_multi` via `recv::occupancy::delivery_decision`).
     #[inline]
     pub fn free(&self) -> u32 {
         self.ring_entries().saturating_sub(self.outstanding)

@@ -3,9 +3,8 @@
 //! On io_uring the client's connection is a plaintext outbound connection,
 //! which receives directly into its accumulator (`docs/recv-direct-design.md`),
 //! so `RING`, `BUF` and the ring counters in the result line do not apply to
-//! it, and `MODE=forward`, which needs the ring, exits with an error.
-//! MODE=whole, bytes and mixed measure direct receive. On mio they
-//! measure the mio read path.
+//! it, and every MODE measures direct receive. On mio they measure the mio
+//! read path.
 //!
 //! Protocol: the ringline client sends a 4-byte little-endian length request;
 //! the in-process std-thread server echoes back exactly that many bytes. This
@@ -20,13 +19,10 @@
 //!   SECS      run duration seconds (default 5)
 //!   RING      provided-ring entry count / power of two (default 256)
 //!   BUF       provided-ring buffer size bytes (default 16384)
-//!   MODE      whole | bytes | mixed | forward (default whole)
+//!   MODE      whole | bytes | mixed (default whole)
 //!             whole    = with_data, parse a full response (1 accumulator copy)
 //!             bytes    = with_bytes (zero-copy value slices; redis-shaped)
 //!             mixed    = with_data, alternate SMALL/LARGE per round (index-derived)
-//!             forward  = Mode A forward_to a /dev/null sink (0 userspace copy)
-//!             (forward exits with status 2 on io_uring, where the
-//!             connection receives directly; on mio it runs as whole)
 //!   PORT      server port (default 7891)
 #![allow(clippy::manual_async_fn)]
 
@@ -122,28 +118,6 @@ impl AsyncEventHandler for Bench {
                     let conn = connect(target).await.expect("connect");
                     // Reading an outbound connection goes through its read half.
                     let (mut conn_tx, mut conn_rx) = conn.split();
-                    #[cfg(has_io_uring)]
-                    if mode == "forward" && conn_rx.is_recv_direct() {
-                        eprintln!(
-                            "[ring_fill_bench] MODE={mode} needs the provided-buffer ring, \
-                             and an outbound plaintext connection receives directly"
-                        );
-                        std::process::exit(2);
-                    }
-                    // MODE=forward forwards each response straight to a discard
-                    // sink (/dev/null) with no userspace copy. Opened once per task.
-                    #[cfg(has_io_uring)]
-                    let fwd_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open("/dev/null")
-                        .ok();
-                    #[cfg(has_io_uring)]
-                    let fwd_sink = {
-                        use std::os::fd::AsFd;
-                        fwd_file
-                            .as_ref()
-                            .and_then(|f| ringline::SinkFd::file(f.as_fd()).ok())
-                    };
                     let deadline = Instant::now() + Duration::from_secs(secs);
                     let mut bytes = 0u64;
                     let mut rounds = 0u64;
@@ -154,15 +128,6 @@ impl AsyncEventHandler for Bench {
                             break;
                         }
                         let got = match mode.as_str() {
-                            // Mode A: forward the response straight to the sink fd,
-                            // no userspace copy (recv buffers written by the kernel).
-                            #[cfg(has_io_uring)]
-                            "forward" => match fwd_sink.as_ref() {
-                                // Forwarding is a read-side operation, and the
-                                // `Connection` was consumed by `split` above.
-                                Some(sink) => conn_rx.forward_to(sink, want).await.unwrap_or(0),
-                                None => 0,
-                            },
                             "bytes" => {
                                 conn_rx
                                     .with_bytes(move |b| {
@@ -218,8 +183,8 @@ fn main() {
     let workers = env_u64("WORKERS", 1) as usize;
     let secs = env_u64("SECS", 5);
     let mode = std::env::var("MODE").unwrap_or_else(|_| "whole".into());
-    if !matches!(mode.as_str(), "whole" | "bytes" | "mixed" | "forward") {
-        eprintln!("[ring_fill_bench] unknown MODE={mode}: use whole, bytes, mixed or forward");
+    if !matches!(mode.as_str(), "whole" | "bytes" | "mixed") {
+        eprintln!("[ring_fill_bench] unknown MODE={mode}: use whole, bytes or mixed");
         std::process::exit(2);
     }
     // ROLE=server: run only the echo server (for cross-host: server on one box).
@@ -246,16 +211,12 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // FWD_CAP: Mode A forward_to held-buffer cap (default 64). Set very high to
-    // effectively disable the throttle for a before/after comparison.
-    let fwd_cap = env_u64("FWD_CAP", 64) as usize;
     let config = ConfigBuilder::new()
         .workers(workers)
         .pin_to_core(true)
         .sq_entries(1024)
         .recv_buffer(ring, buf)
         .max_connections((conns + 8) as u32)
-        .forward_hold_cap(fwd_cap)
         .build()
         .expect("valid config");
 

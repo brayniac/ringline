@@ -29,7 +29,7 @@ use crate::backend::mio::driver::PendingSend;
 use super::{TlsRecvResult, TlsTable, buffered};
 
 #[cfg(not(feature = "tls-buffered"))]
-use super::{PlaintextSink, unbuffered};
+use super::unbuffered;
 
 /// Feed received ciphertext, decrypt into the accumulator, and queue any TLS
 /// output (handshake responses, alerts) onto `pending`.
@@ -49,12 +49,14 @@ pub fn feed_tls_recv_mio(
         let Some(tls_conn) = conn_slot.as_mut() else {
             return TlsRecvResult::Closed;
         };
-        // The mio backend has no provided-buffer ring; segmented recv is
-        // io_uring only. Plaintext always lands in the accumulator here.
-        let mut sink = PlaintextSink::Accumulator(accumulators);
         write_buf.clear();
-        let outcome =
-            unbuffered::feed(tls_conn, Some(&mut sink), write_buf, ciphertext, conn_index);
+        let outcome = unbuffered::feed(
+            tls_conn,
+            Some(accumulators),
+            write_buf,
+            ciphertext,
+            conn_index,
+        );
         if !write_buf.is_empty() {
             pending.push_back(PendingSend::plain(std::mem::take(write_buf)));
         }

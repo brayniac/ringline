@@ -77,10 +77,9 @@ impl PendingSend {
 
 /// An in-flight `forward_to_conn` on the mio backend, indexed by source.
 ///
-/// mio has no provided-buffer ring to hold, so unlike the io_uring Mode A
-/// state this carries no backing — the bytes are copied into a queued send on
-/// the sink as they are read, and all that survives between reads is where
-/// they are going and how many are left.
+/// The bytes are copied into a queued send on the sink as they are read, so
+/// all that survives between reads is where they are going and how many are
+/// left.
 pub(crate) struct MioForwardState {
     pub(crate) sink_index: u32,
     /// Sink generation at the start. Slots recycle; a forward that kept
@@ -221,9 +220,8 @@ pub(crate) struct Driver {
     /// Per connection index: is a [`SendHalf`](crate::SendHalf) currently out?
     /// The write-side twin of `recv_half_taken`; see the io_uring driver.
     pub(crate) send_half_taken: Vec<bool>,
-    /// Queued sends allowed on a sink before its source stops reading. Shares
-    /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
-    /// bound one slow forward — applied to the queue mio actually has.
+    /// Queued sends allowed on a sink before its source stops reading
+    /// (`Config::forward_hold_cap`).
     pub(crate) forward_hold_cap: usize,
     /// Results of bounded (`send_backpressured`) sends, in completion order
     /// and keyed by the id the submitting future holds. Not per-connection:

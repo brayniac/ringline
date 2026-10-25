@@ -1,8 +1,9 @@
 # Segmented recv — design
 
-Note (2026-10-25): Modes B and C (`segments`, `recv_owned_segment`,
-`with_segments`, `end_segments`) and `with_bytes_segments` were removed;
-Mode A (`forward_to`) and `forward_to_conn` remain.
+Note (2026-10-25): Modes A, B and C (`forward_to`, `segments`,
+`recv_owned_segment`, `with_segments`, `end_segments`), `with_bytes_segments`,
+`SinkFd` and `recv_segment_reserve` were removed; `forward_to_conn` remains
+and sends from the source's accumulator.
 
 **Status:** Implemented in #286 (Modes A, B and C). On io_uring only a TLS
 connection enters the segmented domain. On io_uring a plaintext connection

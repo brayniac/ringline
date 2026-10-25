@@ -3,6 +3,9 @@
 Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
 `with_segments`, `end_segments`) and `SegmentReader` were removed.
 
+Note (2026-10-25): `forward_to` and `SinkFd` were removed; on io_uring
+`forward_to_conn` sends through the sink's send queue.
+
 - **Status:** proposal — intent only, nothing implemented
 - **Motivated by:** #423, and four sibling defects found reviewing its fix
 

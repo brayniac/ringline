@@ -159,9 +159,8 @@ pub struct ConnectionState {
     /// `recv_direct_armed`.
     #[cfg(has_io_uring)]
     pub recv_direct_slot: u32,
-    /// A `forward_to_conn` that sends from this connection's accumulator (a
-    /// plaintext source, or a TLS source with no `forward_to` running) is
-    /// running; another forward and `forward_to` get `EBUSY`.
+    /// A `forward_to_conn` from this connection is running; another gets
+    /// `EBUSY`.
     #[cfg(has_io_uring)]
     pub direct_forwarding: bool,
     /// The hangup poll (`OpTag::HangupPoll`) is in flight.

@@ -180,8 +180,8 @@ count; zero-copy send is the exception the ZC rows note.
 | Kernel → `RecvAccumulator` (plaintext, io_uring) | 0 | A one-shot `RECV` into the accumulator's free space, armed when a read parks. Growing the accumulator for a longer message can copy the part already received (`docs/recv-direct-design.md`). |
 | Accumulator → `with_data(\|&[u8]\|)` | 0 borrowed | The parser sees a borrowed slice and must copy anything it keeps. |
 | Accumulator → `with_bytes(\|Bytes\|)` | 0 | `BytesMut::freeze()` and `Bytes::slice()` are O(1) refcount operations; parsed values are refcounted sub-slices that stay valid after the accumulator advances. |
-| TLS receive, unbuffered engine (default) | +3 | Ciphertext is copied into `CiphertextBuf`; rustls decrypts in place there, then copies each record's plaintext into a new `Vec` that `ReadTraffic::next_record` lends out; ringline copies it into the accumulator or an owned segment. `CiphertextBuf::compact` moves ciphertext too: measured 0.94× the payload at 16 KiB records arriving in 16 KiB buffers, 0.02–0.04× at 1 KiB. |
-| TLS receive, buffered engine (`tls-buffered`) | +3 | Ciphertext is copied into rustls' deframer buffer (`read_tls`); rustls decrypts in place and copies each record's plaintext into a new `Vec` (`take_received_plaintext`, one allocation per record); `drain_tls_plaintext` copies it into the accumulator or an owned segment. `DeframerVecBuffer::discard` also memmoves the ciphertext behind each processed record: measured 0.12× the payload at 16 KiB records, 2.3× at 1 KiB. |
+| TLS receive, unbuffered engine (default) | +3 | Ciphertext is copied into `CiphertextBuf`; rustls decrypts in place there, then copies each record's plaintext into a new `Vec` that `ReadTraffic::next_record` lends out; ringline copies it into the accumulator. `CiphertextBuf::compact` moves ciphertext too: measured 0.94× the payload at 16 KiB records arriving in 16 KiB buffers, 0.02–0.04× at 1 KiB. |
+| TLS receive, buffered engine (`tls-buffered`) | +3 | Ciphertext is copied into rustls' deframer buffer (`read_tls`); rustls decrypts in place and copies each record's plaintext into a new `Vec` (`take_received_plaintext`, one allocation per record); `drain_tls_plaintext` copies it into the accumulator. `DeframerVecBuffer::discard` also memmoves the ciphertext behind each processed record: measured 0.12× the payload at 16 KiB records, 2.3× at 1 KiB. |
 
 `with_data` vs `with_bytes` is the single biggest receive-side copy decision a
 client makes: `with_bytes` plus a `Bytes`-aware parser makes value extraction
@@ -255,11 +255,10 @@ TLS *receive* costs 3 copies on both engines, measured with rustls 0.23.46 on
 both backends: ciphertext into a contiguous buffer (`CiphertextBuf`, or rustls'
 deframer buffer), decrypted plaintext into a per-record `Vec`
 (`CommonState::take_received_plaintext` → `Payload::into_vec`, where the payload
-is always `Borrowed`), and that `Vec` into the accumulator or an owned segment.
+is always `Borrowed`), and that `Vec` into the accumulator.
 The unbuffered engine decrypts in place, but `ReadTraffic::next_record` hands
 out the copied `Vec` (the incoming-ciphertext buffer is kept only "for forwards
-compatibility"). Each record also costs one heap allocation, plus one more in
-the segmented domain. `note_copied` counts only ringline's own copy.
+compatibility"). Each record also costs one heap allocation. `note_copied` counts only ringline's own copy.
 
 ### Protocol clients
 

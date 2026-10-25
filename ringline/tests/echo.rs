@@ -7505,11 +7505,11 @@ fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool, case: &
 /// span many reads.
 ///
 /// Run twice against the same backend. The second proxy sets
-/// `forward_hold_cap(1)`, which is what actually exercises backpressure: on
-/// mio the source stops reading after a single queued send and only resumes
-/// when the sink drains, and on io_uring it holds one provided buffer at a
-/// time. At the default cap a localhost sink never backs up, so the resume
-/// path would go untested.
+/// `forward_hold_cap(1)`, which exercises backpressure on mio: the source stops
+/// reading after a single queued send and resumes when the sink drains. At the
+/// default cap a localhost sink never backs up, so the resume path would go
+/// untested. On io_uring the cap has no effect, and both runs take the same
+/// path.
 #[test]
 fn forward_to_conn_proxies_both_directions() {
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
@@ -7579,17 +7579,12 @@ fn forward_to_conn_proxies_both_directions() {
 
 /// Dropping a `forward_to_conn` future stops the relay.
 ///
-/// Both backends relay on their own once the forward is installed — mio from
-/// its event loop, io_uring from the write-completion handler — so a dropped
+/// mio relays from its event loop once the forward is installed, so a dropped
 /// future (a `select!` losing a race, a timeout) has to take the forward with
 /// it. Otherwise bytes keep reaching the sink with nobody waiting on the
-/// result, and the next forward on that connection starts behind.
-///
-/// This was mio-only until gathering moved io_uring's submission out of
-/// `ForwardToFuture::poll` and into `handle_forward_write`. Before that, the
-/// io_uring writes really were driven by polling and a drop stopped them by
-/// itself; afterwards the driver owns the progress and keeps going. The test
-/// covers both backends so that asymmetry cannot come back silently.
+/// result, and the next forward on that connection starts behind. On io_uring
+/// the forward sends only when its future is polled. The test covers both
+/// backends.
 struct DroppedForwardProxy {
     backend_addr: SocketAddr,
 }

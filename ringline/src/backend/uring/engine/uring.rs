@@ -974,16 +974,6 @@ impl Sqe {
                 on!(fd, |t| opcode::SendMsg::new(t, msg).flags(flags).build())
             }
             Op::SendMsgZc { fd, msg } => on!(fd, |t| opcode::SendMsgZc::new(t, msg).build()),
-            Op::Writev {
-                fd,
-                iovecs,
-                count,
-                offset,
-            } => {
-                on!(fd, |t| opcode::Writev::new(t, iovecs, count)
-                    .offset(offset)
-                    .build())
-            }
             Op::Read {
                 fd,
                 buf,
@@ -1095,7 +1085,6 @@ mod encode_tests {
         let path = 0x3000 as *const libc::c_char;
         let path2 = 0x3100 as *const libc::c_char;
         let ts = 0x4000 as *const crate::backend::uring::abi::Timespec;
-        let iov = 0x5000 as *const libc::iovec;
         let addr = 0x6000 as *const libc::sockaddr;
         let stx = 0x7000 as *mut libc::statx;
         let cmd = [7u8; 80];
@@ -1206,18 +1195,6 @@ mod encode_tests {
             (
                 Sqe::send_msg_zc(9, msg, ud),
                 e(opcode::SendMsgZc::new(fx, msg).build()),
-            ),
-            (
-                Sqe::new(
-                    Op::Writev {
-                        fd: Fd::Raw(11),
-                        iovecs: iov,
-                        count: 4,
-                        offset: 99,
-                    },
-                    ud,
-                ),
-                e(opcode::Writev::new(raw, iov, 4).offset(99).build()),
             ),
             (
                 Sqe::new(
