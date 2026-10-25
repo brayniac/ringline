@@ -4552,7 +4552,9 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
     /// last. A chain with at least one part returns `WouldBlock` while a send
     /// on the connection is in flight or queued, or another chain is active.
     /// On a TLS connection the parts are encrypted as one send and queued
-    /// behind the connection's other sends.
+    /// behind the connection's other sends. A chain with at least one part
+    /// returns `NotConnected` if the handle is stale (its connection's slot
+    /// was released) or the connection's Close has been submitted.
     pub fn finish(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             // finished stays false — Drop will call release_all().
@@ -4569,6 +4571,25 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
         }
 
         let conn_index = self.conn.index;
+
+        // The token's connection is gone when its slot is free or holds a
+        // later generation. On a reused slot the chain's SQEs would write to
+        // the new connection's socket and start its `chain_table` entry.
+        // Their CQEs carry the token's generation, fail the generation checks
+        // in `handle_send` and `handle_send_msg_zc`, and never complete that
+        // entry.
+        // finished stays false so Drop releases the built entries' resources.
+        let current = self
+            .ctx
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.generation == self.conn.generation);
+        if !current {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
 
         // Close already submitted — chain SQEs would race it. finished stays
         // false so Drop releases the built entries' resources.
