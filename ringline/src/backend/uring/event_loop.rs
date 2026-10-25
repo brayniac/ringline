@@ -9493,6 +9493,91 @@ mod tests {
         );
     }
 
+    /// Guarded memory for a chain's zero-copy part.
+    struct ChainTestGuard(Box<[u8]>);
+
+    impl crate::guard::SendGuard for ChainTestGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> crate::buffer::fixed::RegionId {
+            crate::buffer::fixed::RegionId::UNREGISTERED
+        }
+    }
+
+    /// A stale handle's chain must not be submitted on the slot's new
+    /// occupant. Its SQEs would write to the new occupant's socket, and the
+    /// `chain_table` entry it started would never complete, since the CQEs
+    /// carry the old generation.
+    #[test]
+    fn a_chain_refuses_a_stale_handle() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, old_gen);
+
+        el.driver.connections.release(conn_index);
+        let reused = accept_connection(&mut el);
+        assert_eq!(reused, conn_index, "test premise: index reused");
+        let new_gen = el.driver.connections.generation(conn_index);
+        assert_ne!(new_gen, old_gen);
+
+        let pool_free = el.driver.send_copy_pool.free_count();
+        let slab_free = el.driver.send_slab.free_count();
+        let result = with_driver_state(&mut el, || {
+            stale.send_chain(|chain| {
+                chain
+                    .copy(b"chained")
+                    .parts()
+                    .copy(b"head")
+                    .guard(crate::guard::GuardBox::new(ChainTestGuard(
+                        vec![7u8; 8192].into_boxed_slice(),
+                    )))
+                    .add()
+                    .finish()
+            })
+        });
+        let Err(err) = result else {
+            panic!("a stale handle's chain must be refused");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert!(
+            !el.driver.chain_table.is_active(conn_index),
+            "a stale handle must not start a chain on the new occupant"
+        );
+        assert_eq!(el.driver.send_copy_pool.free_count(), pool_free);
+        assert_eq!(el.driver.send_slab.free_count(), slab_free);
+
+        // The control: the new occupant's own handle still chains.
+        let current = ConnCtx::new(conn_index, new_gen);
+        let result = with_driver_state(&mut el, || {
+            current.send_chain(|chain| chain.copy(b"chained").finish())
+        });
+        assert!(result.is_ok(), "the current handle must still chain");
+        assert!(el.driver.chain_table.is_active(conn_index));
+    }
+
+    /// A chain on a handle whose connection is gone and whose slot is free
+    /// is refused before anything is submitted.
+    #[test]
+    fn a_chain_refuses_a_handle_whose_slot_is_free() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        el.driver.connections.release(conn_index);
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_chain(token).copy(b"chained").finish()
+        };
+        let err = result.expect_err("a chain on a free slot must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert!(!el.driver.chain_table.is_active(conn_index));
+        assert_eq!(el.driver.send_copy_pool.free_count(), free_before);
+    }
+
     #[test]
     fn close_defers_while_chain_active() {
         let mut el = make_test_loop();

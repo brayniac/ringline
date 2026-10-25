@@ -704,6 +704,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `send_chain` and `send_chain_nowait` on a plaintext connection
+  did not check the handle's generation, so a stale handle (its connection
+  closed and the slot reused) submitted the chain on the slot's new
+  occupant: the bytes went to that connection's socket, and the chain it
+  started there never completed, so the new occupant's own chains returned
+  `WouldBlock` and its plain sends stayed queued. `finish` now returns
+  `NotConnected` on a stale handle, as the TLS path already did.
 - TLS: a close_notify that ringline receives in one read with the peer's
   last handshake flight was dropped. The handshake completion was reported
   and the close was not, so the connection stayed open: a peer that kept

@@ -4570,6 +4570,24 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
 
         let conn_index = self.conn.index;
 
+        // A token for a closed connection: its slot may now hold another
+        // connection, whose socket the chain's SQEs would write to and whose
+        // `chain_table` entry they would start. Their CQEs carry the token's
+        // generation, fail the completion handlers' generation checks, and
+        // never complete that entry.
+        // finished stays false so Drop releases the built entries' resources.
+        let current = self
+            .ctx
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.generation == self.conn.generation);
+        if !current {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+
         // Close already submitted — chain SQEs would race it. finished stays
         // false so Drop releases the built entries' resources.
         if self.ctx.send_queues[conn_index as usize].close_submitted {
