@@ -4552,9 +4552,9 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
     /// last. A chain with at least one part returns `WouldBlock` while a send
     /// on the connection is in flight or queued, or another chain is active.
     /// On a TLS connection the parts are encrypted as one send and queued
-    /// behind the connection's other sends. It returns `NotConnected` if the
-    /// handle is stale (its connection closed) or the connection's Close has
-    /// been submitted.
+    /// behind the connection's other sends. A chain with at least one part
+    /// returns `NotConnected` if the handle is stale (its connection's slot
+    /// was released) or the connection's Close has been submitted.
     pub fn finish(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             // finished stays false — Drop will call release_all().
