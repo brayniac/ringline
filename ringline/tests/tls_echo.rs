@@ -2991,3 +2991,183 @@ fn forward_to_conn_after_bytes_segments_on_a_tls_source() {
         got.len()
     );
 }
+
+// ── A close_notify in the same segment as the handshake's last flight ────
+
+static TLS_HS_CLOSE_INBOUND: Mutex<Option<(Vec<u8>, bool)>> = Mutex::new(None);
+
+struct TlsReadToEof;
+
+impl AsyncEventHandler for TlsReadToEof {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (_tx, mut rx) = conn.split();
+            let mut got = Vec::new();
+            loop {
+                let n = rx
+                    .with_data(|data| {
+                        got.extend_from_slice(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            *TLS_HS_CLOSE_INBOUND.lock().unwrap() = Some((got, rx.eof_truncated()));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsReadToEof
+    }
+}
+
+/// A client that sends its Finished, application data and close_notify in one
+/// write, and keeps TCP open, is read to a clean EOF: the handshake completion
+/// and the close arrive in one feed, and the server handles both.
+#[test]
+fn a_close_notify_with_the_clients_finished_is_read_to_eof() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_HS_CLOSE_INBOUND.lock().unwrap() = None;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsReadToEof>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address");
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls = rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    while tls.wants_write() {
+        tls.write_tls(&mut tcp).unwrap();
+    }
+    // Read the server's flight. The client's Finished is queued, not sent.
+    while tls.is_handshaking() {
+        let n = tls.read_tls(&mut tcp).expect("read the server's flight");
+        assert!(n > 0, "the server closed during the handshake");
+        tls.process_new_packets()
+            .expect("process the server's flight");
+    }
+    tls.writer().write_all(b"hello").unwrap();
+    tls.send_close_notify();
+    let mut wire = Vec::new();
+    while tls.wants_write() {
+        tls.write_tls(&mut wire).unwrap();
+    }
+    tcp.write_all(&wire).unwrap();
+
+    // The server reads to EOF, returns, and closes; TCP stays open on this
+    // side until then.
+    let mut buf = [0u8; 4096];
+    let closed = loop {
+        match tcp.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(_) => break false,
+        }
+    };
+    let result = TLS_HS_CLOSE_INBOUND.lock().unwrap().take();
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert!(closed, "the server did not close within 5 s");
+    let (got, truncated) = result.expect("the handler did not read to EOF");
+    assert_eq!(got, b"hello");
+    assert!(!truncated, "a close_notify preceded the EOF");
+}
+
+static TLS_HS_CLOSE_SERVER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static TLS_HS_CLOSE_OUTBOUND: Mutex<Option<String>> = Mutex::new(None);
+
+struct TlsConnectReadToEof;
+
+impl AsyncEventHandler for TlsConnectReadToEof {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let server = TLS_HS_CLOSE_SERVER.lock().unwrap().expect("server addr");
+        Some(Box::pin(async move {
+            let result = match ringline::connect(server).tls("localhost").await {
+                Err(e) => format!("CONNECT_ERR:{e}"),
+                Ok(conn) => {
+                    let (_tx, mut rx) = conn.split();
+                    let read = ringline::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let n = rx.with_data(|data| ParseResult::Consumed(data.len())).await;
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                    match read {
+                        Err(_) => "TIMEOUT".to_string(),
+                        Ok(()) if rx.eof_truncated() => "EOF_TRUNCATED".to_string(),
+                        Ok(()) => "EOF".to_string(),
+                    }
+                }
+            };
+            *TLS_HS_CLOSE_OUTBOUND.lock().unwrap() = Some(result);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsConnectReadToEof
+    }
+}
+
+/// An outbound TLS connection whose server sends its flight and a close_notify
+/// in one write, and keeps TCP open, is read to a clean EOF.
+#[test]
+fn a_close_notify_with_the_servers_flight_is_read_to_eof() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_HS_CLOSE_OUTBOUND.lock().unwrap() = None;
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    *TLS_HS_CLOSE_SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut tls = rustls::ServerConnection::new(server_config).unwrap();
+        while !tls.wants_write() {
+            let n = tls.read_tls(&mut tcp).expect("read the ClientHello");
+            assert!(n > 0, "the client closed before its ClientHello");
+            tls.process_new_packets().expect("process the ClientHello");
+        }
+        tls.send_close_notify();
+        let mut wire = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut wire).unwrap();
+        }
+        tcp.write_all(&wire).unwrap();
+        // Hold TCP open until the client closes it or the timeout passes.
+        let mut buf = [0u8; 4096];
+        while matches!(tcp.read(&mut buf), Ok(n) if n > 0) {}
+    });
+
+    let config = test_config_builder()
+        .tls_client(ringline::TlsClientConfig::new(client_tls_config(&certs)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .launch::<TlsConnectReadToEof>()
+        .expect("launch failed");
+    common::join_workers(&shutdown, handles);
+    server.join().expect("server thread panicked");
+    let result = TLS_HS_CLOSE_OUTBOUND.lock().unwrap().take();
+    assert_eq!(result.as_deref(), Some("EOF"));
+}

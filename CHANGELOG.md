@@ -704,6 +704,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- TLS: a close_notify that ringline receives in one read with the peer's
+  last handshake flight was dropped. The handshake completion was reported
+  and the close was not, so the connection stayed open: a peer that kept
+  TCP open left the task waiting for data that never came, and on the
+  buffered engine on io_uring a later FIN was reported as truncated. The
+  close is now handled after the completion, on both backends and both
+  engines: the task reads what arrived, then a clean EOF.
 - io_uring: `send_chain` and `send_chain_nowait` on a TLS connection sent
   the chain's bytes unencrypted, so the peer saw a record it could not
   parse. The parts, guard parts included, are now gathered and encrypted

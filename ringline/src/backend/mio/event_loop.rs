@@ -852,7 +852,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
 
                 match result {
-                    crate::tls::TlsRecvResult::HandshakeJustCompleted => {
+                    crate::tls::TlsRecvResult::HandshakeJustCompleted { peer_closed } => {
                         let is_outbound = self
                             .driver
                             .connections
@@ -878,6 +878,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
                         // Wake recv waiter if data accumulated during handshake.
                         self.executor.wake_recv(conn_index);
+
+                        // The peer's close_notify came in the same feed as its
+                        // last handshake flight. Handle it as the `Closed` arm
+                        // does: the task reads what arrived, then EOF. No
+                        // forward exists yet: no task holds the connection.
+                        if peer_closed {
+                            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                                cs.note_eof(false);
+                            }
+                            self.driver.close_connection(conn_index);
+                            break;
+                        }
                     }
                     crate::tls::TlsRecvResult::Ok => {
                         self.executor.wake_recv(conn_index);

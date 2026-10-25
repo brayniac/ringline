@@ -149,7 +149,9 @@ pub fn feed_tls_recv(
         match outcome {
             unbuffered::DriveOutcome::Ok => TlsRecvResult::Ok,
             unbuffered::DriveOutcome::HandshakeJustCompleted => {
-                TlsRecvResult::HandshakeJustCompleted
+                TlsRecvResult::HandshakeJustCompleted {
+                    peer_closed: tls_conn.peer_sent_close_notify,
+                }
             }
             unbuffered::DriveOutcome::Closed => TlsRecvResult::Closed,
             unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
