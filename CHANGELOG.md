@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   adopting worker with it, including ciphertext received but not yet
   decrypted, and the handler there reads and sends without a new handshake.
   Plaintext the unbuffered engine decrypted on the send path and has not yet
-  delivered counts as unread data, which blocks an offer or a park.
+  delivered counts as unread data, which blocks an offer or a park. A
+  handler that already calls `offer_for_park` on TLS connections will now
+  see them parked and adopted; before, they were refused. Once a parked
+  connection's socket has been handed to the other worker, a send on the
+  parking worker is refused.
 - `forward_to_conn` on `ConnCtx`, `Connection` and `RecvHalf` forwards the
   next `len` received bytes to another connection on the same worker, on
   both backends. On io_uring it sends from the source's accumulator through

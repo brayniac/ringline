@@ -309,7 +309,7 @@ the slot now holds another connection (generation check), the gate
 armed; every abandon except the recycled slot gives the connection its
 receive or hangup poll back → take the leftover accumulator bytes and
 handler payload → close A's fixed-file slot without a shutdown → send
-`(OwnedFd, leftover bytes, ListenerId, PeerAddr, handler payload)`, all
+`(OwnedFd, leftover bytes, ListenerId, PeerAddr, handler payload, TLS state)`, all
 `Send`, over the park channel (`peer_park`) → B allocates a slot,
 registers the fd, seeds the accumulator, arms the hangup poll, and calls
 `on_adopt`; the new task's first parked read arms a receive.

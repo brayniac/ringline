@@ -2682,6 +2682,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             cs.socket_handed_off = true;
         }
         self.driver.close_connection(conn_index);
+        // The socket belongs to the target worker from here. Commit the Close
+        // now so every send path refuses (`close_submitted`) instead of
+        // queueing bytes, unencrypted once the TLS state has left, onto it.
+        // The gate guaranteed no sends, chain or shutdown, so this submits.
+        self.driver.try_finalize_close(conn_index);
 
         metrics::CONNECTIONS.increment(metrics::conn::PARK_COMPLETED);
         self.driver.park_ready.push(crate::park::ParkedFd {
@@ -3704,6 +3709,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Deliberately does nothing for a connection that is closing, is not in
     /// multishot mode, or is throttled by the hold cap — that last one
     /// owns its own re-arm and must not have a second multishot armed under it.
+    /// A direct or TLS connection gets `rearm_direct_after_park` instead.
     fn rearm_multishot_if_idle(&mut self, conn_index: u32) {
         let tls = self
             .driver
@@ -7301,6 +7307,9 @@ mod tests {
     #[test]
     fn a_tls_park_waits_for_the_receive_to_end() {
         let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return;
+        }
         let conn_index = accept_connection(&mut el);
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
@@ -7332,6 +7341,79 @@ mod tests {
         );
     }
 
+    /// Once a TLS connection's session has left with the park, a send on the
+    /// parking worker is refused rather than written to the socket, which
+    /// the adopting worker now owns, without encryption.
+    #[test]
+    fn a_send_after_a_tls_park_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+        let generation = el.driver.connections.generation(conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 0,
+                generation,
+            });
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
+        std::mem::forget(probe); // the fd now belongs to the ParkedFd
+        let _parked = el.driver.park_ready.pop().expect("lifted off");
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let sent = el.driver.make_ctx().send(token, b"SECRET-PLAINTEXT");
+        assert!(sent.is_err(), "a send after the handoff is refused");
+        el.driver.ring.submit_and_wait(0).unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(try_recv(&peer, &mut buf), None, "nothing reached the peer");
+    }
+
+    /// An abandoned TLS park gives the connection back its hangup poll and
+    /// wakes its reader, as for a direct connection, so a reader that parked
+    /// during the drain arms its receive again.
+    #[test]
+    fn an_abandoned_tls_park_rearms_the_hangup_poll() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return;
+        }
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        el.driver.park_offered[conn_index as usize] = true;
+        let target = if el.driver.worker_index == 0 { 1 } else { 0 };
+        assert!(el.begin_park(conn_index, target));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::ECANCELED,
+            0,
+        );
+        el.drive_park_drains();
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(el.driver.park_in_flight[conn_index as usize].is_some());
+        // The offer is withdrawn across the round trip, so the re-check
+        // abandons the park.
+        el.driver.park_offered[conn_index as usize] = false;
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
+        assert!(probe.was_closed(), "the installed fd is closed");
+        assert!(el.driver.park_ready.is_empty(), "nothing moved");
+        let cs = el.driver.connections.get(conn_index).expect("still here");
+        assert!(cs.hangup_poll_armed, "the hangup poll is armed again");
+        assert!(
+            el.driver.tls_table.as_ref().unwrap().has(conn_index),
+            "the session stays"
+        );
+    }
+
     /// The TLS session is taken out of the parking worker's table and put in
     /// the entry for the adopting worker.
     #[test]
@@ -7341,14 +7423,9 @@ mod tests {
         assert!(parked.tls.is_some(), "the session travels with the fd");
     }
 
-    /// An adopted TLS connection gets the session it had, established, and
-    /// reaches `on_adopt`. Records the client sends after the move decrypt on
-    /// the adopting side, so the record sequence carried over too.
-    #[cfg(not(feature = "tls-buffered"))]
-    #[test]
-    fn an_adopted_tls_connection_keeps_its_session() {
-        let mut el = make_test_loop();
-        let (parked, mut peer) = park_a_tls_connection(&mut el);
+    /// Adopt `parked` through the park channel and return the slot it was
+    /// installed in.
+    fn adopt_parked(el: &mut AsyncEventLoop<NoopHandler>, parked: crate::park::ParkedFd) -> u32 {
         ADOPTS.with(|n| n.set(0));
         let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
@@ -7357,12 +7434,35 @@ mod tests {
         el.drain_adopted();
         assert_eq!(ADOPTS.with(|n| n.get()), 1, "the handler is adopted");
         let max = el.driver.connections.max_slots();
-        let adopted = (0..max)
+        (0..max)
             .find(|&i| el.driver.tls_table.as_ref().unwrap().has(i))
-            .expect("the session was installed");
+            .expect("the session was installed")
+    }
+
+    /// An adopted TLS connection gets the session it had, established, with
+    /// its hangup poll armed, and reaches `on_adopt`.
+    #[test]
+    fn an_adopted_tls_connection_is_installed_established() {
+        let mut el = make_test_loop();
+        let (parked, _peer) = park_a_tls_connection(&mut el);
+        let adopted = adopt_parked(&mut el, parked);
         let cs = el.driver.connections.get(adopted).expect("open");
         assert!(cs.established, "no new handshake");
         assert!(!cs.recv_direct, "a TLS connection, not a plaintext one");
+        assert!(
+            cs.hangup_poll_armed,
+            "a peer close is seen while nothing reads"
+        );
+    }
+
+    /// Records the client sends after the move decrypt on the adopting side,
+    /// so the session's record sequence carried over too.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn an_adopted_tls_connection_keeps_its_session() {
+        let mut el = make_test_loop();
+        let (parked, mut peer) = park_a_tls_connection(&mut el);
+        let adopted = adopt_parked(&mut el, parked);
 
         let mut dst = [0u8; 4096];
         let (_, n) = crate::tls::unbuffered::encrypt_chunk(&mut peer.conn, b"hello", &mut dst)
