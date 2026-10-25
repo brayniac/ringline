@@ -73,8 +73,9 @@ pub(crate) const INITIAL_SHRINK_TO: usize = 32 * 1024;
 ///
 /// The backing `Vec<u8>` is never zero-filled: reserved-but-unwritten
 /// capacity is left uninitialized (demand-paged, untouched by the CPU) and
-/// `buf.len()` is kept equal to `end` at all times, extended only by
-/// `Vec::extend_from_slice` writing the bytes actually received. See
+/// `buf.len()` is kept equal to `end` at all times, extended only over bytes
+/// actually received: by `Vec::extend_from_slice` in `append`, or by
+/// `recv_done` over bytes a receive wrote. See
 /// `reserved`'s doc comment for why the allocation ceiling this type reports
 /// is tracked as a separate field rather than read back off `Vec::capacity()`.
 pub(crate) struct CiphertextBuf {
@@ -84,7 +85,8 @@ pub(crate) struct CiphertextBuf {
     /// One past the last byte written. Invariant: `buf.len() == end` always
     /// (compaction truncates to match; growth only reserves capacity, it
     /// never extends `len`) — so the only bytes ever exposed as "logically
-    /// present" in `buf` are bytes this type actually wrote via `append`.
+    /// present" in `buf` are bytes written by `append`, or by a receive and
+    /// committed with `recv_done`.
     end: usize,
     /// Hard ceiling on `reserved`.
     cap: usize,
@@ -453,7 +455,10 @@ impl Drop for CiphertextBuf {
     /// with a receive in flight.
     fn drop(&mut self) {
         if self.recv_in_flight {
-            debug_assert!(false, "TLS state dropped with a receive in flight");
+            // Not while unwinding a worker panic: a second panic aborts.
+            if !std::thread::panicking() {
+                debug_assert!(false, "TLS state dropped with a receive in flight");
+            }
             std::mem::forget(std::mem::take(&mut self.buf));
         }
     }

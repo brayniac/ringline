@@ -8,8 +8,9 @@ ringline is a thread-per-core I/O framework. It provides an async/await API
 
 ## What ringline is
 
-- An io_uring backend that exploits advanced kernel features: TCP receives
-  directly into each connection's buffer, ring-provided buffers for UDP,
+- An io_uring backend that exploits advanced kernel features: TCP and Unix
+  receives directly into a per-connection buffer (with `tls-buffered`, TLS
+  receives into a pooled worker buffer), ring-provided buffers for UDP,
   SendMsgZc (zero-copy send), fixed file table
 - A Mio backend for macOS and other Unix targets, for Linux kernels older
   than 6.1 (automatic build-time fallback), and for Linux builds using
@@ -95,7 +96,7 @@ handler instance. On the io_uring backend, each worker also owns:
 
 | Feature | Purpose |
 |---------|---------|
-| One-shot recv into the connection's buffer | Plaintext TCP and Unix receives, armed when a read parks — no copy from a shared buffer |
+| One-shot recv into the connection's buffer | TCP and Unix receives, plaintext and TLS, armed when a read parks — no copy from a shared buffer |
 | Ring-provided buffers | Kernel-managed recv buffer pool for UDP — kernel picks buffer at completion time |
 | Multishot recv | UDP — one SQE, many completions |
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |

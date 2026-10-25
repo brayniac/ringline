@@ -2978,12 +2978,25 @@ impl Driver {
                         }
                     }
                     // The cancel lead ended the receive; the kernel is done
-                    // with the buffer.
+                    // with the buffer. A TLS receive into the engine's own
+                    // buffer is also ended there, while its state exists.
                     OpTag::RecvDirect => {
                         let slot = ud.payload() as usize;
-                        if self.direct_recvs.get(slot).is_some_and(Option::is_some) {
-                            self.direct_recvs[slot] = None;
-                            self.direct_recv_free.push(slot as u32);
+                        let Some(entry) = self.direct_recvs.get_mut(slot).and_then(Option::take)
+                        else {
+                            continue;
+                        };
+                        self.direct_recv_free.push(slot as u32);
+                        if let Some(cs) = self.connections.get_mut(entry.conn_index)
+                            && cs.generation == entry.generation
+                        {
+                            cs.recv_direct_armed = false;
+                            if let DirectRecvBuf::Tls(buf) = entry.buf
+                                && let Some(t) = self.tls_table.as_mut()
+                                && t.has(entry.conn_index)
+                            {
+                                crate::tls::tls_recv_cancel(t, entry.conn_index, buf);
+                            }
                         }
                     }
                     OpTag::Close => {

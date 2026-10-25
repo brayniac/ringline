@@ -183,11 +183,12 @@ register `owner_task` and `recv_waiters` and park without spinning;
 zero, and a stale generation behaves as EOF rather than exposing the new slot
 occupant.
 
-A plaintext connection on io_uring, accepted or outbound, receives directly
-into its accumulator (`docs/recv-direct-design.md`). A TLS connection on
-io_uring receives ciphertext directly into its TLS engine's buffer and feeds
-it to rustls; rustls copies the plaintext into the accumulator. `with_bytes` provides zero-copy slicing of the accumulator, not a
-reference to kernel-owned ring memory.
+A plaintext connection on io_uring, accepted or outbound, receives directly into
+its accumulator (`docs/recv-direct-design.md`). A TLS connection on io_uring
+receives ciphertext into its TLS engine's buffer (with `tls-buffered`, a pooled
+buffer that `read_tls` copies from) and feeds it to rustls; ringline copies the
+decrypted plaintext into the accumulator. `with_bytes` provides zero-copy
+slicing of the accumulator, not a reference to kernel-owned ring memory.
 
 `send_nowait` eagerly submits an owned copy and returns without a future.
 `send` also submits eagerly but returns `SendFuture`, which waits for the

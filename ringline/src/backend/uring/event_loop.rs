@@ -1319,9 +1319,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             crate::backend::uring::driver::DirectRecvBuf::Tls(buf) => {
                 if !live {
                     metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
-                    // A closing connection still has its TLS state, which
-                    // must leave the in-flight state. Once the state is gone,
-                    // `buf` holds whatever the receive owned, and drops here.
+                    // A closing connection still has its TLS state: end the
+                    // receive there (`tls_recv_cancel`) so `release_tls_state`
+                    // finds none in flight. Once the state is gone, `buf`
+                    // holds whatever the receive owned and drops here.
                     let same = self.driver.connections.generation(conn_index) == entry.generation;
                     if same
                         && let Some(t) =
@@ -14907,6 +14908,40 @@ mod tests {
         };
         el.driver.tls_table = Some(table);
         peer
+    }
+
+    /// A Close that completes before the TLS receive it cancelled moves the
+    /// receive's buffer allocation out of the dropped TLS state into the
+    /// receive's entry, which frees it when the receive completes. The peer
+    /// never sends, so the kernel writes nothing into it.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn a_close_before_the_tls_receive_completes_moves_the_allocation() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(UserData::encode(OpTag::Close, conn_index, 0).raw(), 0, 0);
+        assert!(matches!(
+            &el.driver.direct_recvs[slot as usize],
+            Some(crate::backend::uring::driver::DirectRecv {
+                buf: crate::backend::uring::driver::DirectRecvBuf::Tls(Some(_)),
+                ..
+            })
+        ));
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::ECANCELED,
+            0,
+        );
+        assert!(el.driver.direct_recvs[slot as usize].is_none());
     }
 
     /// Run `conn_index`'s queued sends through the real ring until it is idle,
