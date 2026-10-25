@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   next `len` received bytes to another connection on the same worker, on
   both backends. On io_uring it sends from the source's accumulator through
   the sink's send queue; on mio it copies the bytes into sends queued on the
-  sink. A TLS sink is refused with `EPROTOTYPE`.
+  sink. A TLS sink is refused with `EPROTOTYPE`. On mio the source stops
+  reading while the sink has `forward_hold_cap` sends queued.
 - `metrics::park_abandon::RECEIVE_ARMED` (14, `op=receive_armed` on
   `ringline/park_abandoned`): a park whose install found a receive, hangup
   poll or hangup peek armed.
@@ -597,7 +598,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Removed
 
 - **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), which
-  wrote a connection's received bytes to a socket or file descriptor, and
+  wrote a connection's received bytes to a socket or a buffered file, and
   `ConfigBuilder::recv_segment_reserve`, which in 0.6 applied to `forward_to`
   sources and to the segment readers removed below. Nothing replaces
   `forward_to` for a sink that is not a ringline connection: read with
