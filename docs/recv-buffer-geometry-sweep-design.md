@@ -1,5 +1,9 @@
 # Recv buffer geometry sweep — design
 
+Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
+`with_segments`, `with_bytes_segments`, `end_segments`) and
+`recv_zc_threshold` were removed.
+
 **Status:** **Phase A complete — the default stands.** Phase 0 landed (#417);
 #415 merged as 282773b. Outcome below.
 

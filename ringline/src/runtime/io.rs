@@ -929,10 +929,10 @@ pub fn request_shutdown() -> io::Result<()> {
 ///
 /// # The read entry points are crate-private
 ///
-/// `with_data`, `with_bytes` and the other readers are `pub(crate)` as of
-/// step 4b: reading a connection goes
-/// through [`Connection`] or [`RecvHalf`], which are not `Copy`, so the read
-/// side cannot be aliased. A `ConnCtx` is now a send/identity/lifecycle handle
+/// `with_data`, `with_bytes` and the other readers are `pub(crate)`: reading
+/// a connection goes through [`Connection`] or [`RecvHalf`], which are not
+/// `Copy`, so the read side cannot be aliased. A `ConnCtx` is a
+/// send/identity/lifecycle handle
 /// plus a way to *obtain* the read side ([`take_recv`](Self::take_recv),
 /// [`split`](Self::split)).
 ///

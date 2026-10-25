@@ -4579,10 +4579,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Drain any segmented-recv buffers still held (a Mode A forward aborted
-        // by close, or one that never wrote them). `close_connection`
-        // deliberately left these so a forward polled after the FIN could
-        // write them; by teardown no consumer remains, so reclaim each Pinned
-        // bid (Owned entries just drop). Symmetric to the `pending_recv_bufs`
+        // by close, or one that never wrote them). `close_connection` does not
+        // drain them; at teardown each Pinned bid is reclaimed (Owned entries
+        // just drop). Symmetric to the `pending_recv_bufs`
         // reclaim above.
         for held in self.driver.segment_hold[conn_index as usize]
             .drain(..)
@@ -10589,15 +10588,14 @@ mod tests {
             "held segment must decrement free by one"
         );
 
-        // (c) Close does NOT drain the hold — a Mode A forward polled after the
-        // FIN still writes the already-received bytes. The held bid stays out
-        // of the ring.
+        // (c) Close does not drain the hold; teardown does. The held bid stays
+        // out of the ring until then.
         let generation = el.driver.connections.generation(conn_index);
         el.driver.close_connection(conn_index);
         assert_eq!(
             el.driver.segment_hold[conn_index as usize].len(),
             1,
-            "close must NOT drain the segment hold (a forward may still write it)"
+            "close must not drain the segment hold"
         );
         assert!(
             !el.driver.pending_replenish.contains(&bid),
@@ -12066,7 +12064,7 @@ mod tests {
             crate::backend::HeldRecvBuf::Owned(_)
         ));
 
-        // Close leaves the hold for a possible forward; teardown drains it. The
+        // Close does not drain the hold; teardown does. The
         // owned entry carries no bid, so neither step re-queues a replenish.
         el.driver.close_connection(conn_index);
         assert_eq!(

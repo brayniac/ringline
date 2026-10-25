@@ -215,14 +215,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- On io_uring, the ring buffers a `forward_to` write pins count toward the
-  source's `forward_hold_cap`, and without `recv_incremental` the cap is at
-  most a quarter of the receive ring's buffers (#638). The cap is checked as
-  completions arrive, so a multishot receive can take buffers past it before
-  its cancel lands. A connection that forwards accumulator-backed data with
-  `forward_recv_buf` is not throttled: in a test the server accepted 64 MiB
-  from a peer that did not read (#638).
-
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
   buffered engine; `tls-unbuffered` has no effect and is kept so builds that

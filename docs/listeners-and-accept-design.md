@@ -1,5 +1,9 @@
 # Listeners and the accept path
 
+Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
+`with_segments`, `with_bytes_segments`, `end_segments`) and
+`recv_zc_threshold` were removed.
+
 - **Status:** proposal — intent only, nothing implemented
 - **Motivated by:** the single-listener limit found while reviewing whether
   `Connection` should split per transport
