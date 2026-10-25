@@ -81,8 +81,8 @@ impl SendHalf {
 pub struct SendWriter<'a> { /* slot chain, state; borrows the call */ }
 
 impl SendWriter<'_> {
-    /// Reserve pool capacity so that `additional` more bytes written through
-    /// `io::Write` or `BufMut` cannot fail.
+    /// Reserve pool slots for `additional` more bytes written through
+    /// `io::Write` or `BufMut`. Reserves nothing on TLS or mio.
     pub fn reserve(&mut self, additional: usize) -> io::Result<()>;
 
     /// Reserve `n` more whole slots, for `contiguous` calls.
@@ -226,21 +226,18 @@ against the pool from the moment they are taken.
   pool.
 - `contiguous` with `max` larger than the slot size returns `InvalidInput`
   and does not mark the writer failed.
-- On io_uring the writer holds one reservation. It starts with the
-  backpressured form's admission slots and is empty for the other forms.
-  `reserve(additional)` grows it
-  (`SendCopyPool::grow_reservation`, see "mio") by the slots that
-  `additional` bytes need beyond the current slot's free space and the slots
-  already reserved; `reserve_slots(n)` grows it by `n`. After `reserve`
-  returns `Ok`, `io::Write` and `BufMut` writes up to the reserved total
-  take reserved slots and cannot fail. `contiguous` can leave the tail of a
-  slot unused, so a writer that mixes `contiguous` with a byte-count
-  reservation can need more slots than it reserved; those come from the free
-  pool and can fail. An application that wants a guarantee for `contiguous`
-  writes calls `reserve_slots` with one slot per `contiguous` call that can
-  start a new slot. Unused reserved slots go back through
-  `release_reservation` when the call ends.
-- `SendWriter`'s `Drop` releases its slot chain and its reservation. That
+- On a plaintext io_uring connection, `reserve` and `reserve_slots` take
+  pool slots ahead of the writes, so that writes the reservation covers
+  cannot fail for lack of a slot. Unused reserved slots go back through
+  `release_reservation` when the call ends. On TLS and on mio they reserve
+  nothing (see "TLS" and "mio"). How a reservation is sized against the
+  current slot's free space, earlier reservations and slots `contiguous`
+  leaves partly unused, and how it combines with the backpressured form's
+  admission slots, is settled in the prototype. `SlotReservation` cannot
+  grow today, so the prototype adds a way to grow one.
+- `SendWriter`'s `Drop` releases its slot chain and any reservation it
+  holds, including the backpressured form's admission reservation while
+  `f` runs. That
   covers a panic inside the closure: the default `TaskPanicPolicy::Contain`
   catches it and keeps the worker running, and the unwind runs inside the
   task's poll, where `CURRENT_DRIVER` is set. Without this each panic would
@@ -383,10 +380,8 @@ writes fewer bytes than `len`, the permit is narrowed with
 `shrink_reservation` before the entry is queued, and the capacity release is
 flagged (`capacity_released`) so the FIFO head is woken, as the TLS branch
 of mio's `send_bounded` does. When `f` writes more, the permit is grown in
-place with a new `SendCopyPool::grow_reservation(&mut SlotReservation, more)
--> Result<(), ReserveError>`, which io_uring's `reserve` also uses. It
-reserves the shortfall and adds it to the permit. It returns `TooLarge` when
-the permit's slots plus the shortfall exceed the pool, which maps to
+place by reserving the missing slots and adding them to the permit. If the
+permit's slots plus the missing slots exceed the pool, the call fails with
 `InvalidInput`. On an error the call releases the permit (`release_permit`)
 and cancels the id while it is still waiting, which wakes the next head. The
 future then resolves to `Err` with nothing queued, and the closure's `R` is
