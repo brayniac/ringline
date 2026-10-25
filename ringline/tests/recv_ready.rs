@@ -2,9 +2,8 @@
 //!
 //! A server reads one line, then waits on `recv_ready` while the peer is
 //! silent and again after the peer writes a second line. `recv_ready` must stay
-//! pending while nothing has arrived and resolve once the second line has,
-//! wherever the driver holds it. On io_uring a plaintext reply arrives in the
-//! accumulator through direct receive.
+//! pending while nothing has arrived and resolve once the second line has
+//! arrived.
 
 use std::future::Future;
 use std::io::{Read, Write};

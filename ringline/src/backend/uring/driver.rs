@@ -1730,14 +1730,14 @@ impl Driver {
     }
 
     /// Reset segmented-recv delivery state for a (re)activated connection slot.
-    /// The hold is already drained by `close_connection`, so this is defensive;
+    /// `handle_close` drains the hold, so this is defensive;
     /// it also restores the domain to the default in case a slot is reused
     /// without an intervening close.
     pub(crate) fn reset_segment_state(&mut self, conn_index: u32) {
         self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
         self.segment_hold[conn_index as usize].clear();
-        // Mode A forward state — cleared defensively (close drains any pinned
-        // bid). A leftover `forward_done` result must not bleed into a reused
+        // Mode A forward state — cleared defensively (teardown releases any
+        // pinned bid). A leftover `forward_done` result must not bleed into a reused
         // slot's forward.
         self.forward_write[conn_index as usize] = None;
         self.forward_done[conn_index as usize] = None;
@@ -2236,9 +2236,10 @@ impl Driver {
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
         // Held segmented-recv buffers are not drained here. A close cancels an
-        // in-flight forward write and clears an idle forward's progress; the
-        // forward's held bytes are released at `handle_close` (teardown). The
-        // delivery domain is reset at slot reuse (`reset_segment_state`).
+        // in-flight forward write and clears an idle forward's progress.
+        // `close_connection` leaves the hold; teardown releases what is still
+        // in it. The delivery domain is reset at slot reuse
+        // (`reset_segment_state`).
         // An in-flight Mode A forward write's backing is still owned by the kernel
         // (it is the write's *source* memory) until the write CQE arrives —
         // reclaiming it now would either return a provided bid to the ring while

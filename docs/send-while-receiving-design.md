@@ -1,8 +1,6 @@
 # Sending while a reply is pending on the redis and memcache clients
 
-Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
-`with_segments`, `with_bytes_segments`, `end_segments`) and
-`recv_zc_threshold` were removed.
+Note (2026-10-25): `with_segments` and `end_segments` were removed.
 
 Status: Option A implemented (`Client::recv_ready`, and
 `RecvReadyFuture::poll` checks `recv_buffered`); its measurements

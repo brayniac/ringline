@@ -937,8 +937,7 @@ pub fn request_shutdown() -> io::Result<()> {
 /// [`split`](Self::split)).
 ///
 /// The forwarding entry points (`forward_to`, `forward_to_conn`) stay public
-/// on purpose: they move bytes kernel-side from source to sink and never surface
-/// them to the caller, so they cannot be used to observe a stream someone else
+/// on purpose: they never surface the bytes to the caller, so they cannot be used to observe a stream someone else
 /// is reading. Their own "one forward at a time" rule is refused at runtime by
 /// the driver, and that refusal stays reachable — and therefore testable —
 /// only through this handle, because `&mut RecvHalf` turns a second concurrent

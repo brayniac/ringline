@@ -4579,9 +4579,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Drain any segmented-recv buffers still held (a Mode A forward aborted
-        // by close, or one that never wrote them). `close_connection` does not
-        // drain them; at teardown each Pinned bid is reclaimed (Owned entries
-        // just drop). Symmetric to the `pending_recv_bufs`
+        // by close, or one that never wrote them). `close_connection` leaves the
+        // hold; teardown releases what is still in it: each Pinned bid is
+        // reclaimed and Owned entries drop. Symmetric to the `pending_recv_bufs`
         // reclaim above.
         for held in self.driver.segment_hold[conn_index as usize]
             .drain(..)

@@ -10,7 +10,8 @@
 //!   io_uring a plaintext connection receives directly into its accumulator,
 //!   and `forward_to` returns `io::ErrorKind::Unsupported` on it.
 //!   `forward_to_conn` sends from the accumulator through the sink's send
-//!   queue; while a `forward_to` runs from the source it gets `EBUSY`.
+//!   queue, and is refused with `EBUSY` while a `forward_to` runs from the
+//!   same source.
 //!
 //! This is a minimal per-connection selector; the holding machinery lives on the
 //! `Driver` (`segment_hold`).

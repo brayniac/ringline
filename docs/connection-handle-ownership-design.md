@@ -1,8 +1,7 @@
 # Connection handle ownership
 
 Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
-`with_segments`, `with_bytes_segments`, `end_segments`) and
-`recv_zc_threshold` were removed.
+`with_segments`, `end_segments`, `SegmentReader`) were removed.
 
 - **Status:** proposal — intent only, nothing implemented
 - **Motivated by:** #423, and four sibling defects found reviewing its fix
