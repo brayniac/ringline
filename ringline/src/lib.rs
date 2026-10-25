@@ -304,25 +304,10 @@ pub use runtime::io::JoinHandle;
 pub use runtime::io::ParseResult;
 /// The exclusive read side of a connection, from [`Connection::split()`] or [`ConnCtx::take_recv()`].
 pub use runtime::io::RecvHalf;
-/// Future returned by [`ConnCtx::recv_owned_segment()`] (segmented recv, Mode C).
-#[cfg(has_io_uring)]
-pub use runtime::io::RecvOwnedSegment;
 /// Future that resolves when recv data is available (sink, accumulator, or close).
 pub use runtime::io::RecvReadyFuture;
-/// A single zero-copy received provided buffer (segmented recv, Mode B).
-#[cfg(has_io_uring)]
-pub use runtime::io::RecvSegment;
 /// Future returned by [`resolve()`].
 pub use runtime::io::ResolveFuture;
-/// Ordered borrowed view of buffered recv data for [`ConnCtx::with_segments()`].
-#[cfg(has_io_uring)]
-pub use runtime::io::SegChain;
-/// Bytes consumed by a [`ConnCtx::with_segments()`] callback.
-#[cfg(has_io_uring)]
-pub use runtime::io::SegConsumed;
-/// Async lending iterator over received provided buffers (segmented recv, Mode B).
-#[cfg(has_io_uring)]
-pub use runtime::io::SegmentReader;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
 /// The single-owner write side of a connection, from [`Connection::split()`] or [`ConnCtx::take_send()`].
@@ -344,23 +329,16 @@ pub use runtime::io::UdpRecvFuture;
 pub use runtime::io::UnixConnect;
 /// Future that provides received data as zero-copy `Bytes`.
 pub use runtime::io::WithBytesFuture;
-/// Future returned by [`Connection::with_bytes_segments()`].
-pub use runtime::io::WithBytesSegmentsFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
 /// Future that resolves with recv data, `Ok(0)` on clean close, or the transport error.
 pub use runtime::io::WithDataResultFuture;
-/// Future returned by [`ConnCtx::with_segments()`] (segmented recv, Mode B).
-#[cfg(has_io_uring)]
-pub use runtime::io::WithSegmentsFuture;
 /// Future returned by [`yield_now()`].
 pub use runtime::io::YieldNow;
 /// Begin an outbound TCP connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect;
 /// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect_unix;
-/// Copy a receive view shorter than a threshold.
-pub use runtime::io::copy_small_view;
 /// Submit an fsync of a Direct I/O file and return a future for the result.
 pub use runtime::io::direct_io_fsync;
 /// Submit a Direct I/O read and return a future for the result.
@@ -379,8 +357,6 @@ pub use runtime::io::open_direct_io_file;
 pub use runtime::io::open_direct_io_file_with;
 /// Open an NVMe device from any async task.
 pub use runtime::io::open_nvme_device;
-/// The calling worker's receive view threshold.
-pub use runtime::io::recv_zc_threshold;
 /// Request graceful shutdown from any async task.
 pub use runtime::io::request_shutdown;
 /// Resolve a hostname to a `SocketAddr` using the dedicated resolver pool.

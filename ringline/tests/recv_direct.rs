@@ -508,6 +508,15 @@ fn expect_unsupported<T>(what: &str, r: std::io::Result<T>) -> Result<(), String
     }
 }
 
+/// `forward_to`, which holds provided-ring buffers, is refused on a direct
+/// connection.
+async fn expect_forward_to_unsupported(conn: &mut Connection) -> Result<(), String> {
+    let (sink_socket, _peer) =
+        std::os::unix::net::UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+    let sink = ringline::SinkFd::socket(std::os::fd::AsFd::as_fd(&sink_socket));
+    expect_unsupported("forward_to", conn.forward_to(&sink, 4).await)
+}
+
 impl AsyncEventHandler for Refusals {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
@@ -519,16 +528,7 @@ impl AsyncEventHandler for Refusals {
                 if !conn.is_recv_direct() {
                     return Err("a plaintext connect is not direct".into());
                 }
-                expect_unsupported("segments", conn.segments().map(|_| ()))?;
-                expect_unsupported("recv_owned_segment", conn.recv_owned_segment().map(|_| ()))?;
-                expect_unsupported(
-                    "with_bytes_segments",
-                    conn.with_bytes_segments(|_| ParseResult::NeedMore).await,
-                )?;
-                expect_unsupported(
-                    "with_segments",
-                    conn.with_segments(|_| ringline::SegConsumed(0)).await,
-                )?;
+                expect_forward_to_unsupported(&mut conn).await?;
                 // The connection still reads with `with_data`.
                 let mut got = Vec::new();
                 while got.len() < 4 {
@@ -1770,9 +1770,9 @@ fn a_reset_behind_buffered_bytes_read_once_is_reported_as_a_reset() {
 
 static INBOUND: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
-/// An accepted plaintext connection is direct: it refuses the reads that
-/// need the ring, reads a message larger than its region in order, and
-/// answers it.
+/// An accepted plaintext connection is direct: it refuses `forward_to`,
+/// which needs the ring, reads a message larger than its region in order,
+/// and answers it.
 struct InboundEcho;
 
 impl AsyncEventHandler for InboundEcho {
@@ -1782,12 +1782,7 @@ impl AsyncEventHandler for InboundEcho {
                 if !conn.is_recv_direct() {
                     return Err("an accepted plaintext connection is not direct".to_string());
                 }
-                expect_unsupported("segments", conn.segments().map(|_| ()))?;
-                expect_unsupported("recv_owned_segment", conn.recv_owned_segment().map(|_| ()))?;
-                expect_unsupported(
-                    "with_bytes_segments",
-                    conn.with_bytes_segments(|_| ParseResult::NeedMore).await,
-                )?;
+                expect_forward_to_unsupported(&mut conn).await?;
                 let mut got = Vec::new();
                 while got.len() < FWD_TOTAL {
                     let n = conn

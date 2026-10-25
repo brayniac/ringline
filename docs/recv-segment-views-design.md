@@ -1,5 +1,11 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
+Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
+`with_segments`, `end_segments`, `SegmentReader`, `RecvOwnedSegment`,
+`SegChain`, `SegConsumed`) and landing steps 1 to 3 (the receive views,
+`with_bytes_segments`, `recv_zc_threshold`, `copy_small_view`) were
+removed.
+
 Status: landing steps 1 (the view machinery), 2 (the reader) and 3
 (`recv_zc_threshold`) are implemented; steps 4 to 6 are a proposal.
 

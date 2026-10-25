@@ -1,5 +1,9 @@
 # Receive arrival times
 
+Note (2026-10-25): `with_bytes_segments`, `with_segments`,
+`SegmentReader`, `RecvSegment` and `recv_owned_segment` were removed; the reporting readers
+are `with_data`, `with_data_result`, `with_bytes` and `try_with_data`.
+
 Status: implemented. The cost is measured under "Cost".
 
 A reader on a TCP connection can ask when the first and the last byte it

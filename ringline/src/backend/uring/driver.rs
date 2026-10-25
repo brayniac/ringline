@@ -121,31 +121,6 @@ impl Driver {
     }
 }
 
-impl Driver {
-    /// A `Bytes` view of `len` bytes at offset `off` in TCP ring buffer `bid`,
-    /// which must have a hold (the held entry the view is made from). The
-    /// view takes a hold of its own, released when the view and every clone
-    /// and slice of it have dropped (`backend/uring/view.rs`), so the buffer
-    /// is not posted again while any of them is alive. The hold counts in
-    /// `ProvidedBufRing::held`, under the lend cap.
-    ///
-    /// # Panics
-    /// If `bid` has no hold, or the range ends past the bytes the kernel has
-    /// completed in the buffer.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn recv_view(&mut self, bid: u16, off: u32, len: u32) -> bytes::Bytes {
-        let end = off.checked_add(len).expect("view range overflows");
-        self.provided_bufs.add_hold(bid, end);
-        super::view::view(
-            self.provided_bufs.memory(),
-            self.provided_bufs.data_ptr(bid, off),
-            len as usize,
-            bid,
-            self.worker_id,
-        )
-    }
-}
-
 /// An in-flight direct receive: the connection it was armed for and the
 /// accumulator buffer the kernel writes into, behind its existing contents.
 pub(crate) struct DirectRecv {
@@ -279,8 +254,8 @@ impl Driver {
     /// Arm a TLS connection's ring receive if no receive is armed, the
     /// connection is open and reading, it is not throttled or starved, and no
     /// park is pending. Once its handshake is done, a TLS connection's receive
-    /// is armed this way by a parked read (`park_recv`), by a segment reader or
-    /// Mode A forward entering the segmented domain or waiting on its hold, and
+    /// is armed this way by a parked read (`park_recv`), by a Mode A forward
+    /// entering the segmented domain or waiting on its hold, and
     /// by its hangup poll. After a data completion, `handle_recv_multi` re-arms
     /// it only while `rearms_after_completion` holds; a receive stopped by the
     /// hold-cap throttle is re-armed when the throttle lifts, even after the
@@ -314,8 +289,8 @@ impl Driver {
 
     /// Whether a ring receive that completed should be re-armed at once. A
     /// TLS connection whose handshake is done re-arms only in the segmented
-    /// domain (a forward source or a segment reader, throttled at the hold
-    /// cap) or after its hangup poll has completed; otherwise its next
+    /// domain (a forward source, throttled at the hold cap) or after its
+    /// hangup poll has completed; otherwise its next
     /// parked read arms the receive, so a task that does not read stops its
     /// peer. Every other ring connection re-arms.
     pub(crate) fn rearms_after_completion(&self, conn_index: u32) -> bool {
@@ -433,20 +408,21 @@ fn select_incremental(config: &Config, ring: &mut Ring) -> Result<bool, crate::e
     })
 }
 
-/// A held received buffer for segmented delivery (Mode B/C), in one of two
-/// backings depending on ring pressure at delivery time.
+/// A held received buffer for segmented delivery, in one of two backings
+/// depending on ring pressure at delivery time.
 ///
 /// - [`Pinned`](Self::Pinned): a provided-buffer bid pinned in the ring — the
-///   bid is NOT replenished, so the buffer stays in the provided ring until a
-///   segment reader consumes it or the connection closes (`close_connection`
-///   drains the hold). The data's address is derivable via
+///   bid is NOT replenished, so the buffer stays out of the provided ring
+///   until a Mode A forward writes it or the connection closes (teardown
+///   releases the hold). The data's address is derivable via
 ///   `provided_bufs.data_ptr(bid, off)`, so only the id, offset and length
 ///   are stored. This is the zero-copy delivery, used while the ring is
 ///   above the low-water reserve.
 /// - [`Owned`](Self::Owned): an owned copy of the received bytes. When the ring
-///   is at/below `recv_segment_reserve` the bytes are copied at delivery and the
-///   bid is returned to the ring immediately (Mode C), so this entry pins
-///   nothing and needs no replenish when consumed or on close.
+///   is at/below `recv_segment_reserve`, and always for a TLS connection's
+///   plaintext, the bytes are copied at delivery and the bid is returned to
+///   the ring immediately, so this entry pins nothing and needs no replenish
+///   when consumed or on close.
 #[derive(Clone)]
 pub(crate) enum HeldRecvBuf {
     /// A provided-buffer bid pinned in the ring (zero-copy hold).
@@ -454,7 +430,7 @@ pub(crate) enum HeldRecvBuf {
         bid: u16,
         /// Offset of the received bytes in the buffer: 0 on a plain ring.
         off: u32,
-        /// Bytes received into this buffer at `off`. The segment reader slices
+        /// Bytes received into this buffer at `off`. A forward write slices
         /// the buffer to this length; close-drain only needs the bid.
         len: u32,
     },
@@ -641,14 +617,10 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
-    /// TCP bids whose hold (a completion's or a view's) is released at the next
+    /// TCP bids whose completion hold is released at the next
     /// `flush_replenish_and_rearm` (`ProvidedBufRing::release_batch`): one
     /// entry per hold.
     pub(crate) pending_replenish: Vec<u16>,
-    /// The id of the worker that runs this driver (`WorkerWakes::id`). Views
-    /// carry it so their releases reach this worker. 0 until
-    /// `AsyncEventLoop::new` sets it, before any view can be made.
-    pub(crate) worker_id: u32,
     /// Per-connection pending recv buffer for zero-copy recv. When `Some`, the
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
     /// replenished when the slot is cleared.
@@ -687,25 +659,11 @@ pub(crate) struct Driver {
     /// `Segmented` holds arriving provided buffers in `segment_hold` instead.
     /// Reset at slot (re)activation and on close.
     pub(crate) recv_domain: Vec<crate::recv::domain::RecvDomain>,
-    /// Per-connection held provided buffers for `Segmented` connections. Bids
-    /// pushed here are pinned in the ring (NOT replenished, no accumulator copy)
-    /// until a reader consumes them (later increment) or the connection closes.
-    /// A reader consumes them (`SegmentReader::next`) or the connection closes.
-    /// `close_connection` drains any still-held bids to `pending_replenish`.
+    /// Per-connection held receive entries for `Segmented` connections. A
+    /// `Pinned` entry's bid stays out of the ring (not replenished, no
+    /// accumulator copy) until a Mode A forward writes it or the connection
+    /// closes; teardown (`handle_close`) releases any still held.
     pub(crate) segment_hold: Vec<std::collections::VecDeque<HeldRecvBuf>>,
-    /// Per-connection pin slot: the single provided buffer currently checked out
-    /// to a live `RecvSegment` (moved here out of `segment_hold` by
-    /// `SegmentReader::next`). The B2 lending-iterator contract is one live
-    /// segment at a time, so a single `Option` suffices. This is the
-    /// single-release discriminant: whoever `take()`s it (the segment's `Drop`
-    /// under `try_with_state`, or `close_connection` under `&mut Driver`)
-    /// replenishes the bid exactly once; the other sees `None` and does nothing.
-    pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
-    /// Per connection, the number of times `settle_forward_end` has returned
-    /// it to the default domain (wrapping). A parked `with_bytes_segments`
-    /// future compares it, with `recv_consumed`, against the values at the
-    /// end of its previous poll and resolves to `EBUSY` if either changed.
-    pub(crate) segment_epoch: Vec<u32>,
     /// Per-connection receive arrival log (`recv::arrival`).
     pub(crate) arrival: Vec<crate::recv::arrival::ArrivalLog>,
     /// The current completion batch, whose time the arrival logs record. A
@@ -783,14 +741,6 @@ pub(crate) struct Driver {
     /// Connections lifted off this worker, waiting to be handed over.
     /// `OwnedFd` means an entry left here is closed rather than leaked.
     pub(crate) park_ready: Vec<ParkedFd>,
-    /// A `SegmentReader` is live on this connection.
-    ///
-    /// A reader owns the connection's delivery discipline for its whole
-    /// lifetime — its `Drop` settles the hold back into the accumulator — so a
-    /// second reader, or an owned-segment read, alongside it is a bug. Entry
-    /// refuses with `EBUSY` while this is set, rather than letting the conflict
-    /// surface later as a stranded read (#423, #427).
-    pub(crate) segment_reader_live: Vec<bool>,
     /// The connection's [`RecvHalf`] has been taken.
     ///
     /// The recv side of a connection is exclusive — nine entry points that
@@ -922,11 +872,9 @@ pub(crate) struct Driver {
     pub(crate) loop_diag: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
-    /// `Config::recv_zc_threshold`, returned by `crate::recv_zc_threshold`.
-    pub(crate) recv_zc_threshold: u32,
     /// Aggregate low-water reserve for segmented recv (Config::recv_segment_reserve).
     /// When `provided_bufs.free() <= recv_segment_reserve`, an arriving segmented
-    /// buffer is force-copied (Mode C) and its bid replenished immediately instead
+    /// buffer is force-copied and its bid replenished immediately instead
     /// of pinned, so held segments cannot deplete the shared ring under fan-in.
     pub(crate) recv_segment_reserve: u32,
     /// Upper bound on outstanding recv bytes per connection (mirrors
@@ -1235,10 +1183,6 @@ pub(crate) enum ParkBlocker {
     /// A send chain has SQEs in the kernel whose CQEs drive its own
     /// accounting; it has to finish where it started.
     Chain,
-    /// A `SegmentReader` is live. The reader owns the connection's delivery
-    /// discipline for its whole lifetime, so this is by definition not a
-    /// quiescent point.
-    SegmentReader,
     /// A fallback recv is in flight against this worker's send pool.
     RecvFallback,
 }
@@ -1264,7 +1208,6 @@ impl ParkBlocker {
             ParkBlocker::Sends => pa::SENDS,
             ParkBlocker::ForwardWrite => pa::FORWARD_WRITE,
             ParkBlocker::Chain => pa::CHAIN,
-            ParkBlocker::SegmentReader => pa::SEGMENT_READER,
             ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
         }
     }
@@ -1292,7 +1235,6 @@ mod park_blocker_tests {
             ParkBlocker::Sends,
             ParkBlocker::ForwardWrite,
             ParkBlocker::Chain,
-            ParkBlocker::SegmentReader,
             ParkBlocker::RecvFallback,
         ];
         let mut seen = std::collections::HashMap::new();
@@ -1497,7 +1439,6 @@ impl Driver {
             send_slab,
             accumulators,
             pending_replenish: Vec::with_capacity(recv_ring_size as usize),
-            worker_id: 0,
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_offs: vec![0; config.max_connections as usize],
@@ -1511,8 +1452,6 @@ impl Driver {
             segment_hold: (0..config.max_connections)
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
-            segment_pinned: vec![None; config.max_connections as usize],
-            segment_epoch: vec![0; config.max_connections as usize],
             arrival: (0..config.max_connections)
                 .map(|_| crate::recv::arrival::ArrivalLog::default())
                 .collect(),
@@ -1526,7 +1465,6 @@ impl Driver {
             park_ready: Vec::new(),
             peer_park: config.peer_park.clone(),
             park_rx: config.park_rx.clone(),
-            segment_reader_live: vec![false; config.max_connections as usize],
             recv_half_taken: vec![false; config.max_connections as usize],
             send_half_taken: vec![false; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
@@ -1565,7 +1503,6 @@ impl Driver {
             tcp_nodelay: config.tcp_nodelay,
             loop_diag: config.loop_diag,
             send_zc_threshold: config.send_zc_threshold,
-            recv_zc_threshold: config.recv_zc_threshold,
             recv_segment_reserve: config.recv_segment_reserve,
             recv_accumulator_max: config.recv_accumulator_max,
             chain_table: SendChainTable::new(config.max_connections),
@@ -1793,18 +1730,13 @@ impl Driver {
     }
 
     /// Reset segmented-recv delivery state for a (re)activated connection slot.
-    /// The hold is already drained by `close_connection`, so this is defensive;
-    /// it also restores the domain to the default in case a slot is reused
-    /// without an intervening close.
+    /// `handle_close` drains the hold, so this is defensive; it also restores
+    /// the domain to the default, which close does not reset.
     pub(crate) fn reset_segment_state(&mut self, conn_index: u32) {
         self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
         self.segment_hold[conn_index as usize].clear();
-        // The pin slot should already be None (close drains it), but clear it
-        // defensively for a slot reused without an intervening close-drain.
-        self.segment_pinned[conn_index as usize] = None;
-        // Mode A forward state — cleared defensively (close drains any pinned
-        // bid). A leftover `forward_done` result must not bleed into a reused
-        // slot's forward.
+        // Mode A forward state, cleared defensively. A leftover `forward_done`
+        // result must not bleed into a reused slot's forward.
         self.forward_write[conn_index as usize] = None;
         self.forward_done[conn_index as usize] = None;
         self.forward_progress[conn_index as usize] = None;
@@ -1815,16 +1747,14 @@ impl Driver {
     /// Settle a connection when a Mode A `forward_to` finishes: any provided
     /// buffers still held in `segment_hold` carry stream bytes *past* the
     /// forwarded region, so their bytes are preserved by copying them into the
-    /// accumulator (in arrival order) before the bid is replenished — exactly
-    /// like the `with_segments` under-drain path. The delivery domain is then
-    /// reset so subsequent `with_data`/`with_bytes` reads see those bytes first.
+    /// accumulator (in arrival order) before the bid is replenished. The
+    /// delivery domain is then reset so subsequent `with_data`/`with_bytes`
+    /// reads see those bytes first.
     ///
     /// Returns `false` if the accumulator overflowed (`recv_accumulator_max`),
     /// in which case the caller must close the connection.
     #[must_use]
     pub(crate) fn settle_forward_end(&mut self, conn_index: u32) -> bool {
-        let epoch = &mut self.segment_epoch[conn_index as usize];
-        *epoch = epoch.wrapping_add(1);
         let mut ok = true;
         while let Some(held) = self.segment_hold[conn_index as usize].pop_front() {
             match held {
@@ -2239,7 +2169,7 @@ impl Driver {
 
     /// Clear the recv-side exclusivity claims for a slot that is being reused.
     ///
-    /// `RecvHalf::drop` and `SegmentReader::drop` release their own claims, but
+    /// `RecvHalf::drop` and `SendHalf::drop` release their own claims, but
     /// both go through `try_with_state`, which is a **no-op during unguarded
     /// teardown** — `executor.remove_connection` drops a parked task's future
     /// with `CURRENT_DRIVER` unset. A claim can therefore outlive its claimant,
@@ -2251,9 +2181,6 @@ impl Driver {
     /// how the previous occupant died.
     pub(crate) fn clear_conn_claims(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
-        if let Some(live) = self.segment_reader_live.get_mut(idx) {
-            *live = false;
-        }
         if let Some(taken) = self.recv_half_taken.get_mut(idx) {
             *taken = false;
         }
@@ -2306,27 +2233,10 @@ impl Driver {
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
-        // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
-        // this close, a parked Mode B reader must still consume the bytes already
-        // held — draining them now (before the woken reader is polled) would
-        // discard a fully-received response and surface an empty EOF (the
-        // data+FIN-loss bug): a data CQE and the FIN can land in the same batch,
-        // and `close_connection` runs before `poll_ready_tasks`. The reader drains
-        // the hold (replenishing each bid as it consumes, seeing EOF once the hold
-        // is empty and the connection is `Closed`); any buffers it never reaches
-        // are reclaimed at `handle_close` (teardown), symmetric to `segment_pinned`.
-        // The delivery domain is reset at slot reuse (`reset_segment_state`).
-        // A bid checked out to a live `RecvSegment` (a parked task holding a
-        // segment across an await) must NOT be reclaimed here. `RecvSegment::deref`
-        // reads that bid's provided buffer directly, and a parked task can still
-        // resume and deref it between now and the `Close` CQE — returning the bid
-        // to the ring now would let another connection's recv overwrite a buffer a
-        // live segment is still reading (a safe-API data leak). The bid stays
-        // pinned in `segment_pinned[conn]` until `handle_close`, which reclaims it
-        // after `remove_connection` has dropped the future (and with it the
-        // segment). `RecvSegment::drop` running in-poll before then still releases
-        // it (the pin slot is the single-release discriminant); if the drop runs
-        // unguarded during teardown it no-ops and `handle_close` does the release.
+        // Held segmented-recv buffers are not drained here; `handle_close`
+        // releases them. A close cancels an in-flight forward write and clears
+        // an idle forward's progress. The delivery domain is reset at slot
+        // reuse (`reset_segment_state`).
         // An in-flight Mode A forward write's backing is still owned by the kernel
         // (it is the write's *source* memory) until the write CQE arrives —
         // reclaiming it now would either return a provided bid to the ring while
@@ -2364,8 +2274,8 @@ impl Driver {
             self.forward_done[conn_index as usize] = None;
             self.forward_progress[conn_index as usize] = None;
         }
-        // Clear the Mode A forward flags for slot reuse. Any held bids were
-        // already drained above (segment_hold / segment_pinned / forward_write);
+        // Clear the Mode A forward flags for slot reuse. Held bids are
+        // released at teardown (segment_hold) or by the write CQE (forward_write);
         // the throttle flag just tracks recv-arm state and needs no bid release.
         // A throttle-cancel's ECANCELED (if still in flight) is a no-op in
         // `handle_recv_multi` (result < 0 / generation checks).
@@ -2437,8 +2347,8 @@ impl Driver {
         }
     }
 
-    /// Drain the accumulator and the receive holds (`segment_pinned`,
-    /// `segment_hold`) into owned bytes, in wire order,
+    /// Drain the accumulator and the receive hold (`segment_hold`) into owned
+    /// bytes, in wire order,
     /// releasing each held bid back to the ring (tier 3, #443).
     ///
     /// **Normally returns nothing, and that is the intended state.**
@@ -2458,15 +2368,13 @@ impl Driver {
     /// next offer rather than to ship stale state alongside a live request.
     ///
     /// **Order is the correctness property.** The accumulator holds bytes that
-    /// arrived before anything still held, and `segment_pinned` was popped
-    /// from the front of `segment_hold`, so the sequence is: accumulator,
-    /// pinned, then held. Getting this wrong reorders the
+    /// arrived before anything still held, so the sequence is: accumulator,
+    /// then held. Getting this wrong reorders the
     /// peer's byte stream, which no test of "did the bytes arrive" would
     /// catch.
     ///
-    /// Follows the copy-before-replenish discipline of the segment reader
-    /// (`runtime/io.rs`): the bid goes back to the ring only after its bytes
-    /// have been copied out, with no await in between.
+    /// Copy before replenish: the bid goes back to the ring only after its
+    /// bytes have been copied out, with no await in between.
     pub(crate) fn take_pending_for_park(&mut self, conn_index: u32) -> Vec<bytes::Bytes> {
         let idx = conn_index as usize;
         let mut out: Vec<bytes::Bytes> = Vec::new();
@@ -2476,9 +2384,8 @@ impl Driver {
             out.push(acc);
         }
 
-        let pinned = self.segment_pinned[idx].take();
         let held: Vec<HeldRecvBuf> = self.segment_hold[idx].drain(..).collect();
-        for entry in pinned.into_iter().chain(held) {
+        for entry in held {
             match entry {
                 HeldRecvBuf::Pinned { bid, off, len } => {
                     let ptr = self.provided_bufs.data_ptr(bid, off);
@@ -2522,8 +2429,7 @@ impl Driver {
     /// Bytes the connection holds that no consumer has taken: the
     /// accumulator, the bytes in the buffer a direct receive holds
     /// (`recv_direct_held`), a lent buffer in `pending_recv_bufs` and
-    /// `segment_hold`. A buffer in `segment_pinned` has been handed to a
-    /// `RecvSegment`, so its bytes are not counted.
+    /// `segment_hold`.
     ///
     /// The arrival log takes the first unread stream offset as
     /// `delivered - recv_buffered`.
@@ -2539,16 +2445,6 @@ impl Driver {
                 .iter()
                 .map(HeldRecvBuf::len)
                 .sum::<usize>()
-    }
-
-    /// Bytes of the connection's stream that readers have removed from it:
-    /// those delivered (`ArrivalLog::delivered`) less `recv_buffered`. A
-    /// reader that consumes bytes raises it; moving bytes between the
-    /// accumulator and the holds does not change it.
-    pub(crate) fn recv_consumed(&self, conn_index: u32) -> u64 {
-        self.arrival[conn_index as usize]
-            .delivered()
-            .saturating_sub(self.recv_buffered(conn_index) as u64)
     }
 
     /// Record `n` bytes delivered to the connection in the current batch.
@@ -2593,11 +2489,11 @@ impl Driver {
     }
 
     /// Whether the connection holds received bytes that no consumer has
-    /// finished with: `recv_buffered` is nonzero, or a buffer is pinned by a
-    /// live `RecvSegment`. `park_blocker` refuses a park while this holds
-    /// (`ParkBlocker::DataPending`), and `offer_park` declines an offer.
+    /// finished with: `recv_buffered` is nonzero. `park_blocker` refuses a
+    /// park while this holds (`ParkBlocker::DataPending`), and `offer_park`
+    /// declines an offer.
     pub(crate) fn holds_unread(&self, conn_index: u32) -> bool {
-        self.recv_buffered(conn_index) > 0 || self.segment_pinned[conn_index as usize].is_some()
+        self.recv_buffered(conn_index) > 0
     }
 
     /// Record a handler's park offer, with the state to carry
@@ -2645,8 +2541,7 @@ impl Driver {
     /// blocking it.
     ///
     /// Unread bytes block as `ParkBlocker::DataPending`: the accumulator, a
-    /// lent buffer in `pending_recv_bufs`, `segment_hold` and
-    /// `segment_pinned`.
+    /// lent buffer in `pending_recv_bufs` and `segment_hold`.
     pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
         let Some(conn) = self.connections.get(conn_index) else {
             return Some(ParkBlocker::NotOpen);
@@ -2723,9 +2618,6 @@ impl Driver {
         }
         if self.chain_table.is_active(conn_index) {
             return Some(ParkBlocker::Chain);
-        }
-        if self.segment_reader_live[conn_index as usize] {
-            return Some(ParkBlocker::SegmentReader);
         }
         if self.recv_fallback_inflight[conn_index as usize] {
             return Some(ParkBlocker::RecvFallback);

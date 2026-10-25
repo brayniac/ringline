@@ -1,5 +1,7 @@
 # Recv buffer geometry sweep — design
 
+Note (2026-10-25): `with_segments` and `recv_owned_segment` were removed.
+
 **Status:** **Phase A complete — the default stands.** Phase 0 landed (#417);
 #415 merged as 282773b. Outcome below.
 

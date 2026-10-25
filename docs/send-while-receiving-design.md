@@ -1,5 +1,7 @@
 # Sending while a reply is pending on the redis and memcache clients
 
+Note (2026-10-25): `with_segments` and `end_segments` were removed.
+
 Status: Option A implemented (`Client::recv_ready`, and
 `RecvReadyFuture::poll` checks `recv_buffered`); its measurements
 (Measurements) not yet taken. Option B not implemented. The sections below

@@ -42,14 +42,6 @@ pub(crate) struct Inbox {
     /// worker blocked in its event loop wakes. Unset for an executor with no event loop (unit
     /// tests).
     wake: OnceLock<crate::wakeup::WakeHandle>,
-    /// Receive views dropped on other threads: `(ring memory id, bid)` of
-    /// each hold to release (`backend/uring/view.rs`).
-    #[cfg(has_io_uring)]
-    view_releases: Mutex<Vec<(u64, u16)>>,
-    /// Set after a release is pushed to `view_releases`, as `nonempty` is
-    /// for `ids`.
-    #[cfg(has_io_uring)]
-    views_nonempty: AtomicBool,
 }
 
 /// Inboxes of live executors, by worker id.
@@ -84,10 +76,6 @@ impl WorkerWakes {
             ids: Mutex::new(Vec::new()),
             nonempty: AtomicBool::new(false),
             wake: OnceLock::new(),
-            #[cfg(has_io_uring)]
-            view_releases: Mutex::new(Vec::new()),
-            #[cfg(has_io_uring)]
-            views_nonempty: AtomicBool::new(false),
         });
         inboxes()
             .write()
@@ -117,58 +105,6 @@ impl WorkerWakes {
             let mut ids = self.inbox.ids.lock().unwrap_or_else(|e| e.into_inner());
             buf.extend(ids.drain(..));
         }
-    }
-}
-
-#[cfg(has_io_uring)]
-impl WorkerWakes {
-    /// Pass each receive-view release pushed from another thread to
-    /// `release`.
-    pub(crate) fn drain_view_releases(&self, mut release: impl FnMut(u64, u16)) {
-        if self.inbox.views_nonempty.load(Ordering::Relaxed)
-            && self.inbox.views_nonempty.swap(false, Ordering::Acquire)
-        {
-            let releases = std::mem::take(
-                &mut *self
-                    .inbox
-                    .view_releases
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            );
-            for (alloc, bid) in releases {
-                release(alloc, bid);
-            }
-        }
-    }
-}
-
-/// Deliver a receive view's release from a thread other than its worker's to
-/// that worker's inbox, and wake the worker. A worker that has exited has no
-/// inbox, and the release is dropped: its ring is gone.
-#[cfg(has_io_uring)]
-#[cold]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn release_view_remote(owner: u32, alloc: u64, bid: u16) {
-    let inbox = inboxes()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&owner)
-        .cloned();
-    let Some(inbox) = inbox else {
-        crate::metrics::RECV_RING.increment(crate::metrics::recv_ring::VIEW_RELEASE_DROPPED);
-        return;
-    };
-    crate::metrics::RECV_RING.increment(crate::metrics::recv_ring::VIEW_RELEASE_REMOTE);
-    inbox
-        .view_releases
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((alloc, bid));
-    // As in `wake_remote`: only the push that sets the flag writes the fd.
-    if !inbox.views_nonempty.swap(true, Ordering::AcqRel)
-        && let Some(wake) = inbox.wake.get()
-    {
-        wake.wake();
     }
 }
 

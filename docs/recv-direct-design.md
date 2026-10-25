@@ -1,5 +1,9 @@
 # Direct receive: one-shot receives into the connection's accumulator
 
+Note (2026-10-25): `segments`, `recv_owned_segment`, `with_segments` and
+`with_bytes_segments` were removed; of the reads that hold provided buffers
+only `forward_to` remains, and a direct connection refuses it.
+
 Status: merged (#684). Since decisions 11 and 15, every plaintext
 connection on io_uring, outbound or accepted, receives this way, with no
 option. Measured through build C8 and at 250 and 1,000 connections per

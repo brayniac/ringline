@@ -60,9 +60,6 @@ impl TlsClientConfig {
     }
 }
 
-/// Default receive view threshold ([`ConfigBuilder::recv_zc_threshold`]).
-pub(crate) const DEFAULT_RECV_ZC_THRESHOLD: u32 = 4096;
-
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
 pub struct Config {
@@ -149,8 +146,8 @@ pub struct Config {
     /// When a `Segmented` connection receives a provided buffer, the runtime
     /// consults the shared per-worker recv ring's live free-buffer count. If
     /// `free() <= recv_segment_reserve`, the buffer is **force-copied** into an
-    /// owned `Bytes` and its bid returned to the ring immediately (Mode C at
-    /// delivery) instead of being pinned as a zero-copy held segment. This
+    /// owned `Bytes` and its bid returned to the ring immediately instead of
+    /// being pinned as a zero-copy held segment. This
     /// guarantees a well-behaved connection is never `ENOBUFS`-starved by other
     /// connections holding segments under fan-in, at the cost of a copy while the
     /// ring is under pressure. Above the reserve, delivery stays zero-copy
@@ -168,8 +165,7 @@ pub struct Config {
     ///
     /// A connection can hold arriving data in place or as copies until its
     /// consumer drains it: a `forward_to` source until each buffer is written to
-    /// the sink, a segment reader (`segments`, `with_segments`) until it reads.
-    /// A slow consumer would otherwise accumulate an unbounded backlog, pinning
+    /// the sink. A slow consumer would otherwise accumulate an unbounded backlog, pinning
     /// the shared per-worker recv ring (starving every other connection on the
     /// worker) or growing heap copies without limit. When a connection's held
     /// entries reach this cap (lowered to a quarter of the recv ring's buffers
@@ -238,10 +234,6 @@ pub struct Config {
     /// Sends at or above the threshold, or that don't fit a send pool slot,
     /// use the zero-copy path as before. Default: `4096`.
     pub(crate) send_zc_threshold: u32,
-    /// Receive views shorter than this many bytes are copied by
-    /// [`copy_small_view`](crate::copy_small_view) when a client passes this
-    /// value as its threshold. See [`ConfigBuilder::recv_zc_threshold`].
-    pub(crate) recv_zc_threshold: u32,
     /// Number of InFlightSendSlab slots for in-flight scatter-gather sends
     /// (i.e., `send_parts()` calls that include at least one guard).
     /// Each slot is held until all ZC notifications arrive.
@@ -479,7 +471,6 @@ impl Default for Config {
             send_copy_count: 1024,
             send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
-            recv_zc_threshold: DEFAULT_RECV_ZC_THRESHOLD,
             send_slab_slots: 512,
             flush_interval_us: 100,
             tick_timeout_us: 1000,
@@ -535,12 +526,6 @@ impl Config {
     /// [`ConfigBuilder::send_zc_threshold`].
     pub fn send_zc_threshold(&self) -> u32 {
         self.send_zc_threshold
-    }
-
-    /// The receive view threshold in bytes. See
-    /// [`ConfigBuilder::recv_zc_threshold`].
-    pub fn recv_zc_threshold(&self) -> u32 {
-        self.recv_zc_threshold
     }
 
     /// A TLS connection encrypts into the same `SendCopyPool` slots that plain
@@ -1194,9 +1179,8 @@ impl ConfigBuilder {
     /// Set the per-connection cap on held receive entries.
     ///
     /// A connection holds received data until its consumer drains it: a
-    /// `forward_to` source until each buffer is written to the sink, a
-    /// segment reader (`segments`, `with_segments`, `recv_owned_segment`)
-    /// until it reads. When a connection holds this many entries the runtime
+    /// `forward_to` source until each buffer is written to the sink. When a
+    /// connection holds this many entries the runtime
     /// stops its recv (a one-shot recv is not re-armed, a multishot one is
     /// cancelled), closing its TCP receive window so only its peer stops
     /// sending, and re-arms it on an event-loop pass once the hold drains
@@ -1219,7 +1203,7 @@ impl ConfigBuilder {
     /// Default: 64 (2× `MAX_IOVECS`).
     ///
     /// On io_uring only a TLS connection uses this, when it is a `forward_to`
-    /// source or has a segment reader: a plaintext
+    /// source: a plaintext
     /// connection receives directly into its accumulator (see
     /// [`connect`](crate::connect)).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
@@ -1254,24 +1238,6 @@ impl ConfigBuilder {
     /// Set the zero-copy guard send threshold in bytes (0 = always zero-copy).
     pub fn send_zc_threshold(mut self, bytes: u32) -> Self {
         self.config.send_zc_threshold = bytes;
-        self
-    }
-
-    /// Set the receive view threshold in bytes (0 = never copy). Default:
-    /// 4096, the send side's default; it has not been measured for receive.
-    ///
-    /// No connection currently produces a receive view: on io_uring a
-    /// plaintext connection refuses `with_bytes_segments` and a TLS
-    /// connection's pieces are heap copies. A view a client keeps would hold
-    /// its whole ring buffer until it drops. The runtime does not apply this value
-    /// itself. [`recv_zc_threshold`](crate::recv_zc_threshold) returns it in
-    /// the worker's tasks and its `on_tick` and `on_notify` callbacks. A
-    /// client passes it to
-    /// [`copy_small_view`](crate::copy_small_view), which copies a view
-    /// shorter than the threshold, so a small kept value does not hold a
-    /// ring buffer.
-    pub fn recv_zc_threshold(mut self, bytes: u32) -> Self {
-        self.config.recv_zc_threshold = bytes;
         self
     }
 
@@ -1918,15 +1884,5 @@ mod tests {
             .build()
             .expect("zero send_zc_threshold should be valid");
         assert_eq!(cfg.send_zc_threshold, 0);
-    }
-
-    #[test]
-    fn recv_zc_threshold_default_and_builder() {
-        assert_eq!(Config::default().recv_zc_threshold(), 4096);
-        let cfg = ConfigBuilder::default()
-            .recv_zc_threshold(0)
-            .build()
-            .expect("zero recv_zc_threshold should be valid");
-        assert_eq!(cfg.recv_zc_threshold(), 0);
     }
 }

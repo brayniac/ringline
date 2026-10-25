@@ -7,5 +7,5 @@ pub(crate) mod event_loop;
 pub(crate) mod parked;
 pub mod provided;
 pub(crate) mod ring;
+pub(crate) mod ring_memory;
 pub(crate) mod sqe;
-pub(crate) mod view;

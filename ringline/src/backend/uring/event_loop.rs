@@ -166,7 +166,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
         region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
-        let mut driver = Driver::new(
+        let driver = Driver::new(
             config,
             accept_rx,
             eventfd,
@@ -200,7 +200,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.udp_bind.len() as u32,
             udp_queue_capacity,
         );
-        driver.worker_id = executor.wakes.id();
         // A waker woken off this thread rings the worker's own wake fd.
         if let Some(handle) = config
             .wake_keep_alive
@@ -1147,11 +1146,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .tls_table
             .as_ref()
             .is_some_and(|t| t.has(conn_index));
-        // Segmented delivery (`forward_to`, `with_segments`)
+        // Segmented delivery (`forward_to`)
         // is defined over provided buffers: a segment is a held bid, and the
-        // hold is where a reader looks. The fallback reads into a pool slot and
+        // hold is where a forward looks. The fallback reads into a pool slot and
         // can only append to the accumulator, so on a segmented connection it
-        // does not merely bypass the reader — it reorders the stream, since
+        // does not merely bypass the hold — it reorders the stream, since
         // bytes already held are earlier than the ones it appends. A forward
         // source is the worst case: it never looks at the accumulator at all,
         // so the fallback chain feeds bytes into a buffer nobody reads while
@@ -1279,7 +1278,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // flip *while a fallback is in flight* — a handler that parses a length
         // header and then starts a forward does exactly that. These bytes are
         // the newest on the stream, so they go to the back of the hold, where
-        // the segmented reader will find them; appending them to the
+        // the forward will find them; appending them to the
         // accumulator would stand them in front of the held bytes and strand
         // them besides, since a forward never reads the accumulator.
         let appended = if self.driver.recv_domain[conn_index as usize]
@@ -2023,11 +2022,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
-            // A segmented TLS connection (a forward source or a segment
-            // reader) holds decrypted plaintext until the forward or the
-            // reader drains it. Stop receiving at the hold cap, as the
-            // plaintext segmented path does, so a slow sink or reader stops
-            // the peer instead of growing the hold to `recv_accumulator_max`.
+            // A segmented TLS connection (a `forward_to` source) holds
+            // decrypted plaintext until the forward drains it. Stop receiving
+            // at the hold cap, as the plaintext segmented path does, so a slow
+            // sink stops the peer instead of growing the hold to
+            // `recv_accumulator_max`.
             if self.driver.recv_domain[conn_index as usize]
                 == crate::recv::domain::RecvDomain::Segmented
                 && self
@@ -2041,7 +2040,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else if self.driver.recv_domain[conn_index as usize]
             == crate::recv::domain::RecvDomain::Segmented
         {
-            // Segmented delivery (Mode B/C). Consult the aggregate low-water
+            // Segmented delivery. Consult the aggregate low-water
             // reserve on the shared per-worker recv ring (see
             // `docs/segmented-recv-design.md`, "Backpressure and ring safety").
             // `complete()` above already counted this bid, so `free()` reflects
@@ -2064,11 +2063,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             match decision {
                 crate::recv::occupancy::Delivery::ZeroCopyOk => {
                     // Above the reserve: hold the provided buffer in-place (bid
-                    // NOT replenished, no accumulator copy) for a future segment
-                    // reader. The buffer stays pinned until the reader or
-                    // `close_connection` drains the hold. Backpressure is natural
-                    // — unreplenished bids deplete the ring (ENOBUFS) until a
-                    // reader releases them.
+                    // NOT replenished, no accumulator copy) for a forward. The
+                    // buffer stays pinned until a forward write or teardown
+                    // releases it. Backpressure is natural — unreplenished bids
+                    // deplete the ring (ENOBUFS) until they are released.
                     self.driver.segment_hold[conn_index as usize].push_back(
                         crate::backend::HeldRecvBuf::Pinned {
                             bid,
@@ -2092,8 +2090,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
             self.throttle_if_held(conn_index);
-            // A forwarder can submit its write straight from here; only a
-            // Mode B/C segment reader needs its task woken to look at the hold.
+            // A forwarder can submit its write straight from here; otherwise
+            // the connection's task is woken.
             if self.driver.forward_progress[conn_index as usize].is_some() {
                 self.finish_forward_if_done(conn_index);
             } else {
@@ -3689,8 +3687,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Release the backing of the in-flight forward write, record an error for
-    /// the `ForwardToFuture`, and wake it. A pinned bid returns to the ring.
+    /// Release the backing of the in-flight forward write, settle the source
+    /// (`settle_forward_end`, closing the connection if its accumulator
+    /// overflows), record an error for the `ForwardToFuture`, and wake it. A
+    /// pinned bid returns to the ring. On a closing connection it only
+    /// continues the deferred close.
     fn fail_forward_write(&mut self, conn_index: u32, errno: i32) {
         if let Some(state) = self.driver.forward_write[conn_index as usize].take() {
             // A batch holds several bids; every pinned one goes back, exactly
@@ -3709,6 +3710,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.forward_progress[conn_index as usize] = None;
+        // Held bytes not yet written go to the accumulator and the source
+        // leaves the segmented domain, as at the end of any other forward, so
+        // `with_data` reads what follows. Recorded after the settle: the close
+        // an overflow triggers clears `forward_done`.
+        if !self.driver.settle_forward_end(conn_index) {
+            self.driver.close_connection(conn_index);
+        }
         self.driver.forward_done[conn_index as usize] = Some(Err(errno));
         self.executor.wake_recv(conn_index);
     }
@@ -3903,8 +3911,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Re-arm every throttled connection whose hold has drained below the
-    /// cap. A segment reader drains its hold from task
-    /// code, which has no completion to re-arm from, so the event loop checks
+    /// cap. A hold can drain from task code (a `ForwardToFuture` poll or
+    /// drop), which has no completion to re-arm from, so the event loop checks
     /// the throttled connections on each pass.
     fn rearm_throttled_recvs(&mut self) {
         if self.driver.throttled_recvs.is_empty() {
@@ -4570,27 +4578,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.push(pending.bid);
         }
 
-        // Reclaim a bid still pinned by a live `RecvSegment` (Mode B). The future
-        // is dropped just below by `remove_connection`, which drops the segment —
-        // but that `Drop` runs unguarded here (`CURRENT_DRIVER == None`) and
-        // no-ops, so the release is done explicitly. `close_connection`
-        // deliberately did NOT reclaim this bid (a parked task could still have
-        // deref'd it before this point); by now the connection is fully closing
-        // and no live segment can read the buffer, so it is safe to return. If an
-        // in-poll `RecvSegment::drop`/`into_owned` already released it, the slot is
-        // `None` and this is a no-op (single-release via the pin slot).
-        if let Some(crate::backend::HeldRecvBuf::Pinned { bid, .. }) =
-            self.driver.segment_pinned[conn_index as usize].take()
-        {
-            self.driver.pending_replenish.push(bid);
-        }
-
-        // Drain any segmented-recv buffers still held (a Mode B reader that never
-        // finished consuming them, or a Mode A forward aborted by close).
-        // `close_connection` deliberately left these so a post-FIN reader could
-        // consume them; by teardown no consumer remains, so reclaim each Pinned
-        // bid (Owned entries just drop). Symmetric to the `segment_pinned` reclaim
-        // above and the `pending_recv_bufs` reclaim.
+        // Drain any segmented-recv buffers still held (a Mode A forward aborted
+        // by close, or one that never wrote them). `close_connection` leaves the
+        // hold, so it is drained here: each Pinned bid is replenished and Owned
+        // entries drop. Symmetric to the `pending_recv_bufs`
+        // reclaim above.
         for held in self.driver.segment_hold[conn_index as usize]
             .drain(..)
             .collect::<Vec<_>>()
@@ -4619,7 +4611,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Remove the async task (drops the future).
         self.executor.remove_connection(conn_index);
         // The future just dropped may have owned a `RecvHalf` or a
-        // `SegmentReader`, whose `Drop` is a no-op here (unguarded teardown).
+        // `SendHalf`, whose `Drop` is a no-op here (unguarded teardown).
         // Clear their claims before the slot is reused, or the next occupant
         // inherits them.
         self.driver.clear_conn_claims(conn_index);
@@ -5812,7 +5804,6 @@ mod tests {
     use crate::completion::{OpTag, UserData};
     use crate::config::Config;
     use crate::runtime::io::ConnCtx;
-    use crate::runtime::io::SegConsumed;
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -5898,7 +5889,7 @@ mod tests {
 
     /// A test config with an explicit segmented-recv low-water reserve. With the
     /// 16-buffer test ring, `reserve == 16` forces every segmented delivery to
-    /// Mode C (Owned copy), while a small reserve keeps early deliveries Pinned.
+    /// an Owned copy, while a small reserve keeps early deliveries Pinned.
     fn config_with_reserve(reserve: u32) -> Config {
         test_config_builder()
             .recv_segment_reserve(reserve)
@@ -6179,21 +6170,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_live_segment_reader_blocks_the_park() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        // Offered: these cover the mechanical blockers, so the opt-in must
-        // be out of the way or every one of them would report NotOffered.
-        el.driver.park_offered[conn_index as usize] = true;
-        el.driver.segment_reader_live[conn_index as usize] = true;
-        assert_eq!(
-            el.driver.park_blocker(conn_index),
-            Some(ParkBlocker::SegmentReader),
-            "a reader owns delivery discipline for its lifetime: not quiescent"
-        );
-    }
-
     /// Supersedes an earlier decision, deliberately.
     ///
     /// #463 held that a pinned bid must not *block* a park, because waiting
@@ -6212,17 +6188,6 @@ mod tests {
     fn held_ring_buffers_block_the_park_as_unconsumed_data() {
         for (label, place) in [
             (
-                "pinned",
-                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
-                    el.driver.segment_pinned[c as usize] =
-                        Some(crate::backend::uring::driver::HeldRecvBuf::Pinned {
-                            bid: 0,
-                            off: 0,
-                            len: 5,
-                        });
-                }) as Box<dyn Fn(&mut AsyncEventLoop<NoopHandler>, u32)>,
-            ),
-            (
                 "held",
                 Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
                     el.driver.segment_hold[c as usize].push_back(
@@ -6232,7 +6197,7 @@ mod tests {
                             len: 5,
                         },
                     );
-                }),
+                }) as Box<dyn Fn(&mut AsyncEventLoop<NoopHandler>, u32)>,
             ),
             (
                 "lent",
@@ -8167,15 +8132,14 @@ mod tests {
 
     /// Wire order is the property under test, and it is the one a
     /// "did the bytes survive" assertion would miss: the accumulator holds
-    /// bytes that arrived before anything still held, and `segment_pinned`
-    /// was popped from the front of `segment_hold`.
+    /// bytes that arrived before anything still held.
     #[test]
     fn the_park_drain_returns_bytes_in_wire_order() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
         el.driver.accumulators.append(conn_index, b"first");
-        el.driver.segment_pinned[conn_index as usize] = Some(
+        el.driver.segment_hold[conn_index as usize].push_back(
             crate::backend::uring::driver::HeldRecvBuf::Owned(bytes::Bytes::from_static(b"second")),
         );
         el.driver.segment_hold[conn_index as usize].push_back(
@@ -8189,7 +8153,7 @@ mod tests {
         let joined: Vec<u8> = drained.iter().flat_map(|b| b.to_vec()).collect();
         assert_eq!(
             joined, b"firstsecondthirdfourth",
-            "accumulator, then pinned, then held in FIFO order"
+            "accumulator, then held in FIFO order"
         );
     }
 
@@ -8226,9 +8190,6 @@ mod tests {
         let idx = conn_index as usize;
 
         el.driver.accumulators.append(conn_index, b"acc");
-        el.driver.segment_pinned[idx] = Some(crate::backend::uring::driver::HeldRecvBuf::Owned(
-            bytes::Bytes::from_static(b"pin"),
-        ));
         el.driver.segment_hold[idx].push_back(crate::backend::uring::driver::HeldRecvBuf::Owned(
             bytes::Bytes::from_static(b"held"),
         ));
@@ -8236,7 +8197,6 @@ mod tests {
         let _ = el.driver.take_pending_for_park(conn_index);
 
         assert!(el.driver.accumulators.is_empty(conn_index), "accumulator");
-        assert!(el.driver.segment_pinned[idx].is_none(), "pin slot");
         assert!(el.driver.segment_hold[idx].is_empty(), "segment hold");
     }
 
@@ -10628,15 +10588,14 @@ mod tests {
             "held segment must decrement free by one"
         );
 
-        // (c) Close does NOT drain the hold — a post-FIN reader must still be able
-        // to consume the already-received bytes (see the data+FIN-loss regression
-        // test). The held bid stays out of the ring.
+        // (c) Close does not drain the hold; teardown does. The held bid stays
+        // out of the ring until then.
         let generation = el.driver.connections.generation(conn_index);
         el.driver.close_connection(conn_index);
         assert_eq!(
             el.driver.segment_hold[conn_index as usize].len(),
             1,
-            "close must NOT drain the segment hold (a reader may still consume it)"
+            "close must not drain the segment hold"
         );
         assert!(
             !el.driver.pending_replenish.contains(&bid),
@@ -10664,9 +10623,9 @@ mod tests {
         );
     }
 
-    // ── Segmented recv reader (SegmentReader / RecvSegment, Mode B2) ────
+    // ── Test helpers for driving receive futures and segmented delivery ──
 
-    /// A minimal no-op waker for driving `SegmentReader::next` in tests. The
+    /// A minimal no-op waker for driving receive futures in tests. The
     /// futures park via `recv_waiters` and are re-polled manually, so the waker
     /// is never actually invoked.
     fn noop_waker() -> std::task::Waker {
@@ -10717,670 +10676,28 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
     }
 
+    /// Regression: a parked ring reader must resolve to end of stream when a
+    /// peer-FIN (`result == 0`) multishot completion arrives while it is
+    /// parked, and the provided-buffer accounting must stay balanced (no bid
+    /// leak). Guards against a reader hanging forever on a mid-stream peer
+    /// close.
     #[test]
-    fn segment_reader_hands_out_segment_bytes_and_drop_replenishes() {
+    fn parked_ring_reader_resolves_on_fin_completion() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let entries = el.driver.provided_bufs.ring_entries();
-
-        // Opt in and deliver one buffer; it lands in the hold, not the accumulator.
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"hello");
-        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
-
-        // Drive the reader: next() moves the held buffer into the pin slot and
-        // hands out a segment.
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected a segment from a non-empty hold"),
-        };
-
-        // (a) The segment derefs to the received bytes.
-        with_driver_state(&mut el, || {
-            assert_eq!(&seg[..], b"hello", "segment bytes must match received data");
-            assert_eq!(seg.len(), 5);
-            assert!(!seg.is_empty());
-        });
-        // Checked out: hold emptied into the pin slot, still one buffer outstanding.
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(el.driver.segment_pinned[conn_index as usize].is_some());
-        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
-
-        // (b) Dropping the segment (in-poll / guarded) replenishes its bid and
-        // clears the pin slot; committing the replenish restores the ring.
-        with_driver_state(&mut el, || drop(seg));
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_none(),
-            "drop clears pin slot"
-        );
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "drop queues the bid for replenish"
-        );
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "free restored after drop-replenish"
-        );
-    }
-
-    #[test]
-    fn segment_reader_next_parks_then_resumes_on_recv() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-
-        // First poll: hold empty, connection open → parks as a recv waiter.
-        let p1 = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(
-            matches!(p1, std::task::Poll::Pending),
-            "next parks on an empty hold"
-        );
-        assert!(
-            el.executor.recv_waiters[conn_index as usize],
-            "parked next registers a recv waiter"
-        );
-
-        // Simulate a recv arrival: the hold gets a buffer and wake_recv fires.
-        deliver_segment(&mut el, conn_index, 0, b"world");
-        assert!(
-            !el.executor.recv_waiters[conn_index as usize],
-            "wake_recv cleared the recv waiter on delivery"
-        );
-
-        // Second poll: the buffer is now held → resumes with a segment.
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected a segment after the simulated recv"),
-        };
-        with_driver_state(&mut el, || {
-            assert_eq!(
-                &seg[..],
-                b"world",
-                "resumed segment carries the delivered bytes"
-            );
-            drop(seg);
-        });
-    }
-
-    /// Regression for the Mode B RecvSegment UAF: closing a connection while a
-    /// `RecvSegment` is still checked out must NOT return its pinned bid to the
-    /// ring. The segment's `deref` still reads that provided buffer, and a parked
-    /// task can resume and read it before the `Close` CQE — recycling the bid at
-    /// close time would let another connection's recv overwrite live data. The
-    /// release is deferred: an in-poll drop (here) releases exactly once via the
-    /// pin slot; teardown via `handle_close` is covered by the next test.
-    #[test]
-    fn close_while_segment_pinned_defers_bid_release() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // Deliver and check out a segment so its bid sits in the pin slot.
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"hello");
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected a pinned segment"),
-        };
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_some(),
-            "segment is pinned"
-        );
-
-        // Close while the segment is still checked out: the bid must stay pinned.
-        el.driver.close_connection(conn_index);
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_some(),
-            "close must not drain the pin slot while a live segment can read it"
-        );
-        assert!(
-            !el.driver.pending_replenish.contains(&bid),
-            "the pinned bid must not return to the ring at close time"
-        );
-
-        // The segment is still valid after close (reads its own buffer, not
-        // recycled memory); dropping it in-poll then releases the bid exactly once.
-        with_driver_state(&mut el, || {
-            assert_eq!(
-                &seg[..],
-                b"hello",
-                "the live segment still reads its own buffer after close"
-            );
-            drop(seg);
-        });
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "in-poll drop after close replenishes the bid exactly once"
-        );
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_none(),
-            "the pin slot is cleared by the drop"
-        );
-
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "free returns to ring_entries — no leak, no double-replenish"
-        );
-    }
-
-    /// The other Mode B UAF-fix half: when a connection is torn down (the `Close`
-    /// CQE → `handle_close` → the future, and with it the segment, is dropped) the
-    /// pinned bid must be reclaimed exactly once — the unguarded `RecvSegment::drop`
-    /// during teardown no-ops (`CURRENT_DRIVER == None`), so `handle_close` does the
-    /// release. Without it the bid would leak.
-    #[test]
-    fn handle_close_reclaims_pinned_segment_bid_on_teardown() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"hello");
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected a pinned segment"),
-        };
-
-        // Close, then let the Close CQE tear the connection down. The bid is still
-        // pinned at close time; `handle_close` reclaims it.
-        el.driver.close_connection(conn_index);
-        assert!(
-            !el.driver.pending_replenish.contains(&bid),
-            "bid not returned at close time"
-        );
-        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
-        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "handle_close reclaims the pinned segment bid exactly once"
-        );
-
-        // The slot is released; the now-stale segment's unguarded drop no-ops (no
-        // double-replenish).
-        drop(seg);
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "stale segment drop after teardown does not double-replenish"
-        );
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "no leak, no double"
-        );
-    }
-
-    /// Regression for the Mode B data+FIN-loss bug: a data CQE and the peer FIN can
-    /// arrive in the same batch, so `close_connection` runs before the woken reader
-    /// is polled. The already-received bytes must NOT be discarded — the reader must
-    /// still deliver them, then report EOF.
-    #[test]
-    fn segment_reader_delivers_held_data_after_close_then_eof() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // A response buffer is received (held), then the peer FIN closes the conn
-        // before the reader runs.
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"response");
-        el.driver.close_connection(conn_index);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-
-        // The reader still sees the held response — the data was not lost at close.
-        {
-            let mut fut = std::pin::pin!(reader.next());
-            let seg = match with_driver_state(&mut el, || {
-                let mut cx = std::task::Context::from_waker(&waker);
-                fut.as_mut().poll(&mut cx)
-            }) {
-                std::task::Poll::Ready(Ok(Some(seg))) => seg,
-                _ => panic!("expected the held response segment after close"),
-            };
-            with_driver_state(&mut el, || {
-                assert_eq!(
-                    &seg[..],
-                    b"response",
-                    "held response delivered after close, not lost"
-                );
-                drop(seg);
-            });
-        }
-
-        // Next poll: hold drained + connection `Closed` → clean EOF.
-        let mut fut = std::pin::pin!(reader.next());
-        let eof = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
-        });
-        assert!(eof, "reader reports EOF after draining the held data");
-    }
-
-    /// Medium: a second concurrent `SegmentReader` on the same connection must not
-    /// overwrite the pin slot (which would orphan the first segment's bid — a ring
-    /// leak). Its `next()` errors instead, consuming nothing.
-    #[test]
-    fn second_concurrent_segment_reader_errors_rather_than_leaking() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        deliver_segment(&mut el, conn_index, 0, b"hello");
-        deliver_segment(&mut el, conn_index, 1, b"world");
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let waker = noop_waker();
-
-        // Reader A checks out the first segment → pins bid 0.
-        let mut reader_a = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let mut fut_a = std::pin::pin!(reader_a.next());
-        let seg_a = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut_a.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(s))) => s,
-            _ => panic!("reader A: expected a pinned segment"),
-        };
-        assert!(matches!(
-            el.driver.segment_pinned[conn_index as usize],
-            Some(crate::backend::HeldRecvBuf::Pinned { bid: 0, .. })
-        ));
-
-        // Reader B is now refused at `segments()` rather than at its first poll:
-        // the conflict is reported where it is caused, before a second reader
-        // exists at all (#427 step 1). Previously this surfaced one poll later,
-        // as an error from `next()`.
-        // `expect_err` would require `SegmentReader: Debug`, which it is not.
-        let err_b = match with_driver_state(&mut el, || conn.segments()) {
-            Err(e) => e,
-            Ok(_) => panic!("a second reader must be refused while A is live"),
-        };
-        assert_eq!(
-            err_b.raw_os_error(),
-            Some(libc::EBUSY),
-            "a live reader refuses a second one with EBUSY"
-        );
-        assert!(
-            matches!(
-                el.driver.segment_pinned[conn_index as usize],
-                Some(crate::backend::HeldRecvBuf::Pinned { bid: 0, .. })
-            ),
-            "reader A's bid stays pinned (not overwritten)"
-        );
-        assert_eq!(
-            el.driver.segment_hold[conn_index as usize].len(),
-            1,
-            "reader B must not consume the held buffer on the error path"
-        );
-
-        // Cleanup: dropping A's segment releases bid 0 exactly once — no leak.
-        with_driver_state(&mut el, || drop(seg_a));
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == 0)
-                .count(),
-            1,
-        );
-    }
-
-    /// Medium: dropping a `SegmentReader` while the connection is still in the
-    /// segmented domain (no explicit `end_segments`) auto-settles — held bytes are
-    /// gathered into the accumulator and the default read path is restored — so a
-    /// later ordinary read neither hangs nor loses data.
-    #[test]
-    fn segment_reader_drop_auto_settles_held_data() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        deliver_segment(&mut el, conn_index, 0, b"hello");
-        deliver_segment(&mut el, conn_index, 1, b"world");
-
-        let conn = ConnCtx::new(conn_index, generation);
-        // Create a reader, consume nothing, drop it — guarded (CURRENT_DRIVER set),
-        // as it would be inside a real task poll.
-        with_driver_state(&mut el, || {
-            let reader = conn.segments().expect("segments()");
-            drop(reader);
-        });
-
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::default(),
-            "reader drop restores the default read path"
-        );
-        assert_eq!(
-            el.driver.accumulators.data(conn_index),
-            b"helloworld",
-            "held segments are gathered into the accumulator, in order, on drop"
-        );
-    }
-
-    #[test]
-    fn segment_reader_next_returns_none_at_eof() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // Close the connection (recv side) with nothing held.
-        el.driver.close_connection(conn_index);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let done = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
-        });
-        assert!(
-            done,
-            "closed connection with an empty hold yields EOF (Ok(None))"
-        );
-    }
-
-    // ── Segmented recv Mode C (into_owned / recv_owned_segment) ──────────
-
-    #[test]
-    fn recv_segment_into_owned_copies_and_replenishes_exactly_once() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // Deliver and check out a segment so its bid sits in the pin slot.
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"hello");
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected a pinned segment"),
-        };
-        assert!(el.driver.segment_pinned[conn_index as usize].is_some());
-
-        // into_owned: copies the bytes and releases the pin (take() → replenish).
-        let owned = with_driver_state(&mut el, || seg.into_owned());
-        assert_eq!(&owned[..], b"hello", "into_owned returns the correct bytes");
-
-        // (a) The pin slot was taken and the bid queued for replenish — exactly once
-        // (into_owned's take(), then `self` drop no-ops on the now-empty slot).
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_none(),
-            "into_owned clears the pin slot"
-        );
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "into_owned replenishes the bid exactly once (drop-after does not double)"
-        );
-
-        // (b) Commit the replenish, then overwrite the underlying buffer: the owned
-        // Bytes must be unaffected — proving it is a real copy, not an alias.
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "free returns to ring_entries after into_owned's single replenish"
-        );
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"XXXXX".as_ptr(), buf_ptr as *mut u8, 5);
-        }
-        assert_eq!(
-            &owned[..],
-            b"hello",
-            "owned Bytes is a copy — still valid after the bid is replenished and reused"
-        );
-    }
-
-    #[test]
-    fn recv_owned_segment_copies_and_replenishes_at_delivery() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-
-        // recv_owned_segment opts into segmented delivery itself.
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
-        );
-        // First poll opts in + parks (nothing delivered yet).
-        let waker = noop_waker();
-        let p0 = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(matches!(p0, std::task::Poll::Pending));
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::Segmented,
-            "recv_owned_segment sets the Segmented domain"
-        );
-
-        // Deliver a buffer; it lands in the hold and clears the waiter.
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"world");
-        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
-
-        // Second poll: COPY at delivery, bid replenished IMMEDIATELY (never pinned).
-        let owned = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(b))) => b,
-            other => panic!("expected owned bytes, got {other:?}"),
-        };
-        assert_eq!(&owned[..], b"world", "recv_owned_segment returns the bytes");
-
-        // Never pinned — the copy IS the release.
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_none(),
-            "recv_owned_segment must never pin a buffer"
-        );
-        assert!(
-            el.driver.segment_hold[conn_index as usize].is_empty(),
-            "the held buffer was consumed"
-        );
-        // Bid is queued for replenish while the caller STILL holds the owned Bytes.
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "bid replenished at delivery, before the owned Bytes is dropped"
-        );
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "free already restored while the caller still holds the Bytes"
-        );
-        // And it is a real copy: reuse the buffer, owned Bytes is unaffected.
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"ZZZZZ".as_ptr(), buf_ptr as *mut u8, 5);
-        }
-        assert_eq!(&owned[..], b"world", "owned Bytes is a copy, not an alias");
-    }
-
-    #[test]
-    fn recv_owned_segment_parks_then_resumes_on_recv() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
-        );
-        let waker = noop_waker();
-
-        // First poll: hold empty, connection open → parks as a recv waiter.
-        let p1 = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(
-            matches!(p1, std::task::Poll::Pending),
-            "parks on empty hold"
-        );
-        assert!(
-            el.executor.recv_waiters[conn_index as usize],
-            "parked recv_owned_segment registers a recv waiter"
-        );
-
-        // Simulate a recv arrival: the hold gets a buffer and wake_recv fires.
-        deliver_segment(&mut el, conn_index, 0, b"again");
-        assert!(
-            !el.executor.recv_waiters[conn_index as usize],
-            "wake_recv cleared the recv waiter on delivery"
-        );
-
-        // Second poll resumes with owned bytes.
-        let owned = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(b))) => b,
-            _ => panic!("expected owned bytes after the simulated recv"),
-        };
-        assert_eq!(&owned[..], b"again");
-    }
-
-    #[test]
-    fn recv_owned_segment_returns_none_at_eof() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // Close the connection (recv side) with nothing held.
-        el.driver.close_connection(conn_index);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
-        );
-        let waker = noop_waker();
-        let done = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
-        });
-        assert!(
-            done,
-            "closed connection with an empty hold yields EOF (Ok(None))"
-        );
-    }
-
-    /// Regression: a parked `recv_owned_segment` reader must resolve to
-    /// `Ok(None)` when a peer-FIN (`result == 0`) multishot completion arrives
-    /// while it is parked — matching `with_data`/`with_bytes` EOF behavior — and
-    /// the provided-buffer accounting must stay balanced (no bid leak). Guards
-    /// against a segmented reader hanging forever on a mid-stream peer close.
-    #[test]
-    fn parked_recv_owned_segment_resolves_none_on_fin_completion() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
         // Model an armed multishot recv (accept_connection injects CQEs directly
         // and does not arm one).
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
         }
 
-        // Park the reader: empty hold, connection open → Pending + recv waiter.
+        // Park the reader: nothing buffered, connection open → Pending + recv
+        // waiter.
         let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
-        );
+        let mut fut =
+            std::pin::pin!(conn.with_data(|d| crate::runtime::io::ParseResult::Consumed(d.len())));
         let waker = noop_waker();
         let p1 = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
@@ -11388,7 +10705,7 @@ mod tests {
         });
         assert!(
             matches!(p1, std::task::Poll::Pending),
-            "parks on empty hold"
+            "parks with nothing buffered"
         );
         assert!(
             el.executor.recv_waiters[conn_index as usize],
@@ -11405,15 +10722,15 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 0, 0);
         assert!(
             !el.executor.recv_waiters[conn_index as usize],
-            "FIN wakes the parked segmented reader"
+            "FIN wakes the parked reader"
         );
 
         // Second poll now observes the closed recv side and resolves to EOF.
         let done = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
-            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(0))
         });
-        assert!(done, "FIN while parked yields Ok(None), not a hang");
+        assert!(done, "FIN while parked yields 0, not a hang");
 
         // No held buffers were leaked: the ring's free count is fully restored.
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
@@ -11480,233 +10797,6 @@ mod tests {
         );
     }
 
-    // ── Segmented recv B1 callback (with_segments / SegChain) ────────────
-
-    /// (a) Two held buffers are presented to the callback IN ORDER; a callback
-    /// that consumes everything replenishes both bids, leaves the accumulator
-    /// empty, and restores the ring's free count.
-    #[test]
-    fn with_segments_presents_two_held_buffers_in_order_full_drain() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // Two arrivals held in order.
-        deliver_segment(&mut el, conn_index, 0, b"AAA");
-        deliver_segment(&mut el, conn_index, 1, b"BBB");
-        assert_eq!(el.driver.provided_bufs.free(), entries - 2);
-
-        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen_cb = Rc::clone(&seen);
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.with_segments(
-            move |chain| {
-                for s in chain.iter() {
-                    seen_cb.borrow_mut().push(s.to_vec());
-                }
-                SegConsumed(chain.total_len()) // full drain
-            }
-        )));
-        let waker = noop_waker();
-        let n = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(n)) => n,
-            other => panic!("expected Ready(Ok(n)), got {other:?}"),
-        };
-
-        assert_eq!(n, 6, "full drain consumes all presented bytes");
-        assert_eq!(
-            *seen.borrow(),
-            vec![b"AAA".to_vec(), b"BBB".to_vec()],
-            "segments presented in arrival order"
-        );
-        assert!(
-            el.driver.accumulators.data(conn_index).is_empty(),
-            "full drain leaves the accumulator empty"
-        );
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(el.driver.pending_replenish.contains(&0));
-        assert!(el.driver.pending_replenish.contains(&1));
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "both held bids replenished — free restored"
-        );
-    }
-
-    /// (b) Under-drain: the callback consumes only part of the first buffer; the
-    /// remainder of that buffer plus the un-reached buffer gather to the FRONT of
-    /// the accumulator, in order, and both bids are replenished.
-    #[test]
-    fn with_segments_under_drain_gathers_remainder_to_accumulator_front() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        deliver_segment(&mut el, conn_index, 0, b"hello");
-        deliver_segment(&mut el, conn_index, 1, b"world");
-        assert_eq!(el.driver.provided_bufs.free(), entries - 2);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.with_segments(|_chain| SegConsumed(3)))
-        ); // consume "hel" only
-        let waker = noop_waker();
-        let n = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(n)) => n,
-            other => panic!("expected Ready(Ok(3)), got {other:?}"),
-        };
-        assert_eq!(n, 3);
-
-        // Remainder "lo" + un-reached "world" now live contiguously at the front
-        // of the accumulator, in order.
-        assert_eq!(
-            el.driver.accumulators.data(conn_index),
-            b"loworld",
-            "under-drain remainder gathers to the accumulator front, in order"
-        );
-        assert!(
-            el.driver.segment_hold[conn_index as usize].is_empty(),
-            "hold is drained after settle"
-        );
-        assert!(el.driver.pending_replenish.contains(&0));
-        assert!(el.driver.pending_replenish.contains(&1));
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "both bids replenished despite the gather — free restored"
-        );
-    }
-
-    /// (c) Accumulator-first ordering: pre-seed the accumulator, then a held
-    /// buffer arrives; the SegChain presents the accumulator bytes BEFORE the
-    /// held buffer. A `SegConsumed(0)` (need-more) gathers everything and parks.
-    #[test]
-    fn with_segments_presents_accumulator_before_held_and_parks_on_need_more() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        // Pre-seed the accumulator, then hold a later-arriving buffer.
-        assert!(el.driver.accumulators.append(conn_index, b"ACC"));
-        deliver_segment(&mut el, conn_index, 0, b"HELD");
-
-        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen_cb = Rc::clone(&seen);
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.with_segments(
-            move |chain| {
-                for s in chain.iter() {
-                    seen_cb.borrow_mut().push(s.to_vec());
-                }
-                SegConsumed(0) // need a bigger frame
-            }
-        )));
-        let waker = noop_waker();
-        let p = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-
-        assert!(
-            matches!(p, std::task::Poll::Pending),
-            "SegConsumed(0) parks for more data"
-        );
-        assert_eq!(
-            *seen.borrow(),
-            vec![b"ACC".to_vec(), b"HELD".to_vec()],
-            "accumulator remainder presented BEFORE the held buffer"
-        );
-        assert!(
-            el.executor.recv_waiters[conn_index as usize],
-            "need-more registers a recv waiter"
-        );
-        // Everything gathered to the accumulator front, in order; hold empty.
-        assert_eq!(el.driver.accumulators.data(conn_index), b"ACCHELD");
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(el.driver.pending_replenish.contains(&0));
-    }
-
-    /// (d) Park on an empty hold, then resume when a buffer arrives; and EOF on a
-    /// closed connection with nothing to present.
-    #[test]
-    fn with_segments_parks_then_resumes_and_reports_eof() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-
-        // with_segments opts into Segmented itself.
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn
-            .with_segments(|chain| SegConsumed(chain.total_len()))));
-        let waker = noop_waker();
-
-        // First poll: nothing to present, connection open → parks.
-        let p1 = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(matches!(p1, std::task::Poll::Pending), "parks on empty");
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::Segmented,
-            "with_segments sets the Segmented domain"
-        );
-        assert!(el.executor.recv_waiters[conn_index as usize]);
-
-        // A buffer arrives; wake fires.
-        deliver_segment(&mut el, conn_index, 0, b"data");
-        assert!(!el.executor.recv_waiters[conn_index as usize]);
-
-        // Second poll: resumes, consumes everything.
-        let n = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(n)) => n,
-            other => panic!("expected Ready(Ok(4)), got {other:?}"),
-        };
-        assert_eq!(n, 4);
-        assert!(el.driver.accumulators.data(conn_index).is_empty());
-
-        // EOF: a fresh closed connection with nothing held yields Ok(0).
-        let c2 = accept_connection(&mut el);
-        let g2 = el.driver.connections.generation(c2);
-        el.driver.recv_domain[c2 as usize] = crate::recv::domain::RecvDomain::Segmented;
-        el.driver.close_connection(c2);
-        let conn2 = ConnCtx::new(c2, g2);
-        let mut eof = std::pin::pin!(with_driver_state(&mut el, || conn2
-            .with_segments(|chain| SegConsumed(chain.total_len()))));
-        let done = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            matches!(eof.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(0)))
-        });
-        assert!(
-            done,
-            "closed connection with an empty hold yields Ok(0) EOF"
-        );
-    }
-
     // ── Segmented recv low-water reserve (force-copy under ring pressure) ──
 
     /// (a) At/below the reserve, a segmented delivery is force-copied into an
@@ -11716,7 +10806,7 @@ mod tests {
     #[test]
     fn segmented_force_copy_at_reserve_delivers_owned_and_replenishes_immediately() {
         // reserve == ring size (16): free is always <= reserve → every delivery
-        // force-copies (Mode C).
+        // force-copies.
         let mut el = make_test_loop_with_config(config_with_reserve(16));
         let conn_index = accept_connection(&mut el);
         el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
@@ -11794,7 +10884,7 @@ mod tests {
         assert_eq!(el.driver.pending_replenish, [1]);
     }
 
-    /// A segment reader whose hold reaches the hold cap has its receive
+    /// A segmented connection whose hold reaches the hold cap has its receive
     /// cancelled and is re-armed by the event loop once its hold drains.
     #[test]
     fn a_full_segment_hold_throttles_until_it_drains() {
@@ -11813,7 +10903,7 @@ mod tests {
         el.flush_replenish_and_rearm();
         assert!(el.driver.forward_hold_throttled[ci]);
 
-        // The cancel lands and the reader drains its hold.
+        // The cancel lands and the hold is drained.
         let ud = UserData::encode(
             OpTag::RecvMulti,
             conn_index,
@@ -12332,68 +11422,6 @@ mod tests {
         assert_eq!(el.driver.provided_bufs.free(), entries - 1);
     }
 
-    /// The half must actually be able to read.
-    ///
-    /// Regression for a self-inflicted deadlock: the `ConnCtx` segmented path
-    /// refuses while a `RecvHalf` is out, and `RecvHalf::segments()` delegated
-    /// straight to it — so the half, which holds that claim by construction,
-    /// refused itself and every segmented read through it returned `EBUSY`.
-    /// The full gate passed anyway, because nothing exercised the happy path.
-    #[test]
-    fn recv_half_can_actually_read_segments() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        deliver_segment(&mut el, conn_index, 0, b"hello");
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut half = with_driver_state(&mut el, || conn.take_recv()).expect("take_recv");
-
-        let waker = noop_waker();
-        let mut reader = with_driver_state(&mut el, || half.segments())
-            .expect("the half must be able to enter the segmented domain it owns");
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(s))) => s,
-            std::task::Poll::Ready(Ok(None)) => panic!("half read EOF instead of the segment"),
-            std::task::Poll::Ready(Err(e)) => panic!("half read errored: {e}"),
-            std::task::Poll::Pending => panic!("half parked with a segment held"),
-        };
-        with_driver_state(&mut el, || assert_eq!(&seg[..], b"hello"));
-        with_driver_state(&mut el, || drop(seg));
-        drop(reader);
-        with_driver_state(&mut el, || drop(half));
-    }
-
-    /// The owned-segment route through the half must work too.
-    #[test]
-    fn recv_half_can_actually_read_owned_segments() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        deliver_segment(&mut el, conn_index, 0, b"owned");
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut half = with_driver_state(&mut el, || conn.take_recv()).expect("take_recv");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || half.recv_owned_segment())
-                .expect("the half must be able to read owned segments")
-        );
-        match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], b"owned"),
-            other => panic!("expected owned bytes through the half, got {other:?}"),
-        }
-    }
-
     /// `take_recv` hands out the read side exactly once, and dropping it hands
     /// the connection back.
     #[test]
@@ -12413,13 +11441,6 @@ mod tests {
                 "a second take_recv must be refused with EBUSY"
             ),
             Ok(_) => panic!("the read side was handed out twice"),
-        }
-
-        // The `ConnCtx` segmented path must defer to the half wherever the
-        // signature can report it.
-        match with_driver_state(&mut el, || conn.segments()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
-            Ok(_) => panic!("ConnCtx::segments() must not bypass a live RecvHalf"),
         }
 
         with_driver_state(&mut el, || drop(half));
@@ -12549,38 +11570,6 @@ mod tests {
         );
     }
 
-    /// `end_segments()` through the half leaves the segmented domain, and the
-    /// half keeps its read claim afterwards. Migrating the client crates needs
-    /// this: redis/memcache call `end_segments` on the handle they hold.
-    #[test]
-    fn end_segments_through_the_half_restores_the_default_domain() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let conn = ConnCtx::new(conn_index, generation);
-
-        let mut half = with_driver_state(&mut el, || conn.take_recv()).expect("take_recv");
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        with_driver_state(&mut el, || half.end_segments()).expect("end_segments through the half");
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::CopyOrConsume,
-            "the half must return the connection to the default read path"
-        );
-        assert!(
-            el.driver.recv_half_taken[conn_index as usize],
-            "ending the segmented domain must not release the read claim"
-        );
-
-        // And the half is still the exclusive reader.
-        match with_driver_state(&mut el, || conn.take_recv()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
-            Ok(_) => panic!("end_segments() must not hand the read side back"),
-        }
-        with_driver_state(&mut el, || drop(half));
-    }
-
     /// A forward must refuse a sink whose write half somebody else owns.
     ///
     /// This is the "forward *or* send, not both" rule, enforced for the first
@@ -12639,76 +11628,6 @@ mod tests {
         assert!(
             matches!(p2, std::task::Poll::Pending),
             "with the write half released the forward arms, got {p2:?}"
-        );
-    }
-
-    /// A stale handle must not put the slot's new occupant into the segmented
-    /// domain.
-    ///
-    /// This is the #429 headline: `with_segments` used to flip
-    /// `recv_domain[idx] = Segmented` eagerly at *call* time, with no
-    /// generation check at all. The victim's own `with_data` reader never
-    /// looks at `segment_hold`, so its bytes are stranded and it hangs with
-    /// every health signal normal — #423, inflicted on a third party. The flip
-    /// now happens on the first poll, behind the same gate every other
-    /// segmented entry uses.
-    #[test]
-    fn with_segments_does_not_flip_a_stale_slots_domain() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-
-        // Merely constructing the future must not touch the driver.
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || {
-            stale.with_segments(|_chain| crate::SegConsumed(0))
-        }));
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::CopyOrConsume,
-            "constructing the future must not flip the domain"
-        );
-
-        // Nor must polling it.
-        let p = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(
-            matches!(p, std::task::Poll::Ready(Ok(0))),
-            "a stale with_segments resolves as EOF, got {p:?}"
-        );
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::CopyOrConsume,
-            "the live occupant must still be on the default read path"
-        );
-    }
-
-    /// A stale handle must not settle the slot's new occupant's hold.
-    ///
-    /// `end_segments` drains held segments into the accumulator and resets the
-    /// delivery domain. Run against a recycled slot it does that to whoever
-    /// owns it now — #423's shape, inflicted on a third party. See #429.
-    #[test]
-    fn end_segments_refuses_a_stale_handle() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-
-        // The live occupant is in the segmented domain.
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        match with_driver_state(&mut el, || stale.end_segments()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
-            Ok(()) => panic!("a stale handle must not end another connection's segmented domain"),
-        }
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::Segmented,
-            "the live occupant's delivery domain must be untouched"
         );
     }
 
@@ -13096,7 +12015,7 @@ mod tests {
 
     /// A claim must not outlive the slot it was made on.
     ///
-    /// `RecvHalf::drop` and `SegmentReader::drop` both release through
+    /// `RecvHalf::drop` releases through
     /// `try_with_state`, which is a no-op during unguarded teardown — so a
     /// claim can survive its claimant. The flags are indexed by slot, not by
     /// generation, so without an explicit clear at the recycle point the *next*
@@ -13109,7 +12028,6 @@ mod tests {
         // Simulate the claims outliving their owners, which is what an
         // unguarded teardown produces.
         el.driver.recv_half_taken[conn_index as usize] = true;
-        el.driver.segment_reader_live[conn_index as usize] = true;
 
         el.driver.clear_conn_claims(conn_index);
 
@@ -13117,287 +12035,6 @@ mod tests {
             !el.driver.recv_half_taken[conn_index as usize],
             "a recycled slot must not inherit a recv-half claim"
         );
-        assert!(
-            !el.driver.segment_reader_live[conn_index as usize],
-            "a recycled slot must not inherit a reader claim"
-        );
-    }
-
-    /// A segmented reader must deliver bytes that are sitting in the
-    /// accumulator rather than parking forever (#423).
-    ///
-    /// The accumulator is invisible to a segmented reader, so this state used
-    /// to hang with every health signal normal. It is reachable from legal
-    /// compositions — `SegmentReader::drop` settles the hold into the
-    /// accumulator, and `with_segments` leaves its remainder there — so the
-    /// reader adopts rather than asserting.
-    ///
-    /// This covers `adopt_stranded_accumulator`, which the end-to-end test
-    /// cannot reach: there, entry-time adoption has already drained the
-    /// accumulator.
-    #[test]
-    fn segmented_reader_adopts_bytes_stranded_in_the_accumulator() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-
-        // Order matters. `segments()` adopts at entry, so stranding the bytes
-        // first would leave the poll-entry path with nothing to do and test the
-        // wrong thing. Install the reader first, *then* strand — which is what
-        // a settle (`SegmentReader::drop`, `with_segments`) actually does.
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        assert!(
-            el.driver.accumulators.append(conn_index, b"stranded"),
-            "accumulator append"
-        );
-        assert!(
-            el.driver.segment_hold[conn_index as usize].is_empty(),
-            "hold must be empty so only the accumulator can satisfy this read"
-        );
-
-        use metriken::CounterGroupMetric;
-        let before = crate::metrics::POOL
-            .counter_value(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED)
-            .unwrap_or(0);
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let got = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            // `RecvSegment` has no `Debug`, so describe the outcome instead of
-            // formatting it.
-            std::task::Poll::Ready(Ok(None)) => {
-                panic!("reader reported EOF instead of adopting the stranded bytes")
-            }
-            std::task::Poll::Ready(Err(e)) => panic!("reader errored: {e}"),
-            std::task::Poll::Pending => {
-                panic!("reader parked on stranded bytes instead of adopting them")
-            }
-        };
-        with_driver_state(&mut el, || {
-            assert_eq!(&got[..], b"stranded", "the stranded bytes, in order");
-        });
-        drop(got);
-
-        assert!(
-            el.driver.accumulators.is_empty(conn_index),
-            "the accumulator must be drained by the adopt"
-        );
-        assert!(
-            crate::metrics::POOL
-                .counter_value(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED)
-                .unwrap_or(0)
-                > before,
-            "the adopt must be counted — it is the only way this is visible in production"
-        );
-    }
-
-    /// (c1) An owned held segment consumed via the reader returns the correct
-    /// bytes, never enters the pin slot, and its drop replenishes nothing (no
-    /// bid) — the ring stays balanced with no double-replenish.
-    #[test]
-    fn owned_segment_via_reader_returns_bytes_and_drop_does_not_replenish() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"hello");
-        // Commit the force-copy's delivery-time replenish so the ring is full.
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&r);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-
-        // Read the owned segment out via the lending-iterator reader.
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected an owned segment from the hold"),
-        };
-        with_driver_state(&mut el, || {
-            assert_eq!(&seg[..], b"hello", "owned segment derefs to the bytes");
-            assert_eq!(seg.len(), 5);
-        });
-        // Owned segments never use the pin slot.
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_none(),
-            "owned segment must not occupy the pin slot"
-        );
-        // Drop the owned segment: no bid, so nothing is replenished.
-        with_driver_state(&mut el, || drop(seg));
-        assert!(
-            el.driver.pending_replenish.is_empty(),
-            "dropping an owned segment replenishes nothing"
-        );
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "ring stays balanced (no double-replenish)"
-        );
-    }
-
-    /// (c2) An owned held segment consumed via `recv_owned_segment` returns the
-    /// correct bytes and does not replenish a second time (the bid was already
-    /// returned at delivery).
-    #[test]
-    fn recv_owned_segment_over_owned_hold_returns_bytes_no_double_replenish() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"world");
-        // Force-copy queued the bid exactly once at delivery; do NOT commit yet so
-        // we can prove the consume path does not queue it again.
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1
-        );
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
-        );
-        let waker = noop_waker();
-        let owned = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(b))) => b,
-            other => panic!("expected owned bytes, got {other:?}"),
-        };
-        assert_eq!(&owned[..], b"world");
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "consuming an owned hold entry must not replenish its bid again"
-        );
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&r);
-        assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
-    }
-
-    /// (c3) `with_segments` over two OWNED held buffers presents them in order,
-    /// full-drains, and replenishes nothing at settle (owned entries hold no bid)
-    /// — the ring stays balanced.
-    #[test]
-    fn with_segments_owned_entries_full_drain_replenishes_nothing() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        deliver_segment(&mut el, conn_index, 0, b"AAA");
-        deliver_segment(&mut el, conn_index, 1, b"BBB");
-        // Both force-copied: each queued its bid at delivery. Commit them so the
-        // ring is full before consuming.
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        assert_eq!(r.len(), 2, "both force-copied bids queued at delivery");
-        el.driver.provided_bufs.release_batch(&r);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-
-        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen_cb = Rc::clone(&seen);
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.with_segments(
-            move |chain| {
-                for s in chain.iter() {
-                    seen_cb.borrow_mut().push(s.to_vec());
-                }
-                SegConsumed(chain.total_len())
-            }
-        )));
-        let waker = noop_waker();
-        let n = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(n)) => n,
-            other => panic!("expected Ready(Ok(6)), got {other:?}"),
-        };
-        assert_eq!(n, 6);
-        assert_eq!(
-            *seen.borrow(),
-            vec![b"AAA".to_vec(), b"BBB".to_vec()],
-            "owned segments presented in arrival order"
-        );
-        assert!(el.driver.accumulators.data(conn_index).is_empty());
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(
-            el.driver.pending_replenish.is_empty(),
-            "owned settle replenishes nothing (bids already returned at delivery)"
-        );
-        assert_eq!(el.driver.provided_bufs.free(), entries, "ring balanced");
-    }
-
-    /// (c4) `with_segments` under-drain over an OWNED held buffer copies the
-    /// remainder from the owned bytes into the accumulator front, in order, and
-    /// replenishes nothing.
-    #[test]
-    fn with_segments_owned_under_drain_gathers_remainder_from_owned_bytes() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        deliver_segment(&mut el, conn_index, 0, b"hello");
-        deliver_segment(&mut el, conn_index, 1, b"world");
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&r);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(
-            with_driver_state(&mut el, || conn.with_segments(|_chain| SegConsumed(3)))
-        ); // consume "hel" only
-        let waker = noop_waker();
-        let n = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(n)) => n,
-            other => panic!("expected Ready(Ok(3)), got {other:?}"),
-        };
-        assert_eq!(n, 3);
-        assert_eq!(
-            el.driver.accumulators.data(conn_index),
-            b"loworld",
-            "under-drain remainder gathered from the owned bytes, in order"
-        );
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(
-            el.driver.pending_replenish.is_empty(),
-            "owned under-drain settle replenishes nothing"
-        );
-        assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
     }
 
     /// (d) Tearing down a connection with an OWNED segment still held must not
@@ -13427,7 +12064,7 @@ mod tests {
             crate::backend::HeldRecvBuf::Owned(_)
         ));
 
-        // Close leaves the hold for a possible reader; teardown drains it. The
+        // Close does not drain the hold; teardown does. The
         // owned entry carries no bid, so neither step re-queues a replenish.
         el.driver.close_connection(conn_index);
         assert_eq!(
@@ -13815,6 +12452,57 @@ mod tests {
         assert_eq!(el.driver.provided_bufs.free(), entries, "free restored");
     }
 
+    /// A forward whose write fails resolves with the write's error even when
+    /// settling its source overflows the accumulator and closes the
+    /// connection, which clears `forward_done`.
+    #[test]
+    fn a_failed_forward_write_keeps_its_error_when_the_settle_overflows() {
+        use std::os::fd::AsFd;
+        let config = test_config_builder()
+            .recv_accumulator_max(4096)
+            .build()
+            .expect("valid config");
+        let mut el = make_test_loop_with_config(config);
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        // Held behind the forward's 5 bytes, and larger than the accumulator.
+        el.driver.segment_hold[conn_index as usize].push_back(crate::backend::HeldRecvBuf::Owned(
+            bytes::Bytes::from(vec![7u8; 8192]),
+        ));
+
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 5)));
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p1, std::task::Poll::Pending), "parks on the write");
+
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), -libc::EIO, 0);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_none_or(|c| c.close_requested()),
+            "test premise: the settle overflowed and closed the connection"
+        );
+
+        let p2 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        match p2 {
+            std::task::Poll::Ready(Err(e)) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+            other => panic!("expected Err(EIO), got {other:?}"),
+        }
+    }
+
     /// (b) File sink: a short write resubmits the remainder at the advanced
     /// offset (`written` advances, the bid stays held), and the running file
     /// offset advances across buffers (`base_offset == bytes forwarded so far`).
@@ -13916,8 +12604,8 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// (c) Under ring pressure the forward path force-copies at delivery (Mode C
-    /// backing): the bid returns to the ring immediately, so a slow sink cannot
+    /// (c) Under ring pressure the forward path force-copies at delivery (an
+    /// Owned backing): the bid returns to the ring immediately, so a slow sink cannot
     /// deplete the shared ring, and the owned backing's write completion does not
     /// double-replenish.
     #[test]
@@ -14995,62 +13683,6 @@ mod tests {
         }
     }
 
-    /// Bytes handed out as a `RecvSegment` count as consumed. A completion
-    /// that arrives while the segment is live is read, once the segment
-    /// reader is dropped, with its own batch's time.
-    #[test]
-    fn bytes_after_a_dropped_segment_reader_keep_their_batch() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let ctx = ConnCtx::new(conn_index, generation);
-        let base = Instant::now();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        deliver_in_batch(&mut el, conn_index, 0, b"seg", at(base, 1));
-
-        let mut reader = with_driver_state(&mut el, || ctx.segments()).expect("segments()");
-        let waker = noop_waker();
-        {
-            let mut next = std::pin::pin!(reader.next());
-            let seg = match with_driver_state(&mut el, || {
-                let mut cx = std::task::Context::from_waker(&waker);
-                next.as_mut().poll(&mut cx)
-            }) {
-                std::task::Poll::Ready(Ok(Some(seg))) => seg,
-                _ => panic!("expected a segment"),
-            };
-            deliver_in_batch(&mut el, conn_index, 1, b"x\n", at(base, 2));
-            with_driver_state(&mut el, || drop(seg));
-        }
-        with_driver_state(&mut el, || drop(reader));
-        let (n, a) = read_line(&mut el, ctx);
-        assert_eq!(n, 2);
-        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
-    }
-
-    /// `with_segments` reports the times of the bytes its callback consumed
-    /// across held buffers from two batches.
-    #[test]
-    fn with_segments_reports_the_consumed_range() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        deliver_in_batch(&mut el, conn_index, 0, b"ab", at(base, 1));
-        deliver_in_batch(&mut el, conn_index, 1, b"cd", at(base, 2));
-        deliver_in_batch(&mut el, conn_index, 2, b"ef", at(base, 3));
-        let waker = noop_waker();
-        // Consume "abc": the first byte from batch 1, the last from batch 2.
-        let mut fut = std::pin::pin!(ctx.with_segments(|_| SegConsumed(3)));
-        let (r, a) = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            (fut.as_mut().poll(&mut cx), ctx.recv_arrival())
-        });
-        assert!(matches!(r, std::task::Poll::Ready(Ok(3))));
-        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
-    }
-
     /// Bytes from a fallback recv are recorded like a multishot's.
     #[test]
     fn a_fallback_recv_records_its_bytes() {
@@ -15315,8 +13947,8 @@ mod tests {
     /// A segmented connection must never take the fallback recv.
     ///
     /// The fallback reads into a pool slot and can only append to the
-    /// accumulator, while a segmented reader takes its bytes from the hold —
-    /// so the fallback both bypasses the reader and reorders the stream
+    /// accumulator, while a segmented connection's bytes are taken from the
+    /// hold — so the fallback both bypasses the hold and reorders the stream
     /// (held bytes are earlier than anything it appends). For a `forward_to`
     /// source it is fatal: the forward never reads the accumulator, so the
     /// fallback chain feeds a buffer nobody reads while the forward waits for
@@ -21237,1088 +19869,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    // ── Receive views (`backend/uring/view.rs`) ──────────────────────────
-
-    /// Apply the view releases queued on this thread or pushed to the
-    /// worker's inbox, then post the released buffers, as the event loop
-    /// does before it waits.
-    fn release_views(el: &mut AsyncEventLoop<NoopHandler>) {
-        crate::fs::release_orphans(&mut el.driver, &mut el.executor);
-        el.driver.release_pending();
-    }
-
-    /// Give the worker's inbox a wake handle, and return its eventfd.
-    fn set_wake_fd(el: &mut AsyncEventLoop<NoopHandler>) -> std::os::fd::RawFd {
-        let (wake_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
-        el.executor.wakes.set_wake_handle(wake);
-        wake_fd
-    }
-
-    /// Whether the wake eventfd was written since it was last read.
-    fn read_wake(wake_fd: std::os::fd::RawFd) -> bool {
-        let mut count = 0u64;
-        // Safety: `wake_fd` is a nonblocking eventfd the inbox's handle keeps
-        // open, and `count` is 8 bytes.
-        let n = unsafe { libc::read(wake_fd, (&raw mut count).cast(), 8) };
-        n == 8 && count > 0
-    }
-
-    /// A connection in the segmented domain with `data` held in buffer `bid`.
-    fn held_segment(el: &mut AsyncEventLoop<NoopHandler>, bid: u16, data: &[u8]) -> u32 {
-        let conn_index = accept_connection(el);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        deliver_segment(el, conn_index, bid, data);
-        conn_index
-    }
-
-    /// Release the hold of the connection's first held entry, as a reader
-    /// that consumed it does, and post what that frees.
-    fn consume_entry(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
-        match el.driver.segment_hold[conn_index as usize].pop_front() {
-            Some(crate::backend::HeldRecvBuf::Pinned { bid, .. }) => {
-                el.driver.pending_replenish.push(bid);
-            }
-            _ => panic!("expected a pinned entry"),
-        }
-        el.driver.release_pending();
-    }
-
-    // ── copy_small_view and recv_zc_threshold ───────────────────────────
-
-    fn threshold_copied() -> u64 {
-        crate::runtime::io::TEST_THRESHOLD_COPIED.with(|c| c.get())
-    }
-
-    /// A view shorter than the threshold is copied, and the copy releases
-    /// the view's hold on its buffer.
-    #[test]
-    fn copy_small_view_copies_a_small_view_and_releases_its_buffer() {
-        let mut el = make_test_loop();
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 0, b"hello");
-        let view = el.driver.recv_view(0, 0, 5);
-        consume_entry(&mut el, conn_index);
-        let copied = crate::accumulator::test_bytes_copied();
-        let counted = threshold_copied();
-        let copy = with_driver_state(&mut el, || crate::copy_small_view(view, 4096));
-        assert_eq!(&copy[..], b"hello");
-        assert_ne!(copy.as_ptr(), el.driver.provided_bufs.data_ptr(0, 0));
-        assert_eq!(crate::accumulator::test_bytes_copied() - copied, 5);
-        assert_eq!(threshold_copied() - counted, 1);
-        release_views(&mut el);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "the copied view no longer holds its buffer"
-        );
-    }
-
-    /// A view at or above the threshold, and any view with a threshold of 0,
-    /// is returned unchanged.
-    #[test]
-    fn copy_small_view_keeps_a_view_at_or_above_the_threshold() {
-        let mut el = make_test_loop();
-        held_segment(&mut el, 0, b"hello");
-        for threshold in [5, 0] {
-            let view = el.driver.recv_view(0, 0, 5);
-            let ptr = view.as_ptr();
-            let kept = with_driver_state(&mut el, || crate::copy_small_view(view, threshold));
-            assert_eq!(kept.as_ptr(), ptr, "threshold {threshold}");
-            with_driver_state(&mut el, || drop(kept));
-        }
-    }
-
-    /// An empty `Bytes` that still holds a view is returned as an empty
-    /// `Bytes` that holds nothing, so the buffer returns to the ring.
-    #[test]
-    fn copy_small_view_releases_an_empty_view() {
-        let mut el = make_test_loop();
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 0, b"hello");
-        let mut view = el.driver.recv_view(0, 0, 5);
-        view.truncate(0);
-        consume_entry(&mut el, conn_index);
-        // Threshold 0 never copies, so only the empty check releases it.
-        let empty = with_driver_state(&mut el, || crate::copy_small_view(view, 0));
-        assert!(empty.is_empty());
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-    }
-
-    /// A view made by another worker's ring is not recognised and is
-    /// returned unchanged.
-    #[test]
-    fn copy_small_view_returns_another_workers_view_unchanged() {
-        let mut first = make_test_loop();
-        let entries = first.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut first, 0, b"hello");
-        let view = first.driver.recv_view(0, 0, 5);
-        let ptr = view.as_ptr();
-        consume_entry(&mut first, conn_index);
-        let mut second = make_test_loop();
-        let kept = with_driver_state(&mut second, || crate::copy_small_view(view, 4096));
-        assert_eq!(kept.as_ptr(), ptr);
-        drop(kept);
-        release_views(&mut first);
-        assert_eq!(first.driver.provided_bufs.free(), entries);
-    }
-
-    /// On a worker, a heap value is returned unchanged; outside a task, every
-    /// value is treated as a view and copied when short.
-    #[test]
-    fn copy_small_view_treats_heap_values_by_where_it_is_called() {
-        let mut el = make_test_loop();
-        let heap = Bytes::from(b"small".to_vec());
-        let ptr = heap.as_ptr();
-        let kept = with_driver_state(&mut el, || crate::copy_small_view(heap.clone(), 4096));
-        assert_eq!(
-            kept.as_ptr(),
-            ptr,
-            "a heap value on the worker is not a view"
-        );
-        let copy = crate::copy_small_view(heap, 4096);
-        assert_ne!(copy.as_ptr(), ptr, "outside a task every value is a view");
-        assert_eq!(&copy[..], b"small");
-    }
-
-    /// `recv_zc_threshold` returns the worker's configured value, and the
-    /// default outside a task.
-    #[test]
-    fn recv_zc_threshold_reads_the_workers_config() {
-        let mut el = make_test_loop_with_config(
-            test_config_builder()
-                .recv_zc_threshold(123)
-                .build()
-                .expect("valid config"),
-        );
-        assert_eq!(with_driver_state(&mut el, crate::recv_zc_threshold), 123);
-        assert_eq!(crate::recv_zc_threshold(), 4096);
-    }
-
-    /// A view keeps its buffer out of the ring after the entry it was made
-    /// from is consumed, and so does a slice of it; the buffer is posted
-    /// once both have dropped and the worker has applied the releases. The
-    /// slice drops inside a driver borrow, where the release must not take
-    /// the driver. Both drops are on the worker's thread, so neither goes
-    /// through the inbox or writes the wake fd.
-    #[test]
-    fn a_view_keeps_its_buffer_until_its_last_slice_drops() {
-        let mut el = make_test_loop();
-        let wake_fd = set_wake_fd(&mut el);
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 0, b"hello");
-
-        let view = el.driver.recv_view(0, 0, 5);
-        assert_eq!(&view[..], b"hello");
-        let slice = view.slice(1..4);
-        consume_entry(&mut el, conn_index);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries - 1,
-            "the view holds the buffer after its entry is consumed"
-        );
-
-        drop(view);
-        release_views(&mut el);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries - 1,
-            "a slice of the view still holds the buffer"
-        );
-        assert_eq!(&slice[..], b"ell");
-
-        with_driver_state(&mut el, || drop(slice));
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries - 1,
-            "the release waits for the worker to apply it"
-        );
-        assert!(
-            !read_wake(wake_fd),
-            "a drop on the worker's thread is local"
-        );
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-    }
-
-    /// A view ends within the bytes the kernel has completed in its buffer.
-    #[test]
-    #[should_panic(expected = "view of buffer 0 to offset 100, past its 2 completed bytes")]
-    fn a_view_past_the_completed_bytes_panics() {
-        let mut el = make_test_loop();
-        held_segment(&mut el, 0, b"hi");
-        let _ = el.driver.recv_view(0, 0, 100);
-    }
-
-    /// A view's release reaches the worker whose driver made it, when another
-    /// worker was registered on the thread after it and before the view.
-    #[test]
-    fn a_view_releases_to_its_own_worker_with_two_on_the_thread() {
-        let mut first = make_test_loop();
-        let entries = first.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut first, 0, b"first");
-        let mut second = make_test_loop();
-        let view = first.driver.recv_view(0, 0, 5);
-        consume_entry(&mut first, conn_index);
-
-        drop(view);
-        release_views(&mut second);
-        release_views(&mut first);
-        assert_eq!(first.driver.provided_bufs.free(), entries);
-    }
-
-    /// Two views of one buffer take a hold each, and the buffer returns only
-    /// after both drop.
-    #[test]
-    fn two_views_of_one_buffer_each_hold_it() {
-        let mut el = make_test_loop();
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 3, b"abcdef");
-
-        let first = el.driver.recv_view(3, 0, 2);
-        let second = el.driver.recv_view(3, 2, 4);
-        assert_eq!((&first[..], &second[..]), (&b"ab"[..], &b"cdef"[..]));
-        consume_entry(&mut el, conn_index);
-
-        drop(first);
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
-        drop(second);
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-    }
-
-    /// A view dropped on another thread releases its hold through the
-    /// worker's inbox, and writes the worker's wake fd so a worker blocked
-    /// in its wait applies the release.
-    #[test]
-    fn a_view_dropped_on_another_thread_releases_through_the_inbox() {
-        let mut el = make_test_loop();
-        let wake_fd = set_wake_fd(&mut el);
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 1, b"remote");
-
-        let view = el.driver.recv_view(1, 0, 6);
-        consume_entry(&mut el, conn_index);
-        assert!(!read_wake(wake_fd), "no wake before the drop");
-        std::thread::spawn(move || {
-            assert_eq!(&view[..], b"remote");
-            drop(view);
-        })
-        .join()
-        .expect("dropping thread");
-        assert!(read_wake(wake_fd), "the drop wakes the worker");
-        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
-
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-    }
-
-    /// A view outlives its worker: the ring memory stays allocated while the
-    /// view is alive and is freed when it drops, and the release, which has
-    /// no worker to go to, is dropped.
-    #[test]
-    fn a_view_outlives_its_worker() {
-        let mut el = make_test_loop();
-        held_segment(&mut el, 2, b"survivor");
-        let view = el.driver.recv_view(2, 0, 8);
-        let memory = Arc::downgrade(el.driver.provided_bufs.memory());
-
-        drop(el);
-        assert!(memory.upgrade().is_some(), "the view keeps the memory");
-        assert_eq!(&view[..], b"survivor");
-        drop(view);
-        assert!(memory.upgrade().is_none(), "the last view frees the memory");
-    }
-
-    /// A release naming another ring's memory, as one queued by an earlier
-    /// worker on this thread does, is ignored: applying it would drop a
-    /// hold this worker's buffer still needs.
-    #[test]
-    fn a_release_for_another_rings_memory_is_ignored() {
-        let mut el = make_test_loop();
-        let entries = el.driver.provided_bufs.ring_entries();
-        held_segment(&mut el, 0, b"mine");
-        let other = super::super::view::RingMemory::new(4096).expect("ring memory");
-
-        crate::runtime::defer_release(crate::runtime::Orphan::RecvView {
-            alloc: other.id(),
-            bid: 0,
-        });
-        release_views(&mut el);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries - 1,
-            "the held entry's buffer stays out of the ring"
-        );
-    }
-
-    // ── with_bytes_segments ─────────────────────────────────────────────
-
-    use crate::runtime::io::ParseResult;
-    use bytes::Bytes;
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
-    /// Poll `fut` once with `el` as the current driver.
-    fn poll_in<F: Future>(
-        el: &mut AsyncEventLoop<NoopHandler>,
-        fut: std::pin::Pin<&mut F>,
-    ) -> std::task::Poll<F::Output> {
-        let waker = noop_waker();
-        with_driver_state(el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.poll(&mut cx)
-        })
-    }
-
-    fn ready_ok(poll: std::task::Poll<io::Result<usize>>) -> usize {
-        match poll {
-            std::task::Poll::Ready(Ok(n)) => n,
-            std::task::Poll::Ready(Err(e)) => panic!("expected Ready(Ok), got {e}"),
-            std::task::Poll::Pending => panic!("expected Ready(Ok), got Pending"),
-        }
-    }
-
-    fn is_ebusy(poll: &std::task::Poll<io::Result<usize>>) -> bool {
-        matches!(poll, std::task::Poll::Ready(Err(e)) if e.raw_os_error() == Some(libc::EBUSY))
-    }
-
-    fn bytes_copied() -> u64 {
-        crate::accumulator::test_bytes_copied()
-    }
-
-    fn hold_cap_copied() -> u64 {
-        crate::runtime::io::TEST_HOLD_CAP_COPIED.with(|c| c.get())
-    }
-
-    /// Each held buffer is presented as a view of the ring buffer's bytes, in
-    /// order. Nothing is copied, consuming every byte pops the entries, and
-    /// views the parser kept hold their buffers until they drop.
-    #[test]
-    fn bytes_segments_presents_each_held_buffer_as_a_view() {
-        let mut el = make_test_loop();
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 0, b"AB");
-        deliver_segment(&mut el, conn_index, 1, b"CD");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let kept: Rc<RefCell<Vec<Bytes>>> = Rc::default();
-        let kept_cb = Rc::clone(&kept);
-        let copied = bytes_copied();
-
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            kept_cb.borrow_mut().extend(pieces.iter().cloned());
-            ParseResult::Consumed(4)
-        }));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 4);
-
-        let kept = std::mem::take(&mut *kept.borrow_mut());
-        assert_eq!(kept.len(), 2);
-        assert_eq!(&kept[0][..], b"AB");
-        assert_eq!(&kept[1][..], b"CD");
-        assert_eq!(kept[0].as_ptr(), el.driver.provided_bufs.data_ptr(0, 0));
-        assert_eq!(kept[1].as_ptr(), el.driver.provided_bufs.data_ptr(1, 0));
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(el.driver.accumulators.is_empty(conn_index));
-        assert_eq!(bytes_copied(), copied, "no byte is copied");
-
-        el.driver.release_pending();
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries - 2,
-            "the kept views hold both buffers"
-        );
-        with_driver_state(&mut el, || drop(kept));
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-    }
-
-    /// `NeedMore` keeps every entry held without a copy; the next arrival is
-    /// presented as a further piece.
-    #[test]
-    fn bytes_segments_need_more_keeps_the_hold_and_adds_the_next_arrival() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"AB");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let seen: Rc<RefCell<Vec<Vec<Vec<u8>>>>> = Rc::default();
-        let seen_cb = Rc::clone(&seen);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            seen_cb
-                .borrow_mut()
-                .push(pieces.iter().map(|p| p.to_vec()).collect());
-            if pieces.len() < 2 {
-                ParseResult::NeedMore
-            } else {
-                ParseResult::Consumed(4)
-            }
-        }));
-
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(el.driver.segment_hold[conn_index as usize].len(), 1);
-        assert!(el.driver.accumulators.is_empty(conn_index));
-
-        deliver_segment(&mut el, conn_index, 1, b"CD");
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 4);
-        assert_eq!(
-            *seen.borrow(),
-            vec![vec![b"AB".to_vec()], vec![b"AB".to_vec(), b"CD".to_vec()]]
-        );
-    }
-
-    /// After `NeedAtLeast(n)` the parser is not called again until `n` more
-    /// bytes are buffered.
-    #[test]
-    fn bytes_segments_need_at_least_waits_for_the_announced_bytes() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"abc");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let calls = Rc::new(Cell::new(0u32));
-        let calls_cb = Rc::clone(&calls);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            calls_cb.set(calls_cb.get() + 1);
-            let total: usize = pieces.iter().map(Bytes::len).sum();
-            if total < 8 {
-                ParseResult::NeedAtLeast(8 - total)
-            } else {
-                ParseResult::Consumed(8)
-            }
-        }));
-
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(calls.get(), 1);
-        deliver_segment(&mut el, conn_index, 1, b"de");
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(calls.get(), 1, "5 of the 8 bytes: the parser is not called");
-        deliver_segment(&mut el, conn_index, 2, b"fgh");
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 8);
-        assert_eq!(calls.get(), 2);
-    }
-
-    /// At the hold cap the parser is called although its `NeedAtLeast` is
-    /// not met. An incomplete parse copies the hold into the accumulator,
-    /// the receive re-arms, and the next parse presents the accumulator
-    /// first.
-    #[test]
-    fn bytes_segments_at_the_hold_cap_copies_an_incomplete_message() {
-        let mut el = make_test_loop();
-        let cap = el.driver.quarter_ring_cap();
-        let conn_index = held_segment(&mut el, 0, b"m0");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let seen: Rc<RefCell<Vec<Vec<Vec<u8>>>>> = Rc::default();
-        let seen_cb = Rc::clone(&seen);
-        let want = 2 * cap + 2;
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            seen_cb
-                .borrow_mut()
-                .push(pieces.iter().map(|p| p.to_vec()).collect());
-            let total: usize = pieces.iter().map(Bytes::len).sum();
-            if total < want {
-                ParseResult::NeedAtLeast(want - total)
-            } else {
-                ParseResult::Consumed(want)
-            }
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-
-        for bid in 1..cap as u16 {
-            deliver_segment(&mut el, conn_index, bid, format!("m{bid}").as_bytes());
-        }
-        assert!(el.driver.segment_at_hold_cap(conn_index));
-        assert!(el.driver.forward_hold_throttled[conn_index as usize]);
-        let copied = hold_cap_copied();
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(seen.borrow().len(), 2, "called at the cap");
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert_eq!(el.driver.accumulators.len(conn_index), 2 * cap);
-        assert_eq!(hold_cap_copied() - copied, cap as u64);
-        for bid in 0..cap as u16 {
-            assert!(el.driver.pending_replenish.contains(&bid));
-        }
-        el.rearm_throttled_recvs();
-        assert!(
-            !el.driver.forward_hold_throttled[conn_index as usize],
-            "the receive re-arms once the hold drains"
-        );
-
-        deliver_segment(&mut el, conn_index, cap as u16, b"zz");
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), want);
-        let last = seen.borrow().last().cloned().expect("a third call");
-        let front: Vec<u8> = (0..cap)
-            .flat_map(|i| format!("m{i}").into_bytes())
-            .collect();
-        assert_eq!(last, vec![front, b"zz".to_vec()]);
-    }
-
-    /// Fill `conn_index`'s hold to its cap with one `data` entry per buffer,
-    /// starting at buffer 0, and return the cap.
-    fn fill_to_hold_cap(
-        el: &mut AsyncEventLoop<NoopHandler>,
-        conn_index: u32,
-        data: &[u8],
-    ) -> usize {
-        let cap = el.driver.quarter_ring_cap();
-        for bid in 0..cap as u16 {
-            deliver_segment(el, conn_index, bid, data);
-        }
-        assert!(el.driver.segment_at_hold_cap(conn_index));
-        cap
-    }
-
-    /// After a hold-cap copy, consuming part of the accumulator piece leaves
-    /// only its unconsumed bytes for the next call, ahead of the hold.
-    #[test]
-    fn bytes_segments_consumes_part_of_the_accumulator_after_a_hold_cap_copy() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        let cap = fill_to_hold_cap(&mut el, conn_index, b"ab");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
-            if pieces.last().is_some_and(|p| p[..] == b"zz"[..]) {
-                ParseResult::Consumed(3)
-            } else {
-                ParseResult::NeedMore
-            }
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(el.driver.accumulators.len(conn_index), 2 * cap);
-        deliver_segment(&mut el, conn_index, cap as u16, b"zz");
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 3);
-
-        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
-        let seen_cb = Rc::clone(&seen);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            seen_cb
-                .borrow_mut()
-                .extend(pieces.iter().map(|p| p.to_vec()));
-            ParseResult::NeedMore
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        let mut rest = b"ab".repeat(cap)[3..].to_vec();
-        rest.extend_from_slice(b"zz");
-        assert_eq!(seen.borrow().concat(), rest);
-    }
-
-    /// A hold-cap copy that reaches `recv_accumulator_max` closes the
-    /// connection and resolves to `Ok(0)`, and releases every entry's buffer
-    /// hold once, copied or not.
-    #[test]
-    fn bytes_segments_hold_cap_copy_past_the_accumulator_bound_closes() {
-        let mut el = make_test_loop_with_config(
-            test_config_builder()
-                .recv_accumulator_max(4096)
-                .build()
-                .expect("valid config"),
-        );
-        let conn_index = accept_connection(&mut el);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        let cap = fill_to_hold_cap(&mut el, conn_index, &[7u8; 2000]);
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let copied = hold_cap_copied();
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 0);
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.close_requested())
-        );
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        for bid in 0..cap as u16 {
-            assert_eq!(
-                el.driver
-                    .pending_replenish
-                    .iter()
-                    .filter(|&&b| b == bid)
-                    .count(),
-                1,
-                "buffer {bid}'s hold is released once"
-            );
-        }
-        assert_eq!(
-            hold_cap_copied() - copied,
-            2,
-            "two entries fit in 4096 bytes"
-        );
-    }
-
-    /// At end of stream with the hold at its cap and the message incomplete,
-    /// the call resolves to `Ok(0)` without copying the hold.
-    #[test]
-    fn bytes_segments_at_end_of_stream_does_not_copy_the_hold() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        let cap = fill_to_hold_cap(&mut el, conn_index, b"ab");
-        el.driver
-            .connections
-            .get_mut(conn_index)
-            .expect("open")
-            .note_eof(false);
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let copied = hold_cap_copied();
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 0);
-        assert_eq!(hold_cap_copied(), copied);
-        assert_eq!(el.driver.segment_hold[conn_index as usize].len(), cap);
-        assert!(el.driver.accumulators.is_empty(conn_index));
-    }
-
-    /// At the hold cap, complete messages are consumed from the hold without
-    /// a copy.
-    #[test]
-    fn bytes_segments_at_the_hold_cap_consumes_complete_messages_in_place() {
-        let mut el = make_test_loop();
-        let cap = el.driver.quarter_ring_cap();
-        let conn_index = held_segment(&mut el, 0, b"m0");
-        for bid in 1..cap as u16 {
-            deliver_segment(&mut el, conn_index, bid, format!("m{bid}").as_bytes());
-        }
-        assert!(el.driver.segment_at_hold_cap(conn_index));
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let copied = hold_cap_copied();
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::Consumed(4)));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 4);
-        assert_eq!(hold_cap_copied(), copied);
-        assert!(el.driver.accumulators.is_empty(conn_index));
-        assert_eq!(el.driver.segment_hold[conn_index as usize].len(), cap - 2);
-    }
-
-    /// `Pinned` and `Owned` entries are presented in hold order; an `Owned`
-    /// entry is presented as its own bytes, not a copy.
-    #[test]
-    fn bytes_segments_presents_pinned_and_owned_entries_in_order() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"ab");
-        let owned = Bytes::from_static(b"cd");
-        el.driver.segment_hold[conn_index as usize]
-            .push_back(crate::backend::HeldRecvBuf::Owned(owned.clone()));
-        deliver_segment(&mut el, conn_index, 1, b"ef");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let seen: Rc<RefCell<Vec<Bytes>>> = Rc::default();
-        let seen_cb = Rc::clone(&seen);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            seen_cb.borrow_mut().extend(pieces.iter().cloned());
-            ParseResult::Consumed(6)
-        }));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 6);
-        let seen = std::mem::take(&mut *seen.borrow_mut());
-        let bytes: Vec<&[u8]> = seen.iter().map(|b| &b[..]).collect();
-        assert_eq!(bytes, vec![&b"ab"[..], b"cd", b"ef"]);
-        assert_eq!(seen[1].as_ptr(), owned.as_ptr());
-        with_driver_state(&mut el, || drop(seen));
-    }
-
-    /// Partial consumption leaves the rest of an entry held at its new
-    /// offset, and the next call presents a view at that offset.
-    #[test]
-    fn bytes_segments_partial_consumption_leaves_the_rest_at_its_offset() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"hello world");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::Consumed(6)));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 6);
-        assert!(matches!(
-            el.driver.segment_hold[conn_index as usize].front(),
-            Some(crate::backend::HeldRecvBuf::Pinned {
-                bid: 0,
-                off: 6,
-                len: 5
-            })
-        ));
-        assert!(
-            !el.driver.pending_replenish.contains(&0),
-            "the entry still holds its buffer"
-        );
-
-        let seen: Rc<RefCell<Vec<Bytes>>> = Rc::default();
-        let seen_cb = Rc::clone(&seen);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            seen_cb.borrow_mut().extend(pieces.iter().cloned());
-            ParseResult::Consumed(5)
-        }));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 5);
-        let seen = std::mem::take(&mut *seen.borrow_mut());
-        assert_eq!(&seen[0][..], b"world");
-        assert_eq!(seen[0].as_ptr(), el.driver.provided_bufs.data_ptr(0, 6));
-        with_driver_state(&mut el, || drop(seen));
-    }
-
-    /// `Consumed(k)` past the bytes presented consumes only those bytes.
-    #[test]
-    fn bytes_segments_clamps_consumed_to_the_bytes_presented() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"abc");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::Consumed(100)));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 3);
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-    }
-
-    /// Entering the domain turns a pending lend into a `Pinned` entry at the
-    /// lend's offset in its buffer, without a copy.
-    #[test]
-    fn bytes_segments_converts_a_pending_lend_to_a_pinned_entry() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        deliver_segment(&mut el, conn_index, 0, b"xxhello");
-        // A lend whose first two bytes a reader already consumed.
-        let lend = el.driver.pending_recv_bufs[conn_index as usize]
-            .as_mut()
-            .expect("the completion is lent");
-        lend.ptr = el.driver.provided_bufs.data_ptr(0, 2);
-        lend.len = 5;
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let seen: Rc<RefCell<Vec<Bytes>>> = Rc::default();
-        let seen_cb = Rc::clone(&seen);
-        let copied = bytes_copied();
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            seen_cb.borrow_mut().extend(pieces.iter().cloned());
-            ParseResult::NeedMore
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-
-        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_none());
-        assert!(matches!(
-            el.driver.segment_hold[conn_index as usize].front(),
-            Some(crate::backend::HeldRecvBuf::Pinned {
-                bid: 0,
-                off: 2,
-                len: 5
-            })
-        ));
-        assert!(!el.driver.pending_replenish.contains(&0));
-        assert_eq!(bytes_copied(), copied);
-        let seen = std::mem::take(&mut *seen.borrow_mut());
-        assert_eq!(&seen[0][..], b"hello");
-        assert_eq!(seen[0].as_ptr(), el.driver.provided_bufs.data_ptr(0, 2));
-        with_driver_state(&mut el, || drop(seen));
-    }
-
-    /// A stale handle resolves to `Ok(0)` and leaves the slot's domain alone.
-    #[test]
-    fn bytes_segments_on_a_stale_handle_resolves_to_zero() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let ctx = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::Consumed(1)));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 0);
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::default()
-        );
-    }
-
-    fn running_forward(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
-        el.driver.forward_progress[conn_index as usize] =
-            Some(crate::backend::uring::driver::ForwardProgress {
-                target: crate::backend::uring::driver::SinkTarget::Fd {
-                    fd: -1,
-                    is_file: false,
-                },
-                len: 100,
-                forwarded: 0,
-                epoch: 1,
-            });
-    }
-
-    /// A live `SegmentReader` or a running forward gives `EBUSY`, on the
-    /// first poll and on a later one.
-    #[test]
-    fn bytes_segments_refuses_a_segment_reader_or_a_forward() {
-        for owner in ["segment_reader", "forward"] {
-            for later in [false, true] {
-                let mut el = make_test_loop();
-                let conn_index = held_segment(&mut el, 0, b"ab");
-                let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-                let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
-                if later {
-                    assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-                }
-                match owner {
-                    "segment_reader" => el.driver.segment_reader_live[conn_index as usize] = true,
-                    _ => running_forward(&mut el, conn_index),
-                }
-                let poll = poll_in(&mut el, fut.as_mut());
-                assert!(is_ebusy(&poll), "{owner}, later poll {later}: {poll:?}");
-            }
-        }
-    }
-
-    /// A parked call whose connection another reader used in the meantime
-    /// resolves to `EBUSY` on its next poll, and a new call then reads the
-    /// next reply, which arrives in one completion.
-    #[test]
-    fn a_parked_bytes_segments_call_returns_ebusy_after_another_reader() {
-        for other in [
-            "segment_reader",
-            "forward_end",
-            "end_segments",
-            "with_segments",
-            "recv_owned_segment",
-        ] {
-            let mut el = make_test_loop();
-            let conn_index = held_segment(&mut el, 0, b"ab");
-            let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-            let line = |pieces: &[Bytes]| {
-                let mut n = 0;
-                for p in pieces {
-                    if let Some(i) = p.iter().position(|&b| b == b'\n') {
-                        return ParseResult::Consumed(n + i + 1);
-                    }
-                    n += p.len();
-                }
-                ParseResult::NeedMore
-            };
-            let mut parked = std::pin::pin!(ctx.with_bytes_segments(line));
-            assert!(poll_in(&mut el, parked.as_mut()).is_pending());
-
-            match other {
-                "segment_reader" => {
-                    let reader = with_driver_state(&mut el, || ctx.segments().expect("reader"));
-                    with_driver_state(&mut el, || drop(reader));
-                }
-                "forward_end" => {
-                    // What a forward's completion does when it ends.
-                    assert!(el.driver.settle_forward_end(conn_index));
-                }
-                "end_segments" => {
-                    with_driver_state(&mut el, || ctx.end_segments()).expect("end_segments");
-                }
-                "with_segments" => {
-                    let mut f = std::pin::pin!(ctx.with_segments(|_| SegConsumed(1)));
-                    assert!(matches!(
-                        poll_in(&mut el, f.as_mut()),
-                        std::task::Poll::Ready(Ok(1))
-                    ));
-                }
-                _ => {
-                    let mut f = std::pin::pin!(
-                        with_driver_state(&mut el, || ctx.recv_owned_segment()).expect("owned")
-                    );
-                    assert!(matches!(
-                        poll_in(&mut el, f.as_mut()),
-                        std::task::Poll::Ready(Ok(Some(_)))
-                    ));
-                }
-            }
-
-            let poll = poll_in(&mut el, parked.as_mut());
-            assert!(is_ebusy(&poll), "after {other}: {poll:?}");
-
-            let buffered = el.driver.recv_buffered(conn_index);
-            deliver_segment(&mut el, conn_index, 1, b"cd\n");
-            let mut next = std::pin::pin!(ctx.with_bytes_segments(line));
-            assert_eq!(
-                ready_ok(poll_in(&mut el, next.as_mut())),
-                buffered + 3,
-                "after {other}"
-            );
-        }
-    }
-
-    /// A call that recorded `NeedAtLeast(n)` resolves to `EBUSY` once
-    /// another reader consumed the bytes it was shown, instead of waiting
-    /// for `n` bytes past them.
-    #[test]
-    fn bytes_segments_need_at_least_does_not_count_bytes_another_reader_took() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"abc");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let mut parked = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedAtLeast(10)));
-        assert!(poll_in(&mut el, parked.as_mut()).is_pending());
-        let mut f = std::pin::pin!(ctx.with_segments(|chain| SegConsumed(chain.total_len())));
-        assert!(matches!(
-            poll_in(&mut el, f.as_mut()),
-            std::task::Poll::Ready(Ok(3))
-        ));
-        deliver_segment(&mut el, conn_index, 1, b"0123456789");
-        assert!(is_ebusy(&poll_in(&mut el, parked.as_mut())));
-    }
-
-    /// `recv_arrival` covers the bytes a call consumed across pieces, and
-    /// after a hold-cap copy; it is `None` after a call that returned
-    /// `EBUSY`.
-    #[test]
-    fn bytes_segments_reports_the_consumed_range() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        let base = Instant::now();
-        deliver_in_batch(&mut el, conn_index, 0, b"ab", at(base, 1));
-        deliver_in_batch(&mut el, conn_index, 1, b"cd", at(base, 2));
-        deliver_in_batch(&mut el, conn_index, 2, b"ef", at(base, 3));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::Consumed(3)));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 3);
-        let a = with_driver_state(&mut el, || ctx.recv_arrival());
-        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
-
-        // Fill the hold to its cap (the 3 bytes left plus new entries), so an
-        // incomplete parse copies it, then complete the message.
-        let cap = el.driver.quarter_ring_cap();
-        for bid in 3..(cap as u16 + 1) {
-            deliver_in_batch(&mut el, conn_index, bid, b"gh", at(base, bid as u64 + 1));
-        }
-        assert!(el.driver.segment_at_hold_cap(conn_index));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
-            let total: usize = pieces.iter().map(Bytes::len).sum();
-            if pieces.len() > 1 && pieces[1][..] == b"zz"[..] {
-                ParseResult::Consumed(total)
-            } else {
-                ParseResult::NeedMore
-            }
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        let last = cap as u64 + 10;
-        deliver_in_batch(&mut el, conn_index, cap as u16 + 1, b"zz", at(base, last));
-        assert!(ready_ok(poll_in(&mut el, fut.as_mut())) > 0);
-        let a = with_driver_state(&mut el, || ctx.recv_arrival());
-        assert_eq!(times(a), Some((at(base, 2), at(base, last))));
-
-        deliver_in_batch(
-            &mut el,
-            conn_index,
-            cap as u16 + 2,
-            b"x",
-            at(base, last + 1),
-        );
-        let mut parked = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
-        assert!(poll_in(&mut el, parked.as_mut()).is_pending());
-        with_driver_state(&mut el, || ctx.end_segments()).expect("end_segments");
-        assert!(is_ebusy(&poll_in(&mut el, parked.as_mut())));
-        assert!(with_driver_state(&mut el, || ctx.recv_arrival()).is_none());
-    }
-
-    /// A parser called with only the accumulator, after a hold-cap copy and
-    /// with nothing arrived since, holds no bytes in the driver; its park
-    /// offer is still declined because it runs inside the reader callback.
-    #[test]
-    fn a_park_offer_from_a_bytes_segments_parser_over_the_accumulator_is_declined() {
-        use crate::park::ParkState;
-        let mut el = make_test_loop();
-        let cap = el.driver.quarter_ring_cap();
-        let conn_index = held_segment(&mut el, 0, b"m0");
-        for bid in 1..cap as u16 {
-            deliver_segment(&mut el, conn_index, bid, b"mm");
-        }
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let calls = Rc::new(Cell::new(0u32));
-        let calls_cb = Rc::clone(&calls);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            calls_cb.set(calls_cb.get() + 1);
-            if calls_cb.get() == 2 {
-                assert_eq!(pieces.len(), 1, "only the accumulator");
-                ctx.offer_for_park(Some(ParkState::new(3u8)));
-            }
-            ParseResult::NeedMore
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        assert!(!el.driver.accumulators.is_empty(conn_index));
-
-        el.driver.park_offered[conn_index as usize] = true;
-        el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(calls.get(), 2);
-        assert!(!el.driver.park_offered[conn_index as usize]);
-        assert!(!el.driver.park_carry.contains_key(&conn_index));
-    }
-
-    /// A view the handler kept does not block a park of a connection with
-    /// nothing held.
-    #[test]
-    fn a_connection_with_a_view_alive_and_nothing_held_can_be_parked() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"ab");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let kept: Rc<RefCell<Vec<Bytes>>> = Rc::default();
-        let kept_cb = Rc::clone(&kept);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            kept_cb.borrow_mut().extend(pieces.iter().cloned());
-            ParseResult::Consumed(2)
-        }));
-        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 2);
-        assert_eq!(kept.borrow().len(), 1);
-        assert!(el.driver.offer_park(conn_index, None));
-        assert_eq!(el.driver.park_blocker(conn_index), None);
-        let kept = std::mem::take(&mut *kept.borrow_mut());
-        with_driver_state(&mut el, || drop(kept));
-    }
-
-    /// Teardown with entries held and views of them alive releases each
-    /// entry's hold once and leaves the views valid; the buffers return when
-    /// the views drop.
-    #[test]
-    fn close_with_held_entries_and_live_views_releases_each_hold_once() {
-        let mut el = make_test_loop();
-        let entries = el.driver.provided_bufs.ring_entries();
-        let conn_index = held_segment(&mut el, 0, b"ab");
-        deliver_segment(&mut el, conn_index, 1, b"cd");
-        let generation = el.driver.connections.generation(conn_index);
-        let ctx = ConnCtx::new(conn_index, generation);
-        let kept: Rc<RefCell<Vec<Bytes>>> = Rc::default();
-        let kept_cb = Rc::clone(&kept);
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
-            kept_cb.borrow_mut().extend(pieces.iter().cloned());
-            ParseResult::NeedMore
-        }));
-        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        assert_eq!(el.driver.segment_hold[conn_index as usize].len(), 2);
-
-        el.driver.close_connection(conn_index);
-        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
-        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
-        for bid in [0u16, 1] {
-            assert_eq!(
-                el.driver
-                    .pending_replenish
-                    .iter()
-                    .filter(|&&b| b == bid)
-                    .count(),
-                1,
-                "buffer {bid}'s entry hold is released once"
-            );
-        }
-        el.driver.release_pending();
-        assert_eq!(el.driver.provided_bufs.free(), entries - 2);
-        let kept = std::mem::take(&mut *kept.borrow_mut());
-        assert_eq!(&kept[0][..], b"ab");
-        assert_eq!(&kept[1][..], b"cd");
-        with_driver_state(&mut el, || drop(kept));
-        release_views(&mut el);
-        assert_eq!(el.driver.provided_bufs.free(), entries);
-    }
-
-    /// `end_segments` after a parked call hands the held bytes to
-    /// `with_bytes`, first.
-    #[test]
-    fn end_segments_after_bytes_segments_hands_the_hold_to_with_bytes() {
-        let mut el = make_test_loop();
-        let conn_index = held_segment(&mut el, 0, b"ab");
-        deliver_segment(&mut el, conn_index, 1, b"cd");
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        {
-            let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
-            assert!(poll_in(&mut el, fut.as_mut()).is_pending());
-        }
-        with_driver_state(&mut el, || ctx.end_segments()).expect("end_segments");
-        let seen = Rc::new(RefCell::new(Vec::new()));
-        let seen_cb = Rc::clone(&seen);
-        let mut fut = std::pin::pin!(ctx.with_bytes(move |b| {
-            seen_cb.borrow_mut().extend_from_slice(&b);
-            ParseResult::Consumed(b.len())
-        }));
-        assert!(matches!(
-            poll_in(&mut el, fut.as_mut()),
-            std::task::Poll::Ready(4)
-        ));
-        assert_eq!(&seen.borrow()[..], b"abcd");
     }
 }
 
