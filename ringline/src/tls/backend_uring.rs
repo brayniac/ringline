@@ -190,8 +190,9 @@ pub fn tls_recv_arm(
     }
 }
 
-/// End a receive from [`tls_recv_arm`] that wrote nothing, giving back what
-/// it held. A buffered-engine buffer goes back to the free list.
+/// End a receive from [`tls_recv_arm`] without delivering anything it wrote,
+/// giving back what it held. A buffered-engine buffer goes back to the free
+/// list.
 pub fn tls_recv_cancel(tls_table: &mut TlsTable, conn_index: u32, buf: Option<Vec<u8>>) {
     #[cfg(not(feature = "tls-buffered"))]
     {
@@ -200,7 +201,8 @@ pub fn tls_recv_cancel(tls_table: &mut TlsTable, conn_index: u32, buf: Option<Ve
             .get_mut(conn_index)
             .and_then(|c| c.conn.as_unbuffered_mut())
         {
-            // SAFETY: nothing was written.
+            // SAFETY: `recv_done(0)` makes no received bytes readable,
+            // whatever the receive wrote.
             unsafe { conn.recv_done(0) };
         }
     }

@@ -2978,8 +2978,11 @@ impl Driver {
                         }
                     }
                     // The cancel lead ended the receive; the kernel is done
-                    // with the buffer. A TLS receive into the engine's own
-                    // buffer is also ended there, while its state exists.
+                    // with the buffer. If the connection is still this
+                    // generation and has TLS state, end the receive in that
+                    // state (`tls_recv_cancel`), so the Close's
+                    // `release_tls_state` finds none in flight. Otherwise the
+                    // entry's buffer is freed here.
                     OpTag::RecvDirect => {
                         let slot = ud.payload() as usize;
                         let Some(entry) = self.direct_recvs.get_mut(slot).and_then(Option::take)

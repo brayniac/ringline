@@ -98,7 +98,7 @@ io_uring backend, each worker also owns:
 
 | Feature | Purpose |
 |---------|---------|
-| One-shot recv into the connection's buffer | TCP and Unix receives, plaintext and TLS, armed when a read parks — no copy from a shared buffer |
+| One-shot recv into the connection's buffer | TCP and Unix receives, plaintext and TLS, armed when a read parks — no copy from a shared buffer (with `tls-buffered`, TLS receives into a pooled buffer that `read_tls` copies from) |
 | Ring-provided buffers | Kernel-managed recv buffer pool for UDP — kernel picks buffer at completion time |
 | Multishot recv | UDP — one SQE, many completions |
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |

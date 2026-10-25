@@ -14912,8 +14912,9 @@ mod tests {
 
     /// A Close that completes before the TLS receive it cancelled moves the
     /// receive's buffer allocation out of the dropped TLS state into the
-    /// receive's entry, which frees it when the receive completes. The peer
-    /// never sends, so the kernel writes nothing into it.
+    /// receive's entry, which frees it when the receive completes. The
+    /// receive's SQE is pushed but never submitted, so the kernel never writes
+    /// into the allocation this test frees.
     #[cfg(not(feature = "tls-buffered"))]
     #[test]
     fn a_close_before_the_tls_receive_completes_moves_the_allocation() {
@@ -14942,6 +14943,22 @@ mod tests {
             0,
         );
         assert!(el.driver.direct_recvs[slot as usize].is_none());
+    }
+
+    /// Worker shutdown with a TLS receive in flight ends the receive in the TLS
+    /// state before the Close drops it, so the Close finds none in flight.
+    #[test]
+    fn shutdown_ends_an_in_flight_tls_receive() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        el.driver.ring.flush().unwrap();
+        el.driver.run_shutdown();
+        assert!(el.driver.direct_recvs.iter().all(Option::is_none));
+        assert!(el.driver.connections.get(conn_index).is_none());
+        assert!(!el.driver.tls_table.as_ref().unwrap().has(conn_index));
     }
 
     /// Run `conn_index`'s queued sends through the real ring until it is idle,
