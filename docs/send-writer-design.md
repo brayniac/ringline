@@ -82,7 +82,7 @@ pub struct SendWriter<'a> { /* slot chain, state; borrows the call */ }
 
 impl SendWriter<'_> {
     /// Reserve pool slots for `additional` more bytes written through
-    /// `io::Write` or `BufMut`. Reserves nothing on TLS or mio.
+    /// `io::Write` or `BufMut`.
     pub fn reserve(&mut self, additional: usize) -> io::Result<()>;
 
     /// Reserve `n` more whole slots, for `contiguous` calls.
@@ -230,19 +230,19 @@ against the pool from the moment they are taken.
   pool slots ahead of the writes, so that writes the reservation covers
   cannot fail for lack of a slot. Unused reserved slots go back through
   `release_reservation` when the call ends. On TLS and on mio they reserve
-  nothing (see "TLS" and "mio"). How a reservation is sized against the
-  current slot's free space, earlier reservations and slots `contiguous`
-  leaves partly unused, and how it combines with the backpressured form's
-  admission slots, is settled in the prototype. `SlotReservation` cannot
-  grow today, so the prototype adds a way to grow one.
+  nothing (see "TLS" and "mio"). The prototype settles how a reservation is
+  sized against the current slot's free space, earlier `reserve` calls and
+  slot tails `contiguous` leaves unused. It also settles how a reservation
+  combines with the backpressured form's admission slots. `SlotReservation`
+  cannot grow today, so the prototype adds a way to grow one.
 - `SendWriter`'s `Drop` releases its slot chain and any reservation it
-  holds, including the backpressured form's admission reservation while
-  `f` runs. That
-  covers a panic inside the closure: the default `TaskPanicPolicy::Contain`
-  catches it and keeps the worker running, and the unwind runs inside the
-  task's poll, where `CURRENT_DRIVER` is set. Without this each panic would
-  shrink the worker's pool for good. The implementation tests it: panic
-  inside `send_with` under `Contain`, then check `free_count`.
+  holds, including, on a plaintext connection, the backpressured form's
+  admission reservation while `f` runs. That covers a panic inside the
+  closure: the default `TaskPanicPolicy::Contain` catches it and keeps the
+  worker running, and the unwind runs inside the task's poll, where
+  `CURRENT_DRIVER` is set. Without this each panic would shrink the worker's
+  pool for good. The implementation tests it: panic inside `send_with` under
+  `Contain`, then check `free_count`.
 - `SendCopyPool` gains `alloc_raw_reserved(&mut SlotReservation)`, the
   `alloc_raw` counterpart of `copy_in_reserved`: it pops a promised slot
   for incremental filling.
@@ -269,7 +269,8 @@ against the pool from the moment they are taken.
   this future has to leave it to run `f`.
 - Writing past `len`, or `contiguous` leaving slot tails unused, can need
   more slots than `ceil(len / slot_size)` even when `len()` is at most
-  `len`. Those come from the free pool and can fail.
+  `len`. Unless `reserve` or `reserve_slots` covered them, those come from
+  the free pool and can fail.
 - A closure that writes nothing settles its id at once with `Ok(0)`, as
   `send_inner` does for an empty send.
 - On TLS and on mio the backpressured form differs; see those sections.
@@ -379,13 +380,12 @@ entry, as in `send_bounded` (`docs/mio-bounded-send-design.md`). When `f`
 writes fewer bytes than `len`, the permit is narrowed with
 `shrink_reservation` before the entry is queued, and the capacity release is
 flagged (`capacity_released`) so the FIFO head is woken, as the TLS branch
-of mio's `send_bounded` does. When `f` writes more, the permit is grown in
-place by reserving the missing slots and adding them to the permit. If the
-permit's slots plus the missing slots exceed the pool, the call fails with
-`InvalidInput`. On an error the call releases the permit (`release_permit`)
-and cancels the id while it is still waiting, which wakes the next head. The
-future then resolves to `Err` with nothing queued, and the closure's `R` is
-dropped.
+of mio's `send_bounded` does. When `f` writes more, the missing slots are
+reserved and added to the permit. If the permit's slots plus the missing
+slots exceed the pool, the call fails with `InvalidInput`. On an error the
+call releases the permit (`release_permit`) and cancels the id while it is
+still waiting, which wakes the next head. The future then resolves to `Err`
+with nothing queued, and the closure's `R` is dropped.
 
 ## Protocol clients
 
