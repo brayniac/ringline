@@ -3687,8 +3687,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Release the backing of the in-flight forward write, record an error for
-    /// the `ForwardToFuture`, and wake it. A pinned bid returns to the ring.
+    /// Release the backing of the in-flight forward write, settle the source
+    /// (`settle_forward_end`, closing the connection if its accumulator
+    /// overflows), record an error for the `ForwardToFuture`, and wake it. A
+    /// pinned bid returns to the ring.
     fn fail_forward_write(&mut self, conn_index: u32, errno: i32) {
         if let Some(state) = self.driver.forward_write[conn_index as usize].take() {
             // A batch holds several bids; every pinned one goes back, exactly
@@ -3707,13 +3709,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.forward_progress[conn_index as usize] = None;
-        self.driver.forward_done[conn_index as usize] = Some(Err(errno));
         // Held bytes not yet written go to the accumulator and the source
         // leaves the segmented domain, as at the end of any other forward, so
-        // `with_data` reads what follows.
+        // `with_data` reads what follows. The result is recorded after a
+        // close, which clears `forward_done`.
         if !self.driver.settle_forward_end(conn_index) {
             self.driver.close_connection(conn_index);
         }
+        self.driver.forward_done[conn_index as usize] = Some(Err(errno));
         self.executor.wake_recv(conn_index);
     }
 
@@ -12448,6 +12451,57 @@ mod tests {
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries, "free restored");
+    }
+
+    /// A forward whose write fails resolves with the write's error even when
+    /// settling its source overflows the accumulator and closes the
+    /// connection, which clears `forward_done`.
+    #[test]
+    fn a_failed_forward_write_keeps_its_error_when_the_settle_overflows() {
+        use std::os::fd::AsFd;
+        let config = test_config_builder()
+            .recv_accumulator_max(4096)
+            .build()
+            .expect("valid config");
+        let mut el = make_test_loop_with_config(config);
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        // Held behind the forward's 5 bytes, and larger than the accumulator.
+        el.driver.segment_hold[conn_index as usize].push_back(crate::backend::HeldRecvBuf::Owned(
+            bytes::Bytes::from(vec![7u8; 8192]),
+        ));
+
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 5)));
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p1, std::task::Poll::Pending), "parks on the write");
+
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), -libc::EIO, 0);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_none_or(|c| c.close_requested()),
+            "test premise: the settle overflowed and closed the connection"
+        );
+
+        let p2 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        match p2 {
+            std::task::Poll::Ready(Err(e)) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+            other => panic!("expected Err(EIO), got {other:?}"),
+        }
     }
 
     /// (b) File sink: a short write resubmits the remainder at the advanced

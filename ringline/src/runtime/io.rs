@@ -1958,7 +1958,7 @@ impl ConnCtx {
 
     /// A forward from this connection to the sink connection that sends from
     /// this connection's accumulator, if it is a plaintext source or a TLS
-    /// source outside the segmented domain; `None` otherwise.
+    /// source with no `forward_to` running; `None` otherwise.
     /// Refuses the same conditions as `arm_forward_source`: a forward already
     /// running from this connection (`EBUSY`), a stale sink (`EPIPE`), a TLS
     /// sink (`EPROTOTYPE`), and, unless the caller holds the sink's
@@ -1980,7 +1980,6 @@ impl ConnCtx {
                 .tls_table
                 .as_ref()
                 .is_some_and(|t| t.has(self.conn_index))
-                && driver.recv_domain[idx] != crate::recv::domain::RecvDomain::Segmented
                 && driver.forward_progress[idx].is_none();
             if driver.connections.generation(self.conn_index) != self.generation
                 || !(is_recv_direct(driver, self.conn_index) || tls_source)
@@ -2791,7 +2790,7 @@ pub(crate) fn park_recv(
 }
 
 /// Register the current task as `conn_index`'s receive waiter for a Mode A
-/// forward, which waits on the segment hold rather than through
+/// forward on io_uring or a `forward_to_conn` on mio, which wait outside
 /// [`park_recv`]. On io_uring, also arm a TLS connection's receive if
 /// none is armed.
 fn park_segment_waiter(

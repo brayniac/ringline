@@ -215,15 +215,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- On io_uring, the buffers a connection's sends hold count toward its
-  `forward_hold_cap`: those of a `forward_recv_buf` send of a lent receive
-  buffer, and the ring buffers a `forward_to` write pins (#638). Without
-  `recv_incremental` a `forward_to` source's cap is a quarter of the receive
-  ring's buffers. The cap is checked as completions arrive, so a multishot
-  receive can take buffers past it before its cancel lands. A connection
-  that forwards accumulator-backed data with `forward_recv_buf` is not
-  throttled: in a test the server accepted 64 MiB from a peer that did not
-  read (#638).
+- On io_uring, the ring buffers a `forward_to` write pins count toward the
+  source's `forward_hold_cap`, and without `recv_incremental` the cap is at
+  most a quarter of the receive ring's buffers (#638). The cap is checked as
+  completions arrive, so a multishot receive can take buffers past it before
+  its cancel lands. A connection that forwards accumulator-backed data with
+  `forward_recv_buf` is not throttled: in a test the server accepted 64 MiB
+  from a peer that did not read (#638).
 
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
@@ -248,23 +246,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its handshake is done, as a plaintext connection's direct receive is, so a
   task that does not read stops its peer instead of buffering up to
   `recv_accumulator_max` (1 GiB by default). During the handshake, in the
-  segmented domain (a `forward_to` source), and after
-  the peer closes, the receive is re-armed after each completion. A loop
-  that polls `try_with_data` without ever parking a read no longer sees new
-  bytes, as on a plaintext connection. A TLS connection now arms the
-  `POLLRDHUP` hangup poll, so a peer FIN or reset is seen, and `is_alive`
-  returns `false`, while nothing reads. The poll does not fire on a
-  close_notify the peer sends without closing TCP: that alert is read when a
-  ring receive next completes; on mio it is read when it arrives.
-  `forward_to_conn` from a TLS source takes the bytes from the accumulator
-  and sends them through the sink's send queue, as from a plaintext source:
-  ordered with other sends on the sink, with one chunk buffered rather than
-  up to `forward_hold_cap` entries, and below `send_zc_threshold` copied
-  into a pool slot. A zero-copy send of such a forward to a sink that does
-  not read holds worker exit for up to its bound, as any guarded send does.
-  A `forward_to` started while a `forward_to_conn` sends
-  from the accumulator gets `EBUSY`. `recv_multishot` has no effect: TLS
-  connections, the only
+  segmented domain (a `forward_to` source), and after the peer closes, the
+  receive is re-armed after each completion. A loop that polls
+  `try_with_data` without ever parking a read no longer sees new bytes, as
+  on a plaintext connection. A TLS connection now arms the `POLLRDHUP`
+  hangup poll, so a peer FIN or reset is seen, and `is_alive` returns
+  `false`, while nothing reads. The poll does not fire on a close_notify the
+  peer sends without closing TCP: that alert is read when a ring receive
+  next completes; on mio it is read when it arrives. `forward_to_conn` from
+  a TLS source takes the bytes from the accumulator and sends them through
+  the sink's send queue, as from a plaintext source: ordered with other
+  sends on the sink, with one chunk buffered rather than up to
+  `forward_hold_cap` entries, and below `send_zc_threshold` copied into a
+  pool slot. A zero-copy send of such a forward to a sink that does not read
+  holds worker exit for up to its bound, as any guarded send does. A
+  `forward_to` started while a `forward_to_conn` sends from the accumulator
+  gets `EBUSY`. `recv_multishot` has no effect: TLS connections, the only
   ones it affected, always arm one-shot receives.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
@@ -670,12 +667,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the `timestamps` feature from `Cargo.toml`.
 
 ### Fixed
-
-- io_uring: after a `forward_to` failed on a sink write (an error from the
-  sink, or a sink connection whose slot was reused), the source stayed in
-  the segmented domain, so `with_data` and `with_bytes` did not see the
-  bytes that followed. A failed forward now ends as a finished one does:
-  bytes held but not yet written go to the accumulator, and reads resume.
 
 - io_uring: `send_chain` and `send_chain_nowait` did not check the
   handle's generation when the handle's slot held a plaintext connection. A
