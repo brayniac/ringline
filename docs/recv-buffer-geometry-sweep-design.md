@@ -2,6 +2,8 @@
 
 Note (2026-10-25): `with_segments` and `recv_owned_segment` were removed.
 
+Note (2026-10-25): `forward_to` (Mode A) was removed.
+
 **Status:** **Phase A complete — the default stands.** Phase 0 landed (#417);
 #415 merged as 282773b. Outcome below.
 

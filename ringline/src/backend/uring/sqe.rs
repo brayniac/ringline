@@ -81,12 +81,6 @@ pub(crate) enum Op {
         fd: Fd,
         msg: *const libc::msghdr,
     },
-    Writev {
-        fd: Fd,
-        iovecs: *const libc::iovec,
-        count: u32,
-        offset: u64,
-    },
     Read {
         fd: Fd,
         buf: *mut u8,

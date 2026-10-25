@@ -494,105 +494,6 @@ fn a_reset_in_the_middle_of_a_message_is_an_error() {
     );
 }
 
-// ── Reads a direct connection refuses ───────────────────────────────
-
-struct Refusals;
-
-static REFUSALS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
-
-fn expect_unsupported<T>(what: &str, r: std::io::Result<T>) -> Result<(), String> {
-    match r {
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-        Err(e) => Err(format!("{what}: {e}")),
-        Ok(_) => Err(format!("{what}: accepted")),
-    }
-}
-
-/// `forward_to`, which holds provided-ring buffers, is refused on a direct
-/// connection.
-async fn expect_forward_to_unsupported(conn: &mut Connection) -> Result<(), String> {
-    let (sink_socket, _peer) =
-        std::os::unix::net::UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
-    let sink = ringline::SinkFd::socket(std::os::fd::AsFd::as_fd(&sink_socket));
-    expect_unsupported("forward_to", conn.forward_to(&sink, 4).await)
-}
-
-impl AsyncEventHandler for Refusals {
-    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
-        Some(Box::pin(async {
-            let addr = SERVER.lock().unwrap().unwrap();
-            let r = async {
-                let mut conn = ringline::connect(addr)
-                    .await
-                    .map_err(|e| format!("connect: {e}"))?;
-                if !conn.is_recv_direct() {
-                    return Err("a plaintext connect is not direct".into());
-                }
-                expect_forward_to_unsupported(&mut conn).await?;
-                // The connection still reads with `with_data`.
-                let mut got = Vec::new();
-                while got.len() < 4 {
-                    let n = conn
-                        .with_data(|b| {
-                            got.extend_from_slice(b);
-                            ParseResult::Consumed(b.len())
-                        })
-                        .await;
-                    if n == 0 {
-                        break;
-                    }
-                }
-                if got != b"ping" {
-                    return Err(format!("read {got:?} after the refusals"));
-                }
-                Ok(())
-            }
-            .await;
-            *REFUSALS.lock().unwrap() = Some(r);
-            let _ = ringline::request_shutdown();
-        }))
-    }
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
-        async {}
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        Refusals
-    }
-}
-
-#[test]
-fn a_direct_connection_refuses_reads_that_need_the_ring() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
-    *REFUSALS.lock().unwrap() = None;
-    let server = std::thread::spawn(move || {
-        let (mut direct, _) = listener.accept().unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        direct.write_all(b"ping").unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-    });
-    let config = ConfigBuilder::new()
-        .workers(1)
-        .pin_to_core(false)
-        .max_connections(16)
-        .build()
-        .expect("config");
-    let (runtime, handles) = RinglineBuilder::new(config)
-        .launch::<Refusals>()
-        .expect("launch");
-    common::join_workers(&runtime, handles);
-    server.join().unwrap();
-    assert_eq!(
-        REFUSALS
-            .lock()
-            .unwrap()
-            .take()
-            .expect("client did not finish"),
-        Ok(())
-    );
-}
-
 static READY: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
 /// Read part of a message, give up on the rest so the direct receive stays
@@ -1770,9 +1671,8 @@ fn a_reset_behind_buffered_bytes_read_once_is_reported_as_a_reset() {
 
 static INBOUND: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
-/// An accepted plaintext connection is direct: it refuses `forward_to`,
-/// which needs the ring, reads a message larger than its region in order,
-/// and answers it.
+/// An accepted plaintext connection is direct: it reads a message larger
+/// than its region in order, and answers it.
 struct InboundEcho;
 
 impl AsyncEventHandler for InboundEcho {
@@ -1782,7 +1682,6 @@ impl AsyncEventHandler for InboundEcho {
                 if !conn.is_recv_direct() {
                     return Err("an accepted plaintext connection is not direct".to_string());
                 }
-                expect_forward_to_unsupported(&mut conn).await?;
                 let mut got = Vec::new();
                 while got.len() < FWD_TOTAL {
                     let n = conn

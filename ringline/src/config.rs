@@ -140,48 +140,8 @@ pub struct Config {
     /// Most bytes of free buffers a worker keeps for direct connections to
     /// borrow. See `ConfigBuilder::recv_direct_pool_max`.
     pub(crate) recv_direct_pool_max: usize,
-    /// Aggregate low-water reserve for segmented recv (see
-    /// `docs/segmented-recv-design.md`, "Backpressure and ring safety").
-    ///
-    /// When a `Segmented` connection receives a provided buffer, the runtime
-    /// consults the shared per-worker recv ring's live free-buffer count. If
-    /// `free() <= recv_segment_reserve`, the buffer is **force-copied** into an
-    /// owned `Bytes` and its bid returned to the ring immediately instead of
-    /// being pinned as a zero-copy held segment. This
-    /// guarantees a well-behaved connection is never `ENOBUFS`-starved by other
-    /// connections holding segments under fan-in, at the cost of a copy while the
-    /// ring is under pressure. Above the reserve, delivery stays zero-copy
-    /// (pinned).
-    ///
-    /// Larger values reserve more headroom (copy sooner, safer under fan-in);
-    /// `0` force-copies only when the ring is fully drained. Tune relative to
-    /// `recv_buffer` ring_size; a value `>=` ring_size makes segmented delivery
-    /// always copy. Must be `<= 65535` (the maximum provided-ring size).
-    ///
-    /// **Default: 64** (a quarter of the default 256-buffer recv ring).
-    pub(crate) recv_segment_reserve: u32,
-    /// Per-connection cap on held receive entries (see
-    /// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd").
-    ///
-    /// A connection can hold arriving data in place or as copies until its
-    /// consumer drains it: a `forward_to` source until each buffer is written to
-    /// the sink. A slow consumer would otherwise accumulate an unbounded backlog, pinning
-    /// the shared per-worker recv ring (starving every other connection on the
-    /// worker) or growing heap copies without limit. When a connection's held
-    /// entries reach this cap (lowered to a quarter of the recv ring's buffers
-    /// for a segment hold without `recv_incremental`), the runtime stops its
-    /// recv (a one-shot recv is not re-armed, a multishot one is cancelled) so
-    /// its TCP receive window closes and only its peer stops sending; the recv
-    /// is re-armed once the hold drains below the cap. The lent receive
-    /// buffers a connection's unfinished `forward_recv_buf` sends carry are
-    /// held to the same quarter-ring cap (#638); on io_uring no TCP
-    /// connection a task can read from lends one.
-    ///
-    /// Larger values allow more recv in flight (higher single-forward throughput)
-    /// at the cost of more pinned ring buffers / held heap under a slow sink;
-    /// smaller values apply backpressure sooner. Must be `>= 1`.
-    ///
-    /// **Default: 64** (2× `MAX_IOVECS`, the per-`sendmsg` iovec bound).
+    /// Per-connection cap on received data a forward or a lend holds. See
+    /// `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
     /// Fault recv and send buffer pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
@@ -457,7 +417,6 @@ impl Default for Config {
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_direct_region: 32 * 1024,
             recv_direct_pool_max: 16 << 20,
-            recv_segment_reserve: 64,
             forward_hold_cap: 64,
             // Off by default while the trade is being measured: prefaulting
             // converts a latent memory cost into an immediate one, which is
@@ -641,18 +600,8 @@ impl Config {
             ));
         }
         self.validate_tls_slot_size()?;
-        // The provided ring can hold at most u16::MAX buffers, so a reserve above
-        // that is nonsensical (it would force-copy every segmented delivery). A
-        // reserve >= the configured ring_size is *allowed* (it simply makes
-        // segmented delivery always copy) — it is not coupled here so small rings
-        // stay valid.
-        if self.recv_segment_reserve > u16::MAX as u32 {
-            return Err(crate::error::Error::RingSetup(
-                "recv_segment_reserve must be <= 65535 (the maximum provided-ring size)".into(),
-            ));
-        }
-        // A cap of 0 would throttle a forward before it can hold its first
-        // buffer, deadlocking the forward (nothing to write, never re-armed).
+        // A cap of 0 would stop a forward's source before it queues its first
+        // send, so the forward never makes progress.
         if self.forward_hold_cap == 0 {
             return Err(crate::error::Error::RingSetup(
                 "forward_hold_cap must be >= 1".into(),
@@ -1125,29 +1074,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the aggregate low-water reserve for segmented recv.
-    ///
-    /// When the shared per-worker recv ring's free-buffer count drops to this
-    /// value or below, arriving buffers for `Segmented` connections are
-    /// force-copied into owned `Bytes` (and their bids returned to the ring
-    /// immediately) instead of being pinned as zero-copy held segments — so
-    /// connections holding segments cannot deplete the ring and `ENOBUFS`-starve
-    /// well-behaved connections under fan-in. Above the reserve, delivery stays
-    /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
-    /// relative to the `recv_buffer` ring size; must be `<= 65535`. Ignored
-    /// with `recv_incremental(true)`, where the lend cap decides.
-    ///
-    /// Default: 64 (a quarter of the default 256-buffer recv ring).
-    ///
-    /// On io_uring no connection uses this: a plaintext connection receives
-    /// directly into its accumulator (see [`connect`](crate::connect)), and a
-    /// TLS connection's segment entries are heap copies, held to the hold cap
-    /// (see [`forward_hold_cap`](Self::forward_hold_cap)).
-    pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
-        self.config.recv_segment_reserve = reserve;
-        self
-    }
-
     /// Fault buffer pages in at worker startup rather than on first use.
     ///
     /// The provided recv ring and the send copy pool are allocated zeroed,
@@ -1176,36 +1102,19 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the per-connection cap on held receive entries.
+    /// Set the per-connection cap on received data a forward or a lend holds.
     ///
-    /// A connection holds received data until its consumer drains it: a
-    /// `forward_to` source until each buffer is written to the sink. When a
-    /// connection holds this many entries the runtime
-    /// stops its recv (a one-shot recv is not re-armed, a multishot one is
-    /// cancelled), closing its TCP receive window so only its peer stops
-    /// sending, and re-arms it on an event-loop pass once the hold drains
-    /// below the cap. Without `recv_incremental` a segment hold is held to at
-    /// most a quarter of the recv ring's buffers, since each entry can pin
-    /// one. The lent receive buffers a connection's unfinished
-    /// `forward_recv_buf` sends carry are held to the same quarter-ring cap
-    /// (#638); on io_uring no TCP connection a task can read from lends one,
+    /// On mio, a [`forward_to_conn`](crate::ConnCtx::forward_to_conn) source
+    /// stops reading once its sink has this many sends queued, so its TCP
+    /// receive window closes, and reads again once the sink drains. On
+    /// io_uring, a connection whose unfinished `forward_recv_buf` sends hold
+    /// this many lent receive buffers, or a quarter of the recv ring's
+    /// buffers if that is fewer, has its recv stopped until they complete
+    /// (#638). No TCP connection a task can read from lends one on io_uring,
     /// since plaintext connections receive into their accumulators and TLS
-    /// ones copy.
-    /// Larger values allow more recv in flight at the cost of more held
-    /// copies under a slow consumer. On io_uring a TLS connection's entries
-    /// are one record's plaintext each (at most 16 KiB), apart from the bytes
-    /// buffered when the hold was entered, so its hold is about the effective
-    /// cap × 16 KiB, plus what the receives completed before the throttle
-    /// takes effect deliver (one with one-shot receives; with multishot
-    /// receives, each completion posted before the cancel is submitted) and
-    /// the entries of the write in flight. Must be `>= 1`.
+    /// ones copy. Must be `>= 1`.
     ///
-    /// Default: 64 (2× `MAX_IOVECS`).
-    ///
-    /// On io_uring only a TLS connection uses this, when it is a `forward_to`
-    /// source: a plaintext
-    /// connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
+    /// Default: 64.
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self

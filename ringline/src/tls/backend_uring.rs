@@ -36,10 +36,11 @@
 
 use std::io;
 
+use crate::accumulator::AccumulatorTable;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::handler::BuiltSend;
 
-use super::{PlaintextSink, TlsRecvResult, TlsTable};
+use super::{TlsRecvResult, TlsTable};
 
 #[cfg(feature = "tls-buffered")]
 use super::buffered;
@@ -105,20 +106,16 @@ pub(super) fn ciphertext_to_sends(
     true
 }
 
-/// Feed received ciphertext into the TLS connection, route decrypted plaintext
-/// to `sink`, and append any TLS output (handshake responses, alerts) to
+/// Feed received ciphertext into the TLS connection, append decrypted
+/// plaintext to the connection's recv accumulator, and append any TLS output (handshake responses, alerts) to
 /// `out_sends`.
 ///
 /// The output is appended whatever the outcome — an alert generated on the way
 /// to a fatal error still has to reach the peer — and the caller must queue it
 /// whatever the return value, or the pool slots leak.
-///
-/// `sink` selects where decrypted plaintext lands: the recv accumulator (the
-/// default `with_data`/`with_bytes` path) or, for a connection in the segmented
-/// recv domain, owned segments pushed to its hold (see [`PlaintextSink`]).
 pub fn feed_tls_recv(
     tls_table: &mut TlsTable,
-    sink: PlaintextSink<'_>,
+    accumulators: &mut AccumulatorTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
@@ -127,7 +124,6 @@ pub fn feed_tls_recv(
 ) -> TlsRecvResult {
     #[cfg(not(feature = "tls-buffered"))]
     {
-        let mut sink = sink;
         let Some(tls_conn) = tls_table.get_mut(conn_index) else {
             return TlsRecvResult::Closed;
         };
@@ -136,7 +132,7 @@ pub fn feed_tls_recv(
         let mut scratch = Vec::new();
         let outcome = unbuffered::feed(
             tls_conn,
-            Some(&mut sink),
+            Some(accumulators),
             &mut scratch,
             ciphertext,
             conn_index,
@@ -160,7 +156,7 @@ pub fn feed_tls_recv(
     #[cfg(feature = "tls-buffered")]
     buffered::feed_tls_recv_buffered(
         tls_table,
-        sink,
+        accumulators,
         send_copy_pool,
         conn_index,
         generation,

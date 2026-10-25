@@ -71,17 +71,6 @@ pub enum OpTag {
     /// accumulator (the provided ring is smaller than one response).
     /// Payload = fallback pool slot to release on completion.
     RecvFallback = 28,
-    /// Segmented-recv Mode A forward write: a `write`/`send` whose source is a
-    /// held provided recv buffer (or an owned copy), written directly to an
-    /// arbitrary sink fd (socket or buffered file). One write in flight per
-    /// connection (tracked in `Driver::forward_write`). Payload = the
-    /// connection generation at submit time (validates stale completions).
-    ForwardWrite = 29,
-    /// Plain `send` of the first unsent bytes of a forward write to a socket
-    /// or connection sink whose `sendmsg` returned `-EAGAIN`; see
-    /// `SendMsgCoalescedDrain`. Payload = the connection generation at submit
-    /// time.
-    ForwardWriteDrain = 30,
     /// Multishot accept on a listener the worker owns (merged accept mode).
     /// The `conn_index` field carries the **listener index**, not a
     /// connection: no slot exists yet when the SQE is submitted. Payload
@@ -157,8 +146,6 @@ impl OpTag {
             24 => Some(OpTag::SendMsgCoalesced),
             25 => Some(OpTag::SendMsgCoalescedDrain),
             28 => Some(OpTag::RecvFallback),
-            29 => Some(OpTag::ForwardWrite),
-            30 => Some(OpTag::ForwardWriteDrain),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
             33 => Some(OpTag::CloseShutdown),
@@ -205,8 +192,6 @@ impl OpTag {
             OpTag::SendMsgCoalesced => "send_msg_coalesced",
             OpTag::SendMsgCoalescedDrain => "send_msg_coalesced_drain",
             OpTag::RecvFallback => "recv_fallback",
-            OpTag::ForwardWrite => "forward_write",
-            OpTag::ForwardWriteDrain => "forward_write_drain",
             OpTag::AcceptMulti => "accept_multi",
             OpTag::ParkInstall => "park_install",
             OpTag::CloseShutdown => "close_shutdown",

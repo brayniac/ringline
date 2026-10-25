@@ -2,6 +2,9 @@
 
 Note (2026-10-25): `SegmentReader` was removed.
 
+Note (2026-10-25): `forward_to` was removed, with the segment hold
+(`segment_hold`) and Mode A forward writes.
+
 - **Status:** proposal — intent only, nothing implemented
 - **Motivated by:** the single-listener limit found while reviewing whether
   `Connection` should split per transport

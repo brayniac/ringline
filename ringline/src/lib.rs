@@ -295,7 +295,7 @@ pub use runtime::io::Elapsed;
 /// Future returned by the mio [`ConnCtx::forward_to_conn()`] (copy path).
 #[cfg(not(has_io_uring))]
 pub use runtime::io::ForwardToConnFuture;
-/// Future returned by [`ConnCtx::forward_to()`] (segmented recv, Mode A).
+/// Future returned by the io_uring [`ConnCtx::forward_to_conn()`].
 #[cfg(has_io_uring)]
 pub use runtime::io::ForwardToFuture;
 /// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
@@ -312,9 +312,6 @@ pub use runtime::io::ResolveFuture;
 pub use runtime::io::SendFuture;
 /// The single-owner write side of a connection, from [`Connection::split()`] or [`ConnCtx::take_send()`].
 pub use runtime::io::SendHalf;
-/// Non-raw sink descriptor for [`ConnCtx::forward_to()`] (segmented recv, Mode A).
-#[cfg(has_io_uring)]
-pub use runtime::io::SinkFd;
 /// Future returned by [`sleep()`].
 pub use runtime::io::SleepFuture;
 /// Builder for an outbound TCP connection, from [`connect`].

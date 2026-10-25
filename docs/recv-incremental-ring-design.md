@@ -4,6 +4,9 @@ Note (2026-10-25): the receive views (#677), `with_bytes_segments` (#678),
 and `recv_zc_threshold` and `copy_small_view` (#679) were removed with the
 segment readers.
 
+Note (2026-10-25): `forward_to` (Mode A), the segment hold
+(`segment_hold`, `HeldRecvBuf`) and `recv_segment_reserve` were removed.
+
 Status: steps 0, 2 and 3 are implemented (#632, #633), and step 4 behind
 `recv_incremental` (#634–#636; 4b-2's recv-forward and direct-echo paths
 were removed in 0.7.0-alpha.5). Steps 1, 5, 6 and 7 are not. The receive

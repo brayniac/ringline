@@ -3,7 +3,7 @@
 //! Writes continuously and never reads, because the workload under test is
 //! one-way relay: client -> proxy -> drain. The proxy's forward path is the
 //! only thing between the two, which is the point — a request/response client
-//! would put a response path in the measurement that `forward_to` has no part
+//! would put a response path in the measurement that `forward_to_conn` has no part
 //! in.
 //!
 //! Throughput is bytes accepted by the kernel over the measurement window.

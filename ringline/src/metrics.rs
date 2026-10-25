@@ -225,7 +225,7 @@ pub mod park_diag {
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
-/// Slots 2 and 10 are unused.
+/// Slots 2, 8 and 10 are unused.
 /// Nothing is collapsed: an earlier version grouped the variants believed
 /// unreachable at the install re-check into a single `other_blocker`, and that
 /// slot then absorbed 97.8% of abandonments (18,844 of 19,268 in a saturated
@@ -250,8 +250,7 @@ pub mod park_abandon {
     pub const CLOSING: usize = 6;
     /// Queued or in-flight sends hold this worker's pool slots.
     pub const SENDS: usize = 7;
-    /// A Mode A forward write is in flight.
-    pub const FORWARD_WRITE: usize = 8;
+    // Slot 8 has no blocker.
     /// A send chain has SQEs in the kernel.
     pub const CHAIN: usize = 9;
     // Slot 10 has no blocker.
@@ -315,8 +314,7 @@ pub mod recv_ring {
     pub const LEND_REFUSED: usize = 2;
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
-    /// moves), prepended to it, or copied into an owned `segment_hold` entry,
-    /// and TLS plaintext the unbuffered engine stashes when the send path
+    /// moves) or prepended to it, and TLS plaintext the unbuffered engine stashes when the send path
     /// decrypts it. Ciphertext staged for TLS is not counted.
     pub const BYTES_COPIED: usize = 3;
     pub const COUNT: usize = 4;
@@ -425,11 +423,8 @@ pub mod pool {
     /// degradation path that keeps draining the socket when a single
     /// response exceeds the provided ring.
     pub const RECV_FALLBACK: usize = 5;
-    /// A connection holding received data (a `forward_to` source, or a
-    /// connection whose `forward_recv_buf` sends are unfinished)
-    /// reached its hold cap
-    /// (`forward_hold_cap`, lowered as `ConfigBuilder::forward_hold_cap` says)
-    /// and had its recv stopped (a one-shot recv not re-armed, a multishot one
+    /// A connection holding received data reached its hold cap and had its
+    /// recv stopped (a one-shot recv not re-armed, a multishot one
     /// cancelled), so its TCP window closes and its peer is backpressured;
     /// the recv is re-armed once the hold drains below the cap. Sustained counts
     /// mean a consumer is slower than its peer for large
@@ -577,11 +572,6 @@ pub fn init_metadata() {
     PARK_ABANDONED.insert_metadata(park_abandon::TLS_SESSION, "op".into(), "tls_session".into());
     PARK_ABANDONED.insert_metadata(park_abandon::CLOSING, "op".into(), "closing".into());
     PARK_ABANDONED.insert_metadata(park_abandon::SENDS, "op".into(), "sends".into());
-    PARK_ABANDONED.insert_metadata(
-        park_abandon::FORWARD_WRITE,
-        "op".into(),
-        "forward_write".into(),
-    );
     PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());
     PARK_ABANDONED.insert_metadata(
         park_abandon::RECV_FALLBACK,
@@ -858,7 +848,7 @@ mod cqe_tag_tests {
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 1, 17, 26 and 27 have no `OpTag` variant.
+    /// Slots 1, 17, 26, 27, 29 and 30 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
@@ -866,7 +856,7 @@ mod cqe_tag_tests {
             .collect();
         assert_eq!(
             unused,
-            vec![1, 17, 26, 27],
+            vec![1, 17, 26, 27, 29, 30],
             "unexpected unused CQE_BY_TAG slots"
         );
     }

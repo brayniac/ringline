@@ -4,8 +4,6 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-#[cfg(has_io_uring)]
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -604,9 +602,8 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// flight, for example after a parked read was dropped, the buffered bytes
 /// are in that receive's buffer and `try_with_data` returns `None`.
 ///
-/// `forward_to`, which needs the provided-buffer ring, is refused on such a
-/// connection with [`io::ErrorKind::Unsupported`]. `forward_to_conn` sends
-/// from the accumulator (see [`ConnCtx::forward_to_conn`]).
+/// `forward_to_conn` sends from the accumulator (see
+/// [`ConnCtx::forward_to_conn`]).
 ///
 /// A receive into the accumulator is armed only when a read parks.
 /// A poll for `POLLRDHUP`, armed when the connection opens, completes on a
@@ -914,10 +911,7 @@ pub fn request_shutdown() -> io::Result<()> {
 /// through [`RecvHalf`], writing through [`SendHalf`], and neither is `Copy`.
 ///
 /// `ConnCtx` is `Copy` because it carries no I/O capability. A copyable handle
-/// that did carry one allowed two tasks to write to a single socket, which for
-/// a forward sink means interleaved SQEs on the wire, because a forward submits
-/// its own SQE rather than going through the connection's send queue (Domain
-/// Invariant 2).
+/// that did carry one allowed two tasks to write to a single socket.
 ///
 /// A `ConnCtx` identifies a connection (`token`, `index`, `peer_addr`,
 /// `is_outbound`, `is_alive`, `tls_info`), manages its lifecycle (`close`,
@@ -935,10 +929,10 @@ pub fn request_shutdown() -> io::Result<()> {
 /// send/identity/lifecycle handle plus a way to *obtain* the read side
 /// ([`take_recv`](Self::take_recv), [`split`](Self::split)).
 ///
-/// The forwarding entry points (`forward_to`, `forward_to_conn`) stay public.
-/// Their own "one forward at a time" rule is refused at runtime by the driver, and that refusal stays reachable — and therefore testable —
-/// only through this handle, because `&mut RecvHalf` turns a second concurrent
-/// forward into a compile error.
+/// `forward_to_conn` stays public. Its "one forward at a time" rule is
+/// refused at runtime by the driver, and that refusal is reachable, and so
+/// testable, only through this handle, because `&mut RecvHalf` turns a second
+/// concurrent forward into a compile error.
 ///
 /// Both accepted and outbound connections are delivered as a [`Connection`]:
 /// accepted ones in
@@ -1257,8 +1251,8 @@ impl ConnCtx {
     /// Take this connection's exclusive **recv half**.
     ///
     /// The recv side of a connection is exclusive: its entry points
-    /// (`with_data`, `with_data_result`, `with_bytes`, `recv_ready`,
-    /// `forward_to` and `forward_to_conn`) all drive one
+    /// (`with_data`, `with_data_result`, `with_bytes`, `recv_ready` and
+    /// `forward_to_conn`) all drive one
     /// stream and none of them may run
     /// concurrently with another. `ConnCtx` is `Copy`, so that exclusivity
     /// cannot be owned — every rule has to be re-checked at run time, and the
@@ -1438,227 +1432,6 @@ impl ConnCtx {
             conn_index: self.conn_index,
             generation: self.generation,
             f: Some(f),
-        }
-    }
-
-    /// Put this connection into the Mode A forwarding state: switch delivery to
-    /// the segmented domain, mark it a forwarder, and move anything already
-    /// buffered into the hold.
-    ///
-    /// That last step is what makes a proxy expressible. The length a forward
-    /// needs comes from a header, and reading a header means `with_data`,
-    /// which leaves the rest of the segment sitting in the accumulator. Those
-    /// bytes are the front of the forward; leaving them behind would strand
-    /// them and shift the stream by however much arrived with the header.
-    #[cfg(has_io_uring)]
-    /// Install a Mode A forward on this connection, or refuse it.
-    ///
-    /// The refusals mirror the mio sibling's, which stated the contract for
-    /// both backends while only one enforced it: a forward already running is
-    /// `EBUSY`, a stale source or sink slot is `EPIPE`, and a TLS sink is
-    /// `EPROTOTYPE`. That last one matters most — a forward writes bytes to
-    /// the sink as they are, with nothing on the path to encrypt them, so
-    /// forwarding into a TLS connection would put plaintext on the wire.
-    ///
-    /// Every check happens **before** any state is touched, so a refusal
-    /// leaves an in-progress forward and the recv domain exactly as they were.
-    /// `sink_owned` says the caller presented the sink's [`SendHalf`] by
-    /// mutable borrow, which *is* the permission to write to it and, for as
-    /// long as the forward future lives, the proof nobody else can. When the
-    /// sink is named by a bare `ConnCtx` instead, there is no such proof, so
-    /// the claim is checked below.
-    fn arm_forward_source(
-        &self,
-        target: crate::backend::uring::driver::SinkTarget,
-        len: u64,
-        sink_owned: bool,
-    ) -> Result<u32, i32> {
-        with_state(|driver, _executor| {
-            let idx = self.conn_index as usize;
-            // A stale source owns nothing worth settling — its slot has already
-            // been recycled, and touching it would reach a different connection.
-            // Teardown released its buffers when the slot was cleared.
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return Err(libc::EPIPE);
-            }
-            // Arming over a running forward would strand its held bids and
-            // hand its caller a result belonging to someone else. The running
-            // forward owns this connection's hold, so leave it strictly alone.
-            if driver.forward_progress[idx].is_some() {
-                return Err(libc::EBUSY);
-            }
-            // A direct forward from this connection is running.
-            if driver
-                .connections
-                .get(self.conn_index)
-                .is_some_and(|c| c.direct_forwarding)
-            {
-                return Err(libc::EBUSY);
-            }
-            // A direct connection's bytes go to its accumulator, not to a
-            // hold a forward could send from.
-            if is_recv_direct(driver, self.conn_index) {
-                return Err(libc::EOPNOTSUPP);
-            }
-            // Sink-side refusals: the source is live and no forward owns its
-            // hold, so anything already held would be stranded — the provided
-            // buffer leaked per attempt that
-            // `forward_to_conn_refuses_a_recycled_sink_slot` exists to catch.
-            // Before these checks moved to arm time the write path refused and
-            // released the backing on the way out; settling here is what keeps
-            // that true. `settle_forward_end` returns the bytes to the
-            // accumulator, replenishes the bids, and resets the delivery
-            // domain, which is what a connection that is not forwarding wants.
-            if let crate::backend::uring::driver::SinkTarget::Conn { index, generation } = target {
-                let refusal = if driver.connections.generation(index) != generation {
-                    Some(libc::EPIPE)
-                } else if driver.tls_table.as_ref().is_some_and(|t| t.has(index)) {
-                    Some(libc::EPROTOTYPE)
-                } else if !sink_owned && driver.send_half_taken[index as usize] {
-                    // Somebody else owns this sink's writes. A forward submits
-                    // its own SQE straight to the ring rather than going
-                    // through the sink's send queue, so their sends and these
-                    // writes would interleave on one socket — and io_uring
-                    // does not order independent SQEs (Domain Invariant 2).
-                    // This is the "forward *or* send, not both" rule, enforced
-                    // for the first time.
-                    Some(libc::EBUSY)
-                } else {
-                    None
-                };
-                if let Some(errno) = refusal {
-                    if !driver.settle_forward_end(self.conn_index) {
-                        driver.close_connection(self.conn_index);
-                    }
-                    return Err(errno);
-                }
-            }
-            // The driver owns the forward from here: it submits each write from
-            // the completion handler, so the task is woken once at the end
-            // rather than once per provided buffer.
-            let epoch = driver.forward_epoch[idx].wrapping_add(1);
-            driver.forward_epoch[idx] = epoch;
-            driver.forward_progress[idx] = Some(crate::backend::uring::driver::ForwardProgress {
-                target,
-                len,
-                forwarded: 0,
-                epoch,
-            });
-            // A result left by the slot's previous occupant is not this
-            // forward's.
-            driver.forward_done[idx] = None;
-            driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
-            driver.forward_recv_active[idx] = true;
-            if !driver.accumulators.is_empty(self.conn_index) {
-                let buffered = driver.accumulators.take_frozen(self.conn_index);
-                driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
-            }
-            // The plaintext path holds the most recent provided buffer in
-            // place rather than copying it (the zero-copy `with_data` read),
-            // so buffered bytes can be sitting *behind* an empty accumulator.
-            // They are the newest, hence the back of the hold. Missing them
-            // stranded the buffer for good: a forward never reads this slot,
-            // and the bid it pins is only replenished when the slot is
-            // cleared, so the ring lost an entry too.
-            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
-                // SAFETY: the slot owns an unreplenished provided buffer with
-                // `len` bytes received into it; taking the slot transfers that
-                // ownership here, and the bid goes back at the same moment the
-                // copy is made.
-                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                driver.segment_hold[idx].push_back(crate::backend::HeldRecvBuf::Owned(
-                    Bytes::copy_from_slice(data),
-                ));
-                crate::accumulator::note_copied(data.len());
-                driver.pending_replenish.push(pending.bid);
-            }
-            // The forward is driven from completions, so a TLS source's
-            // receive is armed here; the segmented domain re-arms it.
-            driver.arm_tls_recv_if_idle(self.conn_index);
-            Ok(epoch)
-        })
-    }
-
-    /// Forward the next `len` received bytes to `sink` (Mode A; see
-    /// `docs/segmented-recv-design.md`).
-    ///
-    /// The source must be a TLS connection; a plaintext connection is refused
-    /// (see Errors). The connection enters the segmented delivery domain:
-    /// rustls' plaintext is copied into entries held driver-side as it is
-    /// decrypted, and the ciphertext buffers go back to the provided ring when
-    /// rustls reads them. The held entries are written to `sink`, a socket
-    /// (`sendmsg` with `MSG_WAITALL`) or a buffered file (`writev` at an offset
-    /// that advances from 0), gathering up to 16 entries per write.
-    ///
-    /// Writes to `sink` are strictly serialized, one in flight at a time, so the
-    /// byte stream cannot be reordered (io_uring does not order independent SQEs).
-    ///
-    /// Bytes already buffered on this connection when the forward starts
-    /// (typically the bytes that arrived after the length header in the same
-    /// read) are the front of the forward and are moved into the hold, not left
-    /// behind in the accumulator.
-    ///
-    /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
-    /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
-    /// forward is truncated (any received-but-unwritten tail is dropped as the
-    /// connection unwinds). After the forward the delivery domain is reset to the
-    /// default, and any bytes received *past* `len` are preserved at the front of
-    /// the accumulator for the next `with_data`/`with_bytes` read.
-    ///
-    /// # Backpressure
-    ///
-    /// The source stops receiving once the entries waiting in its hold reach
-    /// the hold cap
-    /// ([`ConfigBuilder::forward_hold_cap`](crate::ConfigBuilder::forward_hold_cap)
-    /// entries; without `recv_incremental`, at most a quarter of the receive
-    /// ring's buffers), so a sink slower than the source closes the source's
-    /// TCP window. The up to 16 entries the write in flight carries are not
-    /// counted. Each entry after the first is one TLS record's plaintext, at
-    /// most 16 KiB; the first holds whatever was buffered when the forward
-    /// started. The source receives again once the sink drains the hold below
-    /// the cap.
-    ///
-    /// # Sink ownership
-    ///
-    /// [`SinkFd`] borrows the target descriptor for the forward's lifetime (it is
-    /// **not** a bare `RawFd` the caller can close mid-forward — that would be a
-    /// use-after-close, since an in-flight write would land on a recycled fd). The
-    /// returned future borrows the `SinkFd`, so the borrow checker keeps the fd
-    /// open until the forward resolves.
-    ///
-    /// # NVMe / `O_DIRECT`
-    ///
-    /// Not supported: the held entries are unaligned heap buffers, so
-    /// `O_DIRECT`'s alignment contract cannot be met without an intermediate
-    /// aligned copy. [`SinkFd::file`] rejects an `O_DIRECT` descriptor with
-    /// [`io::ErrorKind::InvalidInput`].
-    ///
-    /// io_uring only.
-    ///
-    /// # Errors
-    ///
-    /// Refused at the call, resolving on the first poll without having
-    /// installed anything: `EOPNOTSUPP` on a plaintext connection, which
-    /// receives directly into its accumulator (see [`connect`]); `EBUSY` if a
-    /// forward is already running on this connection; `EPIPE` if this
-    /// connection's slot is already stale. (The
-    /// sink is a borrowed descriptor, so the sink-side `EPIPE`/`EPROTOTYPE`
-    /// of [`forward_to_conn`](Self::forward_to_conn) do not apply.)
-    #[cfg(has_io_uring)]
-    pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
-        let target = crate::backend::uring::driver::SinkTarget::Fd {
-            fd: sink.fd,
-            is_file: sink.is_file,
-        };
-        // An fd sink is not a connection, so it carries no send claim to check.
-        let armed = self.arm_forward_source(target, len as u64, true);
-        ForwardToFuture {
-            conn_index: self.conn_index,
-            generation: self.generation,
-            epoch: armed.unwrap_or(0),
-            refused: armed.err(),
-            direct: None,
-            _borrow: PhantomData,
         }
     }
 
@@ -1870,11 +1643,8 @@ impl ConnCtx {
     /// Forward the next `len` received bytes to **another connection on this
     /// worker**.
     ///
-    /// The proxy form of `forward_to`. Where `forward_to`
-    /// names its sink as a borrowed descriptor, this names it as a
-    /// [`ConnCtx`] — which is what makes a *bidirectional* proxy expressible:
-    /// the return direction needs the client named as a sink, and a
-    /// connection's descriptor is deliberately not public.
+    /// The sink is named by its [`ConnCtx`], so a bidirectional proxy runs
+    /// one forward in each direction.
     ///
     /// ```ignore
     /// let backend = ringline::connect(addr)?.await?;
@@ -1934,31 +1704,15 @@ impl ConnCtx {
     /// submitted go out and leaves the rest buffered.
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
-        let target = crate::backend::uring::driver::SinkTarget::Conn {
-            index: sink.conn_index,
-            generation: sink.generation,
-        };
-        if let Some(direct) = self.direct_forward(sink.conn_index, sink.generation, len, false) {
-            return direct;
-        }
-        let armed = self.arm_forward_source(target, len as u64, false);
-        ForwardToFuture {
-            conn_index: self.conn_index,
-            generation: self.generation,
-            epoch: armed.unwrap_or(0),
-            refused: armed.err(),
-            direct: None,
-            _borrow: PhantomData,
-        }
+        self.direct_forward(sink.conn_index, sink.generation, len, false)
     }
 
     /// A forward from this connection to the sink connection that sends from
-    /// this connection's accumulator, if it is a plaintext source or a TLS
-    /// source with no `forward_to` running; `None` otherwise.
-    /// Refuses the same conditions as `arm_forward_source`: a forward already
-    /// running from this connection (`EBUSY`), a stale sink (`EPIPE`), a TLS
-    /// sink (`EPROTOTYPE`), and, unless the caller holds the sink's
-    /// [`SendHalf`], a sink whose send half is claimed (`EBUSY`).
+    /// this connection's accumulator. Refuses, resolving on the first poll: a
+    /// forward already running from this connection (`EBUSY`), a stale source
+    /// or sink (`EPIPE`), a TLS sink (`EPROTOTYPE`), and, unless the caller
+    /// holds the sink's [`SendHalf`], a sink whose send half is claimed
+    /// (`EBUSY`).
     #[cfg(has_io_uring)]
     fn direct_forward<'a>(
         &self,
@@ -1966,23 +1720,11 @@ impl ConnCtx {
         sink_generation: u32,
         len: usize,
         sink_owned: bool,
-    ) -> Option<ForwardToFuture<'a>> {
+    ) -> ForwardToFuture<'a> {
         let refusal = with_state(|driver, _| {
-            // A TLS source's plaintext lands in its accumulator too, so it
-            // forwards the same way. While a `forward_to` runs from it (the
-            // segmented domain), `arm_forward_source` refuses with `EBUSY`.
-            let idx = self.conn_index as usize;
-            let tls_source = driver
-                .tls_table
-                .as_ref()
-                .is_some_and(|t| t.has(self.conn_index))
-                && driver.forward_progress[idx].is_none();
-            if driver.connections.generation(self.conn_index) != self.generation
-                || !(is_recv_direct(driver, self.conn_index) || tls_source)
-            {
-                return None;
-            }
-            let refusal = if driver
+            let refusal = if driver.connections.generation(self.conn_index) != self.generation {
+                Some(libc::EPIPE)
+            } else if driver
                 .connections
                 .get(self.conn_index)
                 .is_some_and(|c| c.direct_forwarding)
@@ -2002,12 +1744,11 @@ impl ConnCtx {
             {
                 cs.direct_forwarding = true;
             }
-            Some(refusal)
-        })?;
-        Some(ForwardToFuture {
+            refusal
+        });
+        ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
-            epoch: 0,
             refused: refusal,
             direct: refusal.is_none().then_some(DirectForward {
                 sink_index,
@@ -2017,7 +1758,7 @@ impl ConnCtx {
                 in_flight: None,
             }),
             _borrow: PhantomData,
-        })
+        }
     }
 
     /// Forward the next `len` received bytes to another connection on this
@@ -2751,9 +2492,7 @@ impl<'a> MioSendBuilder<'a> {
 // ── WithDataFuture ───────────────────────────────────────────────────
 
 /// Whether `conn_index` receives directly into its accumulator (a plaintext
-/// TCP or Unix connection). Such a connection has no
-/// receive from the provided-buffer ring, so `forward_to`, which holds ring
-/// buffers, is refused on it.
+/// TCP or Unix connection).
 #[cfg(has_io_uring)]
 fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
     driver
@@ -2785,19 +2524,12 @@ pub(crate) fn park_recv(
     }
 }
 
-/// Register the current task as `conn_index`'s receive waiter for a Mode A
-/// forward on io_uring or a `forward_to_conn` on mio, which wait outside
-/// [`park_recv`]. On io_uring, also arm a TLS connection's receive if
-/// none is armed.
-fn park_segment_waiter(
-    #[allow(unused_variables)] driver: &mut Driver,
-    executor: &mut Executor,
-    conn_index: u32,
-) {
+/// Register the current task as `conn_index`'s receive waiter for a mio
+/// `forward_to_conn`, which waits outside [`park_recv`].
+#[cfg(not(has_io_uring))]
+fn park_forward_waiter(executor: &mut Executor, conn_index: u32) {
     executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
     executor.recv_waiters[conn_index as usize] = true;
-    #[cfg(has_io_uring)]
-    driver.arm_tls_recv_if_idle(conn_index);
 }
 
 /// Future returned by [`Connection::with_data`].
@@ -3199,8 +2931,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 /// borrow**. On io_uring two methods do that, and for them the conflict is a
 /// compile error rather than a runtime refusal:
 ///
-/// - `forward_to` / [`forward_to_conn`](Self::forward_to_conn)
-///   — return `ForwardToFuture<'_>`
+/// - [`forward_to_conn`](Self::forward_to_conn) — returns `ForwardToFuture<'_>`
 ///
 /// The rest — `with_data`, `with_data_result`, `with_bytes`, `recv_ready` —
 /// return futures built from
@@ -3214,7 +2945,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 ///
 /// ```ignore
 /// let mut rx = conn.take_recv()?;
-/// let mut f = rx.forward_to(&sink, len);
+/// let mut f = rx.forward_to_conn(&mut sink, len);
 /// rx.with_data(|_| ParseResult::Consumed(0)).await;  // compile error
 /// ```
 ///
@@ -3224,8 +2955,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 /// exclusivity rule ("forward *or* send, not both") that this step does not yet
 /// enforce. See `docs/connection-handle-ownership-design.md`.
 ///
-/// Available on both backends. `forward_to` is io_uring only, as it is on
-/// [`ConnCtx`].
+/// Available on both backends.
 pub struct RecvHalf {
     conn: ConnCtx,
     /// Same reason as [`ConnCtx`]: pinned to its owning worker thread.
@@ -3298,16 +3028,6 @@ impl RecvHalf {
         self.conn.recv_ready()
     }
 
-    /// See [`ConnCtx::forward_to`].
-    #[cfg(has_io_uring)]
-    pub fn forward_to<'h, 's: 'h>(
-        &'h mut self,
-        sink: &'s SinkFd<'s>,
-        len: usize,
-    ) -> ForwardToFuture<'h> {
-        self.conn.forward_to(sink, len)
-    }
-
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
@@ -3319,25 +3039,8 @@ impl RecvHalf {
         sink: &'s mut SendHalf,
         len: usize,
     ) -> ForwardToFuture<'h> {
-        let target = crate::backend::uring::driver::SinkTarget::Conn {
-            index: sink.conn.conn_index,
-            generation: sink.conn.generation,
-        };
-        if let Some(direct) =
-            self.conn
-                .direct_forward(sink.conn.conn_index, sink.conn.generation, len, true)
-        {
-            return direct;
-        }
-        let armed = self.conn.arm_forward_source(target, len as u64, true);
-        ForwardToFuture {
-            conn_index: self.conn.conn_index,
-            generation: self.conn.generation,
-            epoch: armed.unwrap_or(0),
-            refused: armed.err(),
-            direct: None,
-            _borrow: PhantomData,
-        }
+        self.conn
+            .direct_forward(sink.conn.conn_index, sink.conn.generation, len, true)
     }
 
     /// Forward the next `len` received bytes into another connection.
@@ -3491,16 +3194,6 @@ impl Connection {
     /// `FuturesUnordered`, never re-polls it.
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.rx.recv_ready()
-    }
-
-    /// See [`ConnCtx::forward_to`].
-    #[cfg(has_io_uring)]
-    pub fn forward_to<'h, 's: 'h>(
-        &'h mut self,
-        sink: &'s SinkFd<'s>,
-        len: usize,
-    ) -> ForwardToFuture<'h> {
-        self.rx.forward_to(sink, len)
     }
 
     /// See [`ConnCtx::forward_to_conn`].
@@ -3917,79 +3610,7 @@ impl Drop for RecvHalf {
     }
 }
 
-// ── Segmented recv (Mode A — Forward to an fd) ───────────────────────
-
-/// A non-raw sink descriptor for [`ConnCtx::forward_to`] (Mode A — "Forward";
-/// see `docs/segmented-recv-design.md`).
-///
-/// Wraps a [`BorrowedFd`] so the descriptor is guaranteed open for the forward's
-/// lifetime — deliberately **not** a bare [`RawFd`] the caller could close
-/// mid-forward, which would be a use-after-close (an in-flight write landing on a
-/// recycled fd; generation guards ring *slots*, not caller fds). The
-/// [`forward_to`](ConnCtx::forward_to) future borrows the `SinkFd`, so the borrow
-/// checker keeps the fd alive until the forward resolves.
-///
-/// Two sink kinds are supported:
-/// - [`socket`](Self::socket): a stream socket.
-/// - [`file`](Self::file): a buffered regular file (written at an offset).
-///
-/// `O_DIRECT` / NVMe sinks are not supported (the held entries are
-/// unaligned) and are rejected by [`file`](Self::file).
-#[cfg(has_io_uring)]
-#[derive(Debug)]
-pub struct SinkFd<'a> {
-    fd: RawFd,
-    /// Seekable buffered file (`writev` at an advancing offset) vs. stream
-    /// socket (`sendmsg` with `MSG_WAITALL`, no offset).
-    is_file: bool,
-    /// Ties this handle to the borrowed descriptor's lifetime.
-    _borrow: PhantomData<BorrowedFd<'a>>,
-}
-
-#[cfg(has_io_uring)]
-impl<'a> SinkFd<'a> {
-    /// A socket sink. Forwarded bytes are written with
-    /// `sendmsg`(`MSG_WAITALL`), so the kernel retries short stream sends in
-    /// place.
-    pub fn socket(fd: BorrowedFd<'a>) -> Self {
-        SinkFd {
-            fd: fd.as_raw_fd(),
-            is_file: false,
-            _borrow: PhantomData,
-        }
-    }
-
-    /// A buffered file sink. Forwarded bytes are written with `writev` at
-    /// an offset that advances from 0 as bytes are forwarded; short writes
-    /// resubmit the remainder at the advanced offset.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`io::ErrorKind::InvalidInput`] if the descriptor was opened with
-    /// `O_DIRECT`: the held entries are unaligned heap buffers, so `O_DIRECT`'s
-    /// alignment contract cannot be met without an intermediate aligned copy.
-    /// Use a buffered file.
-    pub fn file(fd: BorrowedFd<'a>) -> io::Result<Self> {
-        let raw = fd.as_raw_fd();
-        // Reject O_DIRECT: unaligned held entries cannot be its source.
-        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if flags & libc::O_DIRECT != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "O_DIRECT sink is not supported for zero-copy forward (provided \
-                 buffers are unaligned); use a buffered file",
-            ));
-        }
-        Ok(SinkFd {
-            fd: raw,
-            is_file: true,
-            _borrow: PhantomData,
-        })
-    }
-}
+// ── Forwarding to a connection ───────────────────────────────────────
 
 /// Future returned by the mio [`ConnCtx::forward_to_conn`]. Parks on the
 /// source's recv waiter slot; the event loop resolves it by writing into
@@ -4028,7 +3649,7 @@ impl Future for ForwardToConnFuture<'_> {
                 let forwarded = driver.forward_conn[idx].take().map_or(0, |st| st.forwarded);
                 return Poll::Ready(Ok(forwarded as usize));
             }
-            park_segment_waiter(driver, executor, idx as u32);
+            park_forward_waiter(executor, idx as u32);
             Poll::Pending
         })
     }
@@ -4059,26 +3680,20 @@ impl Drop for ForwardToConnFuture<'_> {
     }
 }
 
-/// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
-/// that forwards `len` received bytes to the sink, one serialized write at a
-/// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
-/// whole forward.
+/// Future returned by the io_uring [`ConnCtx::forward_to_conn`] and
+/// [`RecvHalf::forward_to_conn`]. Borrows the sink (`'a`) so it cannot be
+/// dropped mid-forward.
 #[cfg(has_io_uring)]
 pub struct ForwardToFuture<'a> {
     conn_index: u32,
     generation: u32,
-    /// Which forward on this connection this future owns; see
-    /// [`ForwardProgress::epoch`]. Drop cancels only its own. Meaningless
-    /// when `refused` is set, which is why Drop checks that first.
-    epoch: u32,
     /// Set when the forward could not be installed at all — a forward already
     /// running (`EBUSY`), a stale source or sink slot (`EPIPE`), or a TLS sink
     /// (`EPROTOTYPE`). Reported on the first poll; nothing was mutated.
     refused: Option<i32>,
-    /// Set for a forward that sends from the source's accumulator.
+    /// The running forward; `None` once it resolved or if it was refused.
     direct: Option<DirectForward>,
-    /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
-    /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
+    /// Ties the future to the sink the caller borrowed.
     _borrow: PhantomData<&'a ()>,
 }
 
@@ -4238,61 +3853,12 @@ impl DirectForward {
 
 #[cfg(has_io_uring)]
 impl Drop for ForwardToFuture<'_> {
-    /// Cancel a forward that is dropped before it resolves.
-    ///
-    /// Gathering moved submission out of `poll` and into
-    /// `handle_forward_write`, so the driver now advances a forward on its own
-    /// once armed. Before that, dropping this future stopped the relay for
-    /// free: nothing popped the hold unless someone polled. Now a `select!`
-    /// that loses, or a `timeout` that fires, would otherwise leave bytes
-    /// streaming to a sink with nobody waiting on the result — and leave the
-    /// connection in the segmented recv domain, so the caller's next
-    /// `with_data` would park while its bytes went to the sink.
-    ///
-    /// The in-flight write is deliberately *not* touched: its backing buffers
-    /// are being read by the kernel, and returning those bids to the provided
-    /// ring here would let an arriving packet overwrite a `sendmsg` in
-    /// progress. Its CQE releases them exactly once, and with the progress
-    /// cleared `advance_forward` submits no successor — so what is already
-    /// queued completes, and no further bytes are taken from the source. That
-    /// is the same contract the mio sibling documents.
-    ///
-    /// Held-but-not-yet-written bytes go to the accumulator rather than being
-    /// dropped, via the same `settle_forward_end` the normal end of a forward
-    /// uses — so a cancel loses no data the peer already sent.
+    /// A chunk already submitted to the sink goes out; the rest stays
+    /// buffered on the source.
     fn drop(&mut self) {
-        // A direct forward holds nothing in the driver: a chunk already on
-        // its way to the sink goes out, and the rest stays buffered.
         if self.direct.is_some() {
             end_direct_forward(self.conn_index, self.generation);
-            return;
         }
-        // A refused forward installed nothing — in particular it may have been
-        // refused *because* another forward is running, which this must not
-        // cancel.
-        if self.refused.is_some() {
-            return;
-        }
-        let _ = try_with_state(|driver, _executor| {
-            let idx = self.conn_index as usize;
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return;
-            }
-            // Only cancel *this* forward. A future dropped after its own
-            // forward resolved must not settle a later one that armed on the
-            // same connection in between.
-            let mine = driver.forward_progress[idx].is_some_and(|p| p.epoch == self.epoch);
-            if !mine {
-                return;
-            }
-            driver.forward_progress[idx] = None;
-            driver.forward_done[idx] = None;
-            if !driver.settle_forward_end(self.conn_index) {
-                // Accumulator overflow settling the tail: the bytes have
-                // nowhere to go, so the connection cannot continue.
-                driver.close_connection(self.conn_index);
-            }
-        });
     }
 }
 
@@ -4302,59 +3868,17 @@ impl Future for ForwardToFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if let Some(errno) = me.refused {
+        let Some(direct) = me.direct.as_mut() else {
+            // Refused at the call, or polled again after resolving.
+            let errno = me.refused.unwrap_or(libc::EPIPE);
             return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
+        };
+        let poll = direct.poll(me.conn_index, me.generation, cx);
+        if poll.is_ready() {
+            me.direct = None;
+            end_direct_forward(me.conn_index, me.generation);
         }
-        if let Some(direct) = me.direct.as_mut() {
-            let poll = direct.poll(me.conn_index, me.generation, cx);
-            if poll.is_ready() {
-                me.direct = None;
-                end_direct_forward(me.conn_index, me.generation);
-                // A poll after this one reports a closed forward.
-                me.refused = Some(libc::EPIPE);
-            }
-            return poll;
-        }
-        with_state(|driver, executor| {
-            let conn = me.conn_index;
-            let idx = conn as usize;
-
-            // The terminal result wins over a stale-handle check: a forward
-            // that ended as its connection closed still owes its caller the
-            // count.
-            if let Some(res) = driver.forward_done[idx].take() {
-                driver.forward_progress[idx] = None;
-                return Poll::Ready(match res {
-                    Ok(n) => Ok(n as usize),
-                    Err(errno) => Err(io::Error::from_raw_os_error(errno)),
-                });
-            }
-
-            // Stale handle (slot closed/reused): the driver already released any
-            // held or in-flight backing on close.
-            if driver.connections.generation(conn) != me.generation {
-                let forwarded = driver.forward_progress[idx]
-                    .take()
-                    .map_or(0, |p| p.forwarded);
-                return Poll::Ready(Ok(forwarded as usize));
-            }
-
-            // Drive it on every poll, not just the first. The completion
-            // handlers submit each write themselves, so in the common path this
-            // finds a write already in flight and simply parks — but *any* other
-            // wake has to be able to finish the forward. A peer FIN is the case
-            // that matters: `handle_recv_multi` notes EOF and wakes, and if this
-            // only parked, a forward ending in a truncation would park forever.
-            // (It did: 47 of 60 proxy runs hung before this line looked like
-            // this.)
-            if let Some(res) = driver.advance_forward(conn) {
-                driver.forward_progress[idx] = None;
-                return Poll::Ready(res.map(|n| n as usize));
-            }
-
-            park_segment_waiter(driver, executor, idx as u32);
-            Poll::Pending
-        })
+        poll
     }
 }
 
@@ -4362,7 +3886,7 @@ impl Future for ForwardToFuture<'_> {
 
 /// Future returned by [`Connection::recv_ready`]. Resolves when:
 /// 1. The driver holds received bytes for the connection: in the
-///    accumulator, or on io_uring in a lent buffer or the segment hold, OR
+///    accumulator, or on io_uring in a lent buffer, OR
 /// 2. The connection has finished receiving.
 pub struct RecvReadyFuture {
     conn_index: u32,
@@ -4381,7 +3905,7 @@ impl Future for RecvReadyFuture {
                 return Poll::Ready(());
             }
             // Bytes the driver holds for the connection: the accumulator, and
-            // on io_uring a lent buffer and the segment hold.
+            // on io_uring a lent buffer.
             if driver.recv_buffered(self.conn_index) > 0 {
                 return Poll::Ready(());
             }

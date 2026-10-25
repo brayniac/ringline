@@ -6,7 +6,7 @@ use super::{
     DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, encrypt_chunk, feed, queue_close_notify,
 };
 use crate::accumulator::AccumulatorTable;
-use crate::tls::{DEFAULT_MAX_PLAINTEXT_PER_RECORD, PlaintextSink, TlsConn, TlsConnKind};
+use crate::tls::{DEFAULT_MAX_PLAINTEXT_PER_RECORD, TlsConn, TlsConnKind};
 
 /// Wire size of one maximum-size TLS 1.3 record on a default-configured
 /// connection: the 5-byte header, 16384 bytes of plaintext, the inner
@@ -126,8 +126,7 @@ pub(crate) fn handshaked_pair() -> (TlsConn, TlsConn) {
 pub(crate) fn decrypt_at(to: &mut TlsConn, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     let mut accs = AccumulatorTable::new(2, 4 * 1024 * 1024);
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    match feed(to, Some(&mut sink), &mut out, ciphertext, 0) {
+    match feed(to, Some(&mut accs), &mut out, ciphertext, 0) {
         DriveOutcome::Error(e) => Err(e.to_string()),
         _ => Ok(accs.data(0).to_vec()),
     }
@@ -251,8 +250,7 @@ fn pump(to: &mut TlsConn, bytes: &[u8], accs: &mut AccumulatorTable) -> (DriveOu
             .expect("test appends stay under the cap");
     }
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(accs);
-    let outcome = drive(to, Some(&mut sink), &mut out, 0);
+    let outcome = drive(to, Some(&mut *accs), &mut out, 0);
     (outcome, out)
 }
 
@@ -344,8 +342,7 @@ fn plaintext_over_the_sink_bound_fails_the_connection() {
         .append(&cipher)
         .expect("test append stays under the cap");
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = drive(&mut server, Some(&mut sink), &mut out, 0);
+    let outcome = drive(&mut server, Some(&mut accs), &mut out, 0);
     assert!(
         matches!(outcome, DriveOutcome::Error(_)),
         "over-bound plaintext must fail the connection, got {outcome:?}"
@@ -364,9 +361,8 @@ fn feed_handshake_bytes_in_small_pieces() {
     let (_, hello) = pump(&mut client, &[], &mut accs);
 
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
     for b in &hello {
-        let outcome = feed(&mut server, Some(&mut sink), &mut out, &[*b], 0);
+        let outcome = feed(&mut server, Some(&mut accs), &mut out, &[*b], 0);
         assert!(!matches!(outcome, DriveOutcome::Error(_)), "{outcome:?}");
     }
     assert!(!out.is_empty(), "server must answer a complete ClientHello");
@@ -386,8 +382,7 @@ fn feed_chunks_oversized_input() {
     // than a debug_assert panic.
     let junk = vec![0u8; MAX_SINGLE_APPEND * 2 + 7];
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &junk, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &junk, 0);
     assert!(
         matches!(outcome, DriveOutcome::Error(_)),
         "unparseable ciphertext must be a protocol error, got {outcome:?}"
@@ -462,8 +457,7 @@ fn handshake_completion_outranks_a_close_in_the_same_feed() {
     );
 
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &coalesced, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &coalesced, 0);
     assert!(
         matches!(outcome, DriveOutcome::HandshakeJustCompleted),
         "completion must outrank the close, got {outcome:?}"
@@ -489,8 +483,7 @@ fn close_notify_is_seen_as_a_clean_close() {
     assert!(client.close_notify_sent);
 
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &alert, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &alert, 0);
     assert!(matches!(outcome, DriveOutcome::Closed), "got {outcome:?}");
     assert!(
         server.peer_sent_close_notify,
@@ -528,9 +521,8 @@ fn an_empty_feed_still_drives_the_machine() {
     let (_server, mut client) = conn_pair();
     let mut accs = AccumulatorTable::new(2, 4096);
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
 
-    let outcome = feed(&mut client, Some(&mut sink), &mut out, &[], 0);
+    let outcome = feed(&mut client, Some(&mut accs), &mut out, &[], 0);
 
     assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
     assert!(
@@ -580,8 +572,7 @@ fn feed_retries_an_append_a_drive_can_relieve() {
     prefix.extend_from_slice(&held[..split]);
     let mut out = Vec::new();
     {
-        let mut sink = PlaintextSink::Accumulator(&mut accs);
-        let outcome = feed(&mut server, Some(&mut sink), &mut out, &prefix, 0);
+        let outcome = feed(&mut server, Some(&mut accs), &mut out, &prefix, 0);
         assert!(matches!(outcome, DriveOutcome::Ok), "{outcome:?}");
     }
 
@@ -595,8 +586,7 @@ fn feed_retries_an_append_a_drive_can_relieve() {
     }
     accs.reset(0);
 
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &next, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &next, 0);
     assert!(
         matches!(outcome, DriveOutcome::Ok),
         "relievable backpressure must not fail the connection, got {outcome:?}"
@@ -638,13 +628,11 @@ fn feed_fails_rather_than_spinning_on_an_undrainable_buffer() {
     prefix.extend_from_slice(&stuck[..split]);
     let mut out = Vec::new();
     {
-        let mut sink = PlaintextSink::Accumulator(&mut accs);
-        let outcome = feed(&mut server, Some(&mut sink), &mut out, &prefix, 0);
+        let outcome = feed(&mut server, Some(&mut accs), &mut out, &prefix, 0);
         assert!(matches!(outcome, DriveOutcome::Ok), "{outcome:?}");
     }
 
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &next, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &next, 0);
     let DriveOutcome::Error(err) = outcome else {
         panic!("an undrainable buffer must fail the connection, got {outcome:?}");
     };
@@ -670,8 +658,7 @@ fn encrypt_round_trips_multi_record_plaintext() {
     let cipher = encrypt_all(&mut client, &plaintext);
 
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &cipher, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &cipher, 0);
     assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
     assert_eq!(accs.data(0), &plaintext[..]);
 }
@@ -702,8 +689,7 @@ fn encrypt_converges_on_a_small_destination() {
     }
 
     let mut out = Vec::new();
-    let mut sink = PlaintextSink::Accumulator(&mut accs);
-    let outcome = feed(&mut server, Some(&mut sink), &mut out, &cipher, 0);
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &cipher, 0);
     assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
     assert_eq!(accs.data(0), &plaintext[..]);
 }
