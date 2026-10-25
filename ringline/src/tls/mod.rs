@@ -487,6 +487,11 @@ pub struct TlsTable {
     /// `PoolWriter` and don't need it.
     #[cfg(not(has_io_uring))]
     write_buf: Vec<u8>,
+    /// Free buffers for direct receives on the buffered engine, which reads
+    /// ciphertext from a slice rather than receiving into its own buffer.
+    /// One is taken per receive in flight and returned on its completion.
+    #[cfg(all(has_io_uring, feature = "tls-buffered"))]
+    recv_buffers: Vec<Vec<u8>>,
 }
 
 impl TlsTable {
@@ -520,6 +525,8 @@ impl TlsTable {
             client_config,
             #[cfg(not(has_io_uring))]
             write_buf: Vec::new(),
+            #[cfg(all(has_io_uring, feature = "tls-buffered"))]
+            recv_buffers: Vec::new(),
         }
     }
 

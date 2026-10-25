@@ -1595,6 +1595,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Cancel pending operations on a connection.
     pub fn cancel(&mut self, conn: ConnToken) -> io::Result<()> {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
         let cs = self
             .connections
             .get_mut(conn.index)
@@ -1613,12 +1615,14 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
-        // A direct connection's receive is armed when a read parks and stays
-        // in flight until it completes, even if that read is dropped; it is
-        // cancelled by the `direct_recvs` slot its user_data carries. Reads
-        // resolve to EOF from here on, as below, and the receive's
+        // A direct or TLS connection's receive is armed when a read parks and
+        // stays in flight until it completes, even if that read is dropped;
+        // it is cancelled by the `direct_recvs` slot its user_data carries.
+        // Reads resolve to EOF from here on, as below, and the receive's
         // `-ECANCELED` completion wakes a parked reader.
-        if cs.recv_direct && !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
+        if (cs.recv_direct || tls)
+            && !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting)
+        {
             if matches!(cs.read, crate::connection::ReadHalf::Open) {
                 cs.read = crate::connection::ReadHalf::Cancelled;
             }

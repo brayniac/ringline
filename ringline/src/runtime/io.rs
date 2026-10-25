@@ -624,15 +624,19 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// even when the task only sends, and sends made once the Close is submitted
 /// (after queued sends drain) fail with `NotConnected`.
 ///
-/// A TLS connection receives ciphertext through the worker's provided-buffer
-/// ring. During the handshake a receive is re-armed after each completion.
-/// After it, a receive is armed when a read parks, as on a plaintext
-/// connection. When the `POLLRDHUP` poll fires because the peer sent a FIN or
-/// reset while nothing reads, the runtime arms one and re-arms it after each
-/// completion until the receive reads the close_notify, returns 0 at the FIN,
-/// or fails. The poll does not fire on a close_notify sent without a FIN; the
-/// alert is read when a ring receive next completes. On mio every connection
-/// reads into its accumulator.
+/// A TLS connection receives ciphertext directly too, up to
+/// `recv_direct_region` bytes per receive. With the default engine the
+/// destination is the buffer rustls processes records in, so no copy is made
+/// before decryption; with the `tls-buffered` feature it is a buffer rustls
+/// copies the ciphertext from. Decrypted plaintext goes to the accumulator.
+/// During the handshake a receive is re-armed after each completion. After
+/// it, a receive is armed when a read parks, as on a plaintext connection.
+/// When the `POLLRDHUP` poll fires because the peer sent a FIN or reset while
+/// nothing reads, the runtime arms one and re-arms it after each completion
+/// until the receive reads the close_notify, returns 0 at the FIN, or fails.
+/// The poll does not fire on a close_notify sent without a FIN; the alert is
+/// read when a receive next completes. On mio every connection reads into its
+/// accumulator.
 ///
 /// # Concurrency
 ///
@@ -2155,8 +2159,8 @@ impl ConnCtx {
     /// [`connect`]). On a TLS connection the close takes effect when the
     /// receive reads the close_notify or the FIN; plaintext already decrypted
     /// stays readable. On io_uring, a close_notify the peer sends without a FIN
-    /// is read when a ring receive next completes (see [`connect`] for when one
-    /// is armed), and this returns `true` until then.
+    /// is read when a receive next completes (see [`connect`] for when one is
+    /// armed), and this returns `true` until then.
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by
@@ -2179,13 +2183,10 @@ impl ConnCtx {
 
     /// Whether the connection receives directly into its accumulator: on
     /// io_uring, every plaintext connection, accepted or from [`connect`] or
-    /// [`connect_unix`].
-    /// The reads that need the provided-buffer ring return
-    /// [`io::ErrorKind::Unsupported`] on such a connection, so a caller can
-    /// check this before sending a request whose reply it would read with one
-    /// of them. Always `false` on the mio backend, outside the
-    /// executor, and once the runtime has released the connection's slot
-    /// after its close completes.
+    /// [`connect_unix`]. A TLS connection receives into its TLS engine's
+    /// buffer instead, and this returns `false` for it. Always `false` on the
+    /// mio backend, outside the executor, and once the runtime has released
+    /// the connection's slot after its close completes.
     pub fn is_recv_direct(&self) -> bool {
         #[cfg(has_io_uring)]
         {
@@ -2503,9 +2504,9 @@ fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
 
 /// Register the current task as `conn_index`'s receive waiter and arm the
 /// connection's receive, which the caller does only after its parser has seen
-/// every buffered byte: a direct receive on a plaintext TCP or Unix
-/// connection, a ring receive on a TLS one whose handshake is done. `need` is
-/// the parser's `NeedAtLeast` value, if it returned one.
+/// every buffered byte: a direct receive into the accumulator on a plaintext
+/// TCP or Unix connection, into its TLS engine's buffer on a TLS one. `need`
+/// is the parser's `NeedAtLeast` value, if it returned one.
 pub(crate) fn park_recv(
     #[allow(unused_variables)] driver: &mut Driver,
     executor: &mut Executor,
@@ -2520,7 +2521,6 @@ pub(crate) fn park_recv(
             // The connection closed instead: poll again to resolve the read.
             executor.wake_recv(conn_index);
         }
-        driver.arm_tls_recv_if_idle(conn_index);
     }
 }
 
@@ -4381,7 +4381,7 @@ impl ConnectFuture {
             ctx.arm_connect_timeout(token.index, ms);
         }
         // A plaintext connection receives directly into its accumulator. A
-        // TLS connection receives ciphertext through the provided-buffer ring.
+        // TLS connection receives into its TLS engine's buffer.
         #[cfg(has_io_uring)]
         if !matches!(
             target,

@@ -106,20 +106,107 @@ pub(super) fn ciphertext_to_sends(
     true
 }
 
-/// Feed received ciphertext into the TLS connection, append decrypted
-/// plaintext to the connection's recv accumulator, and append any TLS output
-/// (handshake responses, alerts) to `out_sends`.
+/// Map an unbuffered drive's outcome to the backend result, after turning its
+/// output into sends.
+#[cfg(not(feature = "tls-buffered"))]
+fn finish_unbuffered_feed(
+    peer_sent_close_notify: bool,
+    outcome: unbuffered::DriveOutcome,
+    send_copy_pool: &mut SendCopyPool,
+    conn_index: u32,
+    generation: u32,
+    scratch: &[u8],
+    out_sends: &mut Vec<BuiltSend>,
+) -> TlsRecvResult {
+    if !ciphertext_to_sends(send_copy_pool, conn_index, generation, scratch, out_sends) {
+        return TlsRecvResult::Error(rustls::Error::General(
+            "send pool exhausted during TLS output flush".into(),
+        ));
+    }
+    match outcome {
+        unbuffered::DriveOutcome::Ok => TlsRecvResult::Ok,
+        unbuffered::DriveOutcome::HandshakeJustCompleted => TlsRecvResult::HandshakeJustCompleted {
+            peer_closed: peer_sent_close_notify,
+        },
+        unbuffered::DriveOutcome::Closed => TlsRecvResult::Closed,
+        unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
+    }
+}
+
+/// The buffer a direct receive on `conn_index` writes ciphertext into, and
+/// how many bytes it may write behind the buffer's length. The unbuffered
+/// engine lends its own incoming-ciphertext buffer, holding any partial
+/// record at its front, so the receive costs no copy into it; the buffered
+/// engine takes a free buffer from the table. `want` is the receive size the
+/// caller asks for.
 ///
-/// The output is appended whatever the outcome — an alert generated on the way
-/// to a fatal error still has to reach the peer — and the caller must queue it
-/// whatever the return value, or the pool slots leak.
-pub fn feed_tls_recv(
+/// `None` if the slot has no TLS state, or if the unbuffered engine's buffer
+/// is already full of unprocessed bytes, which a conforming peer cannot
+/// cause.
+pub fn tls_recv_buffer(
+    tls_table: &mut TlsTable,
+    conn_index: u32,
+    want: usize,
+) -> Option<(Vec<u8>, usize)> {
+    #[cfg(not(feature = "tls-buffered"))]
+    {
+        tls_table
+            .get_mut(conn_index)?
+            .conn
+            .as_unbuffered_mut()?
+            .detach_for_recv(want)
+    }
+    #[cfg(feature = "tls-buffered")]
+    {
+        if !tls_table.has(conn_index) {
+            return None;
+        }
+        let mut buf = tls_table.recv_buffers.pop().unwrap_or_default();
+        buf.clear();
+        buf.reserve(want);
+        Some((buf, want))
+    }
+}
+
+/// Give back a buffer from [`tls_recv_buffer`] whose receive wrote nothing.
+/// A connection whose TLS state is gone drops it.
+pub fn tls_recv_return(tls_table: &mut TlsTable, conn_index: u32, buf: Vec<u8>) {
+    #[cfg(not(feature = "tls-buffered"))]
+    if let Some(conn) = tls_table
+        .get_mut(conn_index)
+        .and_then(|c| c.conn.as_unbuffered_mut())
+    {
+        // SAFETY: nothing was written behind the buffer's length.
+        unsafe { conn.attach_received(buf, 0) };
+    }
+    #[cfg(feature = "tls-buffered")]
+    {
+        let _ = conn_index;
+        tls_table.recv_buffers.push(buf);
+    }
+}
+
+/// Feed the `received` bytes a direct receive wrote into `buf` (from
+/// [`tls_recv_buffer`]) to the TLS connection: decrypted plaintext goes to
+/// the accumulator, and TLS output (handshake responses, alerts) is appended
+/// to `out_sends`. The output is appended whatever the outcome, since an
+/// alert generated on the way to a fatal error still has to reach the peer,
+/// and the caller must queue it whatever the result, or the pool slots leak.
+///
+/// # Safety
+///
+/// `buf` must come from [`tls_recv_buffer`] for this connection, and the
+/// `received` bytes at `buf.len()` must have been written, within the room
+/// `tls_recv_buffer` returned.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn feed_tls_received(
     tls_table: &mut TlsTable,
     accumulators: &mut AccumulatorTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
-    ciphertext: &[u8],
+    buf: Vec<u8>,
+    received: usize,
     out_sends: &mut Vec<BuiltSend>,
 ) -> TlsRecvResult {
     #[cfg(not(feature = "tls-buffered"))]
@@ -127,42 +214,42 @@ pub fn feed_tls_recv(
         let Some(tls_conn) = tls_table.get_mut(conn_index) else {
             return TlsRecvResult::Closed;
         };
-        // Handshake records and alerts only; application data is encrypted
-        // straight into a slot by `encrypt_to_sends`, never through here.
+        let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
+            return TlsRecvResult::Closed;
+        };
+        // SAFETY: forwarded to the caller.
+        unsafe { conn.attach_received(buf, received) };
         let mut scratch = Vec::new();
-        let outcome = unbuffered::feed(
-            tls_conn,
-            Some(accumulators),
-            &mut scratch,
-            ciphertext,
+        let outcome = unbuffered::drive(tls_conn, Some(accumulators), &mut scratch, conn_index);
+        finish_unbuffered_feed(
+            tls_conn.peer_sent_close_notify,
+            outcome,
+            send_copy_pool,
             conn_index,
-        );
-        if !ciphertext_to_sends(send_copy_pool, conn_index, generation, &scratch, out_sends) {
-            return TlsRecvResult::Error(rustls::Error::General(
-                "send pool exhausted during TLS output flush".into(),
-            ));
-        }
-        match outcome {
-            unbuffered::DriveOutcome::Ok => TlsRecvResult::Ok,
-            unbuffered::DriveOutcome::HandshakeJustCompleted => {
-                TlsRecvResult::HandshakeJustCompleted {
-                    peer_closed: tls_conn.peer_sent_close_notify,
-                }
-            }
-            unbuffered::DriveOutcome::Closed => TlsRecvResult::Closed,
-            unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
-        }
+            generation,
+            &scratch,
+            out_sends,
+        )
     }
     #[cfg(feature = "tls-buffered")]
-    buffered::feed_tls_recv_buffered(
-        tls_table,
-        accumulators,
-        send_copy_pool,
-        conn_index,
-        generation,
-        ciphertext,
-        out_sends,
-    )
+    {
+        let mut buf = buf;
+        // SAFETY: forwarded to the caller; `tls_recv_buffer` hands out an
+        // empty buffer, so the received bytes start at 0.
+        unsafe { buf.set_len(buf.len() + received) };
+        let result = buffered::feed_tls_recv_buffered(
+            tls_table,
+            accumulators,
+            send_copy_pool,
+            conn_index,
+            generation,
+            &buf,
+            out_sends,
+        );
+        buf.clear();
+        tls_table.recv_buffers.push(buf);
+        result
+    }
 }
 
 /// Collect pending TLS output as queueable sends. Used on the client path to

@@ -19,7 +19,7 @@ use crate::buffer::send_slab::InFlightSendSlab;
 use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
-use crate::connection::{ConnectionTable, Lifecycle, RecvArm, WriteHalf};
+use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::metrics;
 use crate::runtime::send_completion::SendId;
@@ -122,30 +122,44 @@ impl Driver {
 }
 
 /// An in-flight direct receive: the connection it was armed for and the
-/// accumulator buffer the kernel writes into, behind its existing contents.
+/// buffer the kernel writes into, behind its existing contents.
 pub(crate) struct DirectRecv {
     pub(crate) conn_index: u32,
     pub(crate) generation: u32,
-    pub(crate) buf: bytes::BytesMut,
+    pub(crate) buf: DirectRecvBuf,
+}
+
+/// The buffer a direct receive writes into.
+pub(crate) enum DirectRecvBuf {
+    /// A plaintext connection's accumulator buffer.
+    Accumulator(bytes::BytesMut),
+    /// A buffer the TLS engine lent for ciphertext
+    /// ([`tls_recv_buffer`](crate::tls::tls_recv_buffer)).
+    Tls(Vec<u8>),
 }
 
 impl Driver {
     /// Arm a direct receive on `conn_index` if it is a direct connection (a
-    /// plaintext TCP or Unix connection), open, and has none in flight, and
-    /// no park of it is pending. Called by a
+    /// plaintext TCP or Unix connection) or a TLS connection, open, and has
+    /// none in flight, and no park of it is pending. Called by a
     /// receive future that parks, after its parser has seen every buffered
     /// byte: the receive detaches the accumulator's buffer, so arming earlier
-    /// would hide buffered bytes from the parser until more arrive.
+    /// would hide buffered bytes from the parser until more arrive. A TLS
+    /// connection's receive writes ciphertext into a buffer its TLS engine
+    /// lends ([`tls_recv_buffer`](crate::tls::tls_recv_buffer)), of
+    /// `recv_direct_region` bytes; it is also armed during the handshake and
+    /// after a hangup (see `rearms_after_completion`).
     ///
     /// `need` is the parser's `NeedAtLeast` value, if it returned one. When
-    /// it is at least `recv_direct_region`, the buffer is first grown to hold
-    /// the rest of the message. A receive that returns less wakes the task
-    /// like any other, and its parser sees the bytes so far.
+    /// it is at least `recv_direct_region`, a plaintext connection's buffer is
+    /// first grown to hold the rest of the message. A receive that returns
+    /// less wakes the task like any other, and its parser sees the bytes so
+    /// far.
     ///
-    /// On a push failure, or with the accumulator at `recv_accumulator_max`,
-    /// the connection is closed, as for a multishot re-arm failure and an
-    /// accumulator overflow, and this returns `true`: the caller wakes the
-    /// task so its read resolves.
+    /// On a push failure, with the accumulator at `recv_accumulator_max`, or
+    /// with a TLS engine that has no room for ciphertext, the connection is
+    /// closed, as for an accumulator overflow, and this returns `true`: the
+    /// caller wakes the task so its read resolves.
     pub(crate) fn arm_direct_recv_or_close(
         &mut self,
         conn_index: u32,
@@ -154,7 +168,8 @@ impl Driver {
         let Some(cs) = self.connections.get(conn_index) else {
             return false;
         };
-        if !cs.recv_direct
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !(cs.recv_direct || tls)
             || cs.recv_direct_armed
             || !matches!(cs.lifecycle, Lifecycle::Open)
             || cs.recv_finished()
@@ -169,15 +184,30 @@ impl Driver {
             return false;
         }
         let generation = cs.generation;
-        let Some((mut buf, len, known)) =
-            self.accumulators
-                .detach_for_recv(conn_index, self.recv_direct_region, need)
-        else {
-            self.close_connection(conn_index);
-            return true;
-        };
-        let held = buf.len();
-        let ptr = unsafe { buf.as_mut_ptr().add(held) };
+        let (buf, ptr, len, held, known) =
+            if tls {
+                let Some((mut buf, room)) = self.tls_table.as_mut().and_then(|t| {
+                    crate::tls::tls_recv_buffer(t, conn_index, self.recv_direct_region)
+                }) else {
+                    self.close_connection(conn_index);
+                    return true;
+                };
+                // SAFETY: `room` bytes are reserved behind the buffer's length.
+                let ptr = unsafe { buf.as_mut_ptr().add(buf.len()) };
+                (DirectRecvBuf::Tls(buf), ptr, room, 0, false)
+            } else {
+                let Some((mut buf, len, known)) =
+                    self.accumulators
+                        .detach_for_recv(conn_index, self.recv_direct_region, need)
+                else {
+                    self.close_connection(conn_index);
+                    return true;
+                };
+                let held = buf.len();
+                // SAFETY: `len` bytes are reserved behind the buffer's length.
+                let ptr = unsafe { buf.as_mut_ptr().add(held) };
+                (DirectRecvBuf::Accumulator(buf), ptr, len, held, known)
+            };
         let slot = match self.direct_recv_free.pop() {
             Some(slot) => slot,
             None => {
@@ -191,8 +221,17 @@ impl Driver {
             .is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            // SAFETY: nothing was submitted, so nothing was written.
-            unsafe { self.accumulators.attach_received(conn_index, buf, 0) };
+            match buf {
+                // SAFETY: nothing was submitted, so nothing was written.
+                DirectRecvBuf::Accumulator(buf) => unsafe {
+                    self.accumulators.attach_received(conn_index, buf, 0)
+                },
+                DirectRecvBuf::Tls(buf) => {
+                    if let Some(t) = self.tls_table.as_mut() {
+                        crate::tls::tls_recv_return(t, conn_index, buf);
+                    }
+                }
+            }
             self.direct_recv_free.push(slot);
             self.close_connection(conn_index);
             return true;
@@ -251,44 +290,10 @@ impl Driver {
         }
     }
 
-    /// Arm a TLS connection's ring receive if no receive is armed, the
-    /// connection is open and reading, it is not throttled or starved, and no
-    /// park is pending. Once its handshake is done, a TLS connection's receive
-    /// is armed this way by a parked read (`park_recv`) and by its hangup
-    /// poll. After a data completion, `handle_recv_multi` re-arms it only
-    /// while `rearms_after_completion` holds. A failed push goes to
-    /// `recv_rearm_retries`.
-    pub(crate) fn arm_tls_recv_if_idle(&mut self, conn_index: u32) {
-        let ci = conn_index as usize;
-        let Some(cs) = self.connections.get(conn_index) else {
-            return;
-        };
-        if !self.tls_table.as_ref().is_some_and(|t| t.has(conn_index))
-            || cs.recv_multishot_armed
-            || cs.recv_finished()
-            || !matches!(cs.lifecycle, Lifecycle::Open)
-            || !matches!(cs.recv_arm, RecvArm::Multi)
-            || self.forward_hold_throttled[ci]
-            || self.recv_fallback_inflight[ci]
-            || self.recv_starved.contains(conn_index)
-            || self.park_pending(conn_index)
-        {
-            return;
-        }
-        let generation = cs.generation;
-        if self.submit_tcp_recv(conn_index, generation).is_err() {
-            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.recv_rearm_retries.push((conn_index, generation));
-        } else if let Some(cs) = self.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-    }
-
-    /// Whether a ring receive that completed should be re-armed at once. A
-    /// TLS connection whose handshake is done re-arms only after its hangup
-    /// poll has completed; otherwise its next
-    /// parked read arms the receive, so a task that does not read stops its
-    /// peer. Every other ring connection re-arms.
+    /// Whether a receive that completed should be re-armed at once. A TLS
+    /// connection re-arms during its handshake and after its hangup poll has
+    /// completed; otherwise its next parked read arms the receive, so a task
+    /// that does not read stops its peer. Every ring connection re-arms.
     pub(crate) fn rearms_after_completion(&self, conn_index: u32) -> bool {
         let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
         if !tls {
@@ -323,6 +328,10 @@ impl Driver {
     /// user_data. A TLS connection's is one-shot; the multishot branch is
     /// reached only by plaintext ring connections that unit tests construct.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        debug_assert!(
+            !self.tls_table.as_ref().is_some_and(|t| t.has(conn_index)),
+            "a TLS connection receives directly, not through the ring"
+        );
         // A direct connection never takes a provided buffer; its receive is
         // armed by the parked receive future (`arm_direct_recv_or_close`).
         if self

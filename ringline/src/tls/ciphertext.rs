@@ -109,6 +109,11 @@ pub(crate) struct CiphertextBuf {
     /// Total bytes relocated by compaction. Diagnostic; asserted by tests to
     /// stay linear in throughput.
     bytes_moved: u64,
+    /// A receive holds the allocation (`detach_for_recv`) until
+    /// `attach_received` returns it. Meanwhile the buffer is empty, `append`
+    /// is refused, and a full `discard` does not reallocate. Holds the
+    /// offset of the first unprocessed byte in the detached allocation.
+    detached: Option<usize>,
 }
 
 impl CiphertextBuf {
@@ -136,6 +141,7 @@ impl CiphertextBuf {
             initial,
             reserved,
             bytes_moved: 0,
+            detached: None,
         }
     }
 
@@ -184,7 +190,7 @@ impl CiphertextBuf {
             self.len()
         );
         self.start += n;
-        if self.start == self.end {
+        if self.start == self.end && self.detached.is_none() {
             self.start = 0;
             self.end = 0;
             // Keep the `buf.len() == end` invariant. Free: no data movement,
@@ -227,6 +233,13 @@ impl CiphertextBuf {
     /// `ErrorKind::InvalidData` means the append cannot ever fit within `cap`
     /// — a protocol error; close the connection.
     pub(crate) fn append(&mut self, src: &[u8]) -> io::Result<()> {
+        if self.detached.is_some() {
+            debug_assert!(false, "append while a receive holds the buffer");
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TLS ciphertext buffer is held by a receive",
+            ));
+        }
         debug_assert!(
             src.len() <= MAX_SINGLE_APPEND,
             "append of {} bytes exceeds MAX_SINGLE_APPEND ({MAX_SINGLE_APPEND}); \
@@ -238,6 +251,58 @@ impl CiphertextBuf {
         }
         self.write_tail(src);
         Ok(())
+    }
+
+    /// Take the allocation for a receive that writes into it directly, behind
+    /// the unprocessed bytes. Room for up to `want` bytes is made there,
+    /// within `cap`, as `append` makes it: compacting only when that moves no
+    /// more bytes than it reclaims, unless growing would pass `cap`. Returns
+    /// the allocation, whose length is where the receive writes, and the
+    /// room. Until [`attach_received`](Self::attach_received) returns it,
+    /// this buffer is empty and `append` is refused.
+    ///
+    /// `None` when the unprocessed bytes already fill `cap`, or when a
+    /// receive already holds the allocation.
+    pub(crate) fn detach_for_recv(&mut self, want: usize) -> Option<(Vec<u8>, usize)> {
+        if self.detached.is_some() {
+            return None;
+        }
+        let live = self.len();
+        let room = want.min(self.cap - live);
+        if room == 0 {
+            return None;
+        }
+        if self.make_room(room).is_err() {
+            // Growing at the tail would pass `cap`; `live + room` fits once
+            // the unprocessed bytes are at the front.
+            self.compact();
+            if self.end + room > self.buf.capacity() {
+                self.grow_to(self.end + room);
+            }
+        }
+        let buf = std::mem::take(&mut self.buf);
+        self.detached = Some(self.start);
+        self.start = 0;
+        self.end = 0;
+        Some((buf, room))
+    }
+
+    /// Return the allocation [`detach_for_recv`](Self::detach_for_recv)
+    /// took, with `received` bytes written behind its contents.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be the allocation `detach_for_recv` returned, and the
+    /// `received` bytes at `buf.len()` must have been written, with
+    /// `buf.len() + received <= buf.capacity()`.
+    pub(crate) unsafe fn attach_received(&mut self, mut buf: Vec<u8>, received: usize) {
+        debug_assert!(self.detached.is_some(), "attach without a detach");
+        debug_assert!(buf.len() + received <= buf.capacity());
+        // SAFETY: the caller guarantees the bytes are written and in bounds.
+        unsafe { buf.set_len(buf.len() + received) };
+        self.start = self.detached.take().unwrap_or(0);
+        self.end = buf.len();
+        self.buf = buf;
     }
 
     /// Write `src` at `end`, extending `buf`'s logical length to match.
@@ -366,6 +431,79 @@ impl CiphertextBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A receive takes the allocation with the unprocessed bytes at its
+    /// front and room behind them; returning it with bytes written makes them
+    /// pending behind the old ones.
+    #[test]
+    fn a_receive_writes_behind_the_unprocessed_bytes() {
+        let mut b = CiphertextBuf::with_cap_unchecked(256, 1024);
+        b.append(b"abcdef").unwrap();
+        b.discard(4);
+        let (mut buf, room) = b.detach_for_recv(100).expect("room");
+        assert_eq!(
+            &buf[4..],
+            b"ef",
+            "the receive writes behind the unprocessed bytes"
+        );
+        assert_eq!(room, 100);
+        assert!(buf.capacity() >= buf.len() + room);
+        assert!(
+            b.is_empty(),
+            "the buffer is empty while the receive holds it"
+        );
+        assert!(b.detach_for_recv(100).is_none(), "one receive at a time");
+        b.discard(0);
+        // Stands in for the kernel writing into the spare capacity.
+        buf.spare_capacity_mut()[..3].copy_from_slice(&[
+            std::mem::MaybeUninit::new(b'g'),
+            std::mem::MaybeUninit::new(b'h'),
+            std::mem::MaybeUninit::new(b'i'),
+        ]);
+        // SAFETY: three bytes were written behind the buffer's length.
+        unsafe { b.attach_received(buf, 3) };
+        assert_eq!(b.pending(), b"efghi");
+        b.append(b"j").unwrap();
+        assert_eq!(b.pending(), b"efghij");
+        assert_eq!(
+            b.bytes_moved(),
+            0,
+            "a receive with room at the tail moves nothing"
+        );
+    }
+
+    /// When growing at the tail would pass `cap`, the unprocessed bytes move
+    /// to the front to make the room.
+    #[test]
+    fn a_receive_compacts_when_the_tail_would_pass_the_cap() {
+        let mut b = CiphertextBuf::with_cap_unchecked(16, 64);
+        b.append(&[7u8; 40]).unwrap();
+        b.discard(15);
+        // 25 unprocessed bytes after a 15-byte prefix: 30 more at the tail
+        // would end at 70, past the cap, so the 25 move to the front.
+        let (buf, room) = b.detach_for_recv(30).expect("room");
+        assert_eq!(room, 30);
+        assert_eq!(buf, [7u8; 25], "the unprocessed bytes, at the front");
+        assert!(buf.capacity() >= 55);
+        // SAFETY: nothing was written.
+        unsafe { b.attach_received(buf, 0) };
+        assert_eq!(b.pending(), [7u8; 25]);
+    }
+
+    /// The room is bounded by what `cap` leaves behind the unprocessed bytes,
+    /// and none at all is a refusal.
+    #[test]
+    fn a_receive_gets_at_most_the_room_under_the_cap() {
+        let mut b = CiphertextBuf::with_cap_unchecked(16, 64);
+        b.append(&[1u8; 60]).unwrap();
+        let (buf, room) = b.detach_for_recv(100).expect("room");
+        assert_eq!(room, 4);
+        // SAFETY: nothing was written.
+        unsafe { b.attach_received(buf, 0) };
+        b.append(&[2u8; 4]).unwrap();
+        assert!(b.detach_for_recv(100).is_none(), "the cap is full");
+        assert_eq!(b.len(), 64, "a refusal leaves the bytes in place");
+    }
 
     #[test]
     fn append_then_pending_returns_what_was_written() {

@@ -2393,3 +2393,120 @@ fn a_close_notify_with_the_servers_flight_is_read_to_eof() {
     let result = TLS_HS_CLOSE_OUTBOUND.lock().unwrap().take();
     assert_eq!(result.as_deref(), Some("EOF"));
 }
+
+// ── Sends while a TLS receive is in flight ─────────────────────────────
+
+static TLS_SEND_WHILE_RECV: Mutex<Option<Result<Vec<u8>, String>>> = Mutex::new(None);
+
+/// Messages the server sends, and their size.
+const SEND_WHILE_RECV_COUNT: usize = 64;
+const SEND_WHILE_RECV_SIZE: usize = 1000;
+
+fn send_while_recv_message(i: usize) -> Vec<u8> {
+    (0..SEND_WHILE_RECV_SIZE)
+        .map(|j| (i * 31 + j) as u8)
+        .collect()
+}
+
+/// A task sends messages while the connection's task is parked in
+/// `with_data`, so each send is encrypted while the receive is in flight,
+/// then reads what the client sends back.
+struct TlsSendWhileRecv;
+
+impl AsyncEventHandler for TlsSendWhileRecv {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (mut tx, mut rx) = conn.split();
+            let _ = ringline::spawn(async move {
+                for i in 0..SEND_WHILE_RECV_COUNT {
+                    let sent = match tx.send(&send_while_recv_message(i)) {
+                        Ok(f) => f.await.map(|_| ()),
+                        Err(e) => Err(e),
+                    };
+                    if sent.is_err() {
+                        return;
+                    }
+                    ringline::sleep(Duration::from_millis(1)).await;
+                }
+                // Keep the write side open until the reader is done.
+                ringline::sleep(Duration::from_secs(10)).await;
+            });
+            let mut got = Vec::new();
+            while got.len() < 4 {
+                let n = rx
+                    .with_data(|data| {
+                        got.extend_from_slice(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            *TLS_SEND_WHILE_RECV.lock().unwrap() = Some(Ok(got));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSendWhileRecv
+    }
+}
+
+/// Records sent while the server's receive is in flight reach the client in
+/// order, and the bytes the client sends afterwards reach the server.
+#[test]
+fn tls_sends_while_a_receive_is_in_flight() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_SEND_WHILE_RECV.lock().unwrap() = None;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSendWhileRecv>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    let mut got = vec![0u8; SEND_WHILE_RECV_COUNT * SEND_WHILE_RECV_SIZE];
+    read_until_full_or_stalled(
+        &mut stream,
+        &mut got,
+        Duration::from_secs(10),
+        "messages sent while the receive was in flight",
+    );
+    let want: Vec<u8> = (0..SEND_WHILE_RECV_COUNT)
+        .flat_map(send_while_recv_message)
+        .collect();
+    assert!(
+        got == want,
+        "the messages arrived out of order or corrupted"
+    );
+    stream.write_all(b"done").unwrap();
+    stream.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let result = loop {
+        if let Some(r) = TLS_SEND_WHILE_RECV.lock().unwrap().take() {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the server never read the reply");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _ = stream;
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert_eq!(result, Ok(b"done".to_vec()));
+}

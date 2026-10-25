@@ -211,6 +211,23 @@ impl UnbufferedConn {
         &self.kind
     }
 
+    /// See [`CiphertextBuf::detach_for_recv`].
+    #[cfg(has_io_uring)]
+    pub(crate) fn detach_for_recv(&mut self, want: usize) -> Option<(Vec<u8>, usize)> {
+        self.incoming.detach_for_recv(want)
+    }
+
+    /// See [`CiphertextBuf::attach_received`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`CiphertextBuf::attach_received`].
+    #[cfg(has_io_uring)]
+    pub(crate) unsafe fn attach_received(&mut self, buf: Vec<u8>, received: usize) {
+        // SAFETY: forwarded to the caller.
+        unsafe { self.incoming.attach_received(buf, received) }
+    }
+
     /// Borrow the rustls connection, the ciphertext buffer and the deferred
     /// plaintext stash at once. `process_tls_records` borrows the connection
     /// *and* the slice handed to it, so the state machine cannot reach these
@@ -542,9 +559,9 @@ fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {
 /// Append received ciphertext and drive the state machine over it.
 ///
 /// `ciphertext` is chunked at [`MAX_SINGLE_APPEND`]: `CiphertextBuf::append`
-/// `debug_assert`s that bound (silent in release), and it is reachable from
-/// public config — `ConfigBuilder::recv_buffer` accepts buffer sizes above
-/// 64 KiB and the io_uring recv path hands one whole provided buffer here.
+/// `debug_assert`s that bound (silent in release). On io_uring the receive
+/// path does not come here: it receives into the buffer
+/// ([`UnbufferedConn::detach_for_recv`]) and calls [`drive`].
 ///
 /// `append` is all-or-nothing and returns `WouldBlock` when the buffer holds
 /// only live data. That is backpressure, not an error: drive first (which

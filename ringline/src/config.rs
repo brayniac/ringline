@@ -968,9 +968,9 @@ impl ConfigBuilder {
 
     /// Set recv buffer configuration.
     ///
-    /// On io_uring this affects TLS connections only: a plaintext
-    /// connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
+    /// On io_uring no connection receives into this ring: a plaintext
+    /// connection receives directly into its accumulator, and a TLS one into
+    /// its TLS engine's buffer (see [`connect`](crate::connect)).
     pub fn recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.recv_buffer.ring_size = ring_size;
         self.config.recv_buffer.buffer_size = buffer_size;
@@ -978,10 +978,10 @@ impl ConfigBuilder {
         self
     }
 
-    /// Has no effect. On io_uring a plaintext connection
-    /// receives directly into its accumulator (see [`connect`](crate::connect)),
-    /// and a TLS connection's ring receive is one-shot, armed when a read
-    /// parks, so a task that does not read stops its peer.
+    /// Has no effect. On io_uring every connection receives directly, with a
+    /// one-shot receive armed when a read parks (see
+    /// [`connect`](crate::connect)), so a task that does not read stops its
+    /// peer.
     ///
     /// io_uring only; the mio backend reads on readiness.
     /// **Default: false**.
@@ -1008,9 +1008,8 @@ impl ConfigBuilder {
     /// receive buffers. **Default: false**, which keeps the plain ring
     /// `recv_buffer` sets (256 × 16 KiB by default).
     ///
-    /// On io_uring this sets the ring kind TLS connections receive into; a
-    /// plaintext connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
+    /// On io_uring no connection receives into this ring; see
+    /// [`recv_buffer`](Self::recv_buffer).
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
         self
@@ -1052,8 +1051,9 @@ impl ConfigBuilder {
     /// that is larger and at most twice this. A message that does not fit borrows a larger
     /// buffer from the worker (see
     /// [`recv_direct_pool_max`](Self::recv_direct_pool_max)), and the bytes
-    /// already received for it, at most this many, are copied into it. Defaults
-    /// to 32 KiB; must be at least 1.
+    /// already received for it, at most this many, are copied into it. A TLS
+    /// connection receives up to this many bytes of ciphertext at a time.
+    /// Defaults to 32 KiB; must be at least 1.
     pub fn recv_direct_region(mut self, n: usize) -> Self {
         self.config.recv_direct_region = n;
         self
