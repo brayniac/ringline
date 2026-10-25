@@ -932,14 +932,11 @@ pub fn request_shutdown() -> io::Result<()> {
 /// `with_data`, `with_bytes` and the other readers are `pub(crate)`: reading
 /// a connection goes through [`Connection`] or [`RecvHalf`], which are not
 /// `Copy`, so the read side cannot be aliased. A `ConnCtx` is a
-/// send/identity/lifecycle handle
-/// plus a way to *obtain* the read side ([`take_recv`](Self::take_recv),
-/// [`split`](Self::split)).
+/// send/identity/lifecycle handle plus a way to *obtain* the read side
+/// ([`take_recv`](Self::take_recv), [`split`](Self::split)).
 ///
-/// The forwarding entry points (`forward_to`, `forward_to_conn`) stay public
-/// on purpose: they never surface the bytes to the caller, so they cannot be used to observe a stream someone else
-/// is reading. Their own "one forward at a time" rule is refused at runtime by
-/// the driver, and that refusal stays reachable — and therefore testable —
+/// The forwarding entry points (`forward_to`, `forward_to_conn`) stay public.
+/// Their own "one forward at a time" rule is refused at runtime by the driver, and that refusal stays reachable — and therefore testable —
 /// only through this handle, because `&mut RecvHalf` turns a second concurrent
 /// forward into a compile error.
 ///

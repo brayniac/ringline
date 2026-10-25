@@ -160,11 +160,10 @@ none of them:
 
 - A connection's task is dropped at teardown with no driver installed
   (`handle_close` → `Executor::remove_connection`), so a held writer's
-  `Drop` cannot release its slots. `handle_close` already reclaims held
-  receive buffers (`pending_recv_bufs`, `segment_hold`) explicitly for the
-  same reason. A held writer would
-  need a thread-local list of orphaned slot chains, drained by the event
-  loop.
+  `Drop` cannot release its slots. `handle_close` already reclaims the
+  driver's held receive buffers (`pending_recv_bufs`, `segment_hold`)
+  explicitly. A held writer would need a thread-local list of orphaned slot
+  chains, drained by the event loop.
 - The send-capacity FIFO admits its head only when `free_count()` covers the
   head's slots (`SendCompletions::turn`). Every slot outside a reservation
   is freed today by kernel progress. A held writer's slots are freed only by

@@ -1,6 +1,6 @@
 # Listeners and the accept path
 
-Note (2026-10-25): `SegmentReader` and the other segment readers were removed.
+Note (2026-10-25): `SegmentReader` was removed.
 
 - **Status:** proposal — intent only, nothing implemented
 - **Motivated by:** the single-listener limit found while reviewing whether
