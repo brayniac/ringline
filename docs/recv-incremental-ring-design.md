@@ -1,7 +1,7 @@
 # Two shared receive rings per worker, consumed incrementally where supported
 
-Note (2026-10-25): the receive views (#677–#679) and `recv_zc_threshold`
-were removed with the segment readers.
+Note (2026-10-25): the receive views (#677), `with_bytes_segments` (#678)
+and `recv_zc_threshold` (#679) were removed with the segment readers.
 
 Status: steps 0, 2 and 3 are implemented (#632, #633), and step 4 behind
 `recv_incremental` (#634–#636; 4b-2's recv-forward and direct-echo paths

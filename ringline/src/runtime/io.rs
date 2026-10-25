@@ -1307,11 +1307,7 @@ impl ConnCtx {
     /// connection is an explicit queue drained by the owning task.
     ///
     /// It is also what lets a forward refuse a sink somebody else is already
-    /// writing to. A forward from a TLS source in the segmented domain (after a
-    /// `forward_to`) submits its own SQE straight to the
-    /// ring instead of going through the per-connection send queue, so a
-    /// concurrent send to that socket interleaves with it — and io_uring does
-    /// not order independent SQEs (Domain Invariant 2).
+    /// writing to.
     ///
     /// # Errors
     ///
@@ -1892,10 +1888,7 @@ impl ConnCtx {
     ///
     /// On io_uring the forward takes the bytes the source's accumulator holds
     /// and sends them through the sink's send queue; see "The source" below.
-    /// A TLS source that a `forward_to` left in the
-    /// segmented domain forwards as `forward_to` does instead, from its segment
-    /// hold, writing to the sink directly: do not send on the sink while that
-    /// forward runs. A result `< len` means the peer sent FIN first.
+    /// A result `< len` means the peer sent FIN first.
     ///
     /// # Thread affinity
     ///
@@ -1980,9 +1973,8 @@ impl ConnCtx {
     ) -> Option<ForwardToFuture<'a>> {
         let refusal = with_state(|driver, _| {
             // A TLS source's plaintext lands in its accumulator too, so it
-            // forwards the same way, unless it is in the segmented domain (a
-            // Mode A forward put it there), where its
-            // plaintext goes to the hold: Mode A forwards it from there.
+            // forwards the same way. While a `forward_to` runs from it (the
+            // segmented domain), `arm_forward_source` refuses with `EBUSY`.
             let idx = self.conn_index as usize;
             let tls_source = driver
                 .tls_table
@@ -2798,9 +2790,9 @@ pub(crate) fn park_recv(
     }
 }
 
-/// Register the current task as `conn_index`'s receive waiter for a segment
-/// reader or a Mode A forward, which wait on the segment hold rather than
-/// through [`park_recv`]. On io_uring, also arm a TLS connection's receive if
+/// Register the current task as `conn_index`'s receive waiter for a Mode A
+/// forward, which waits on the segment hold rather than through
+/// [`park_recv`]. On io_uring, also arm a TLS connection's receive if
 /// none is armed.
 fn park_segment_waiter(
     #[allow(unused_variables)] driver: &mut Driver,
@@ -3324,14 +3316,8 @@ impl RecvHalf {
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. That borrow is the point: from a TLS source in the
-    /// segmented domain (after a `forward_to`), a forward
-    /// submits its own SQE straight to the ring rather than through the sink's
-    /// send queue, so a concurrent `send` to the same socket would interleave
-    /// with it — and io_uring does not order independent SQEs (Domain
-    /// Invariant 2). Holding the half is both the permission to write and the
-    /// proof that nobody else is. Every other forward sends through the sink's
-    /// queue; see [`ConnCtx::forward_to_conn`].
+    /// forward runs. The forward sends through the sink's send queue; see
+    /// [`ConnCtx::forward_to_conn`].
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
@@ -3362,19 +3348,12 @@ impl RecvHalf {
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. That borrow is the point: from a TLS source in the
-    /// segmented domain (after a `forward_to`), a forward
-    /// submits its own SQE straight to the ring rather than through the sink's
-    /// send queue, so a concurrent `send` to the same socket would interleave
-    /// with it — and io_uring does not order independent SQEs (Domain
-    /// Invariant 2). Holding the half is both the permission to write and the
-    /// proof that nobody else is. Every other forward sends through the sink's
-    /// queue; see [`ConnCtx::forward_to_conn`].
+    /// forward runs. The forward sends through the sink's send queue; see
+    /// [`ConnCtx::forward_to_conn`].
     ///
-    /// The two backends return different futures (io_uring forwards from the
-    /// accumulator, or from the segment hold for a TLS source in the
-    /// segmented domain; mio pumps through the accumulator), so this is two
-    /// signatures rather than one.
+    /// The two backends return different futures (io_uring sends from the
+    /// accumulator through the sink's send queue; mio pumps through the
+    /// accumulator), so this is two signatures rather than one.
     #[cfg(not(has_io_uring))]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
@@ -3719,11 +3698,6 @@ impl Connection {
 /// Unlike [`RecvHalf`], this does not borrow the read side: sending while a
 /// reader is live is ordinary (an echo does exactly that), so the two halves
 /// are independent.
-///
-/// Note the write side has an exclusivity rule of its own that is **not yet
-/// enforced** — a connection that is the sink of a `forward_to_conn` from a
-/// TLS source in the segmented domain must not be sent to concurrently. See
-/// `docs/connection-handle-ownership-design.md`.
 ///
 /// Available on both backends.
 pub struct SendHalf {
@@ -4106,16 +4080,14 @@ pub struct ForwardToFuture<'a> {
     /// running (`EBUSY`), a stale source or sink slot (`EPIPE`), or a TLS sink
     /// (`EPROTOTYPE`). Reported on the first poll; nothing was mutated.
     refused: Option<i32>,
-    /// Set for a forward that sends from the source's accumulator: a
-    /// plaintext source, or a TLS source outside the segmented domain.
+    /// Set for a forward that sends from the source's accumulator.
     direct: Option<DirectForward>,
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,
 }
 
-/// State of a [`ForwardToFuture`] that sends from its source's accumulator
-/// (a plaintext source, or a TLS source outside the segmented domain).
+/// State of a [`ForwardToFuture`] that sends from its source's accumulator.
 ///
 /// Each step takes the bytes the accumulator holds, up to what is left of
 /// `len`, and sends them on the sink through its send queue under a guard:

@@ -14,12 +14,6 @@ pub(crate) struct RingMemory {
     len: usize,
 }
 
-// Safety: `RingMemory` owns its allocation and exposes it as raw pointers,
-// and as a slice only through `&mut self`. The code that reads through the
-// pointers (the receive path) reads ranges the kernel has finished writing.
-unsafe impl Send for RingMemory {}
-unsafe impl Sync for RingMemory {}
-
 impl RingMemory {
     /// Map `len` zeroed, page-aligned bytes. An anonymous mapping, so a page
     /// is backed only once it is touched: the kernel's first write into a

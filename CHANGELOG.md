@@ -215,6 +215,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- On io_uring, the buffers a connection's sends hold count toward its
+  `forward_hold_cap`: those of a `forward_recv_buf` send of a lent receive
+  buffer, and the ring buffers a `forward_to` write pins (#638). Without
+  `recv_incremental` a `forward_to` source's cap is a quarter of the receive
+  ring's buffers. The cap is checked as completions arrive, so a multishot
+  receive can take buffers past it before its cancel lands. A connection
+  that forwards accumulator-backed data with `forward_recv_buf` is not
+  throttled: in a test the server accepted 64 MiB from a peer that did not
+  read (#638).
+
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
   buffered engine; `tls-unbuffered` has no effect and is kept so builds that
@@ -252,10 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   up to `forward_hold_cap` entries, and below `send_zc_threshold` copied
   into a pool slot. A zero-copy send of such a forward to a sink that does
   not read holds worker exit for up to its bound, as any guarded send does.
-  A `forward_to_conn` from a TLS source in the segmented domain forwards
-  from its hold and writes to the sink directly, unordered with other sends
-  on the sink. A TLS source is in that domain after a `forward_to` that
-  failed on a write. A `forward_to` started while a `forward_to_conn` sends
+  A `forward_to` started while a `forward_to_conn` sends
   from the accumulator gets `EBUSY`. `recv_multishot` has no effect: TLS
   connections, the only
   ones it affected, always arm one-shot receives.
@@ -664,6 +671,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: after a `forward_to` failed on a sink write (an error from the
+  sink, or a sink connection whose slot was reused), the source stayed in
+  the segmented domain, so `with_data` and `with_bytes` did not see the
+  bytes that followed. A failed forward now ends as a finished one does:
+  bytes held but not yet written go to the accumulator, and reads resume.
+
 - io_uring: `send_chain` and `send_chain_nowait` did not check the
   handle's generation when the handle's slot held a plaintext connection. A
   stale handle (its connection closed, with or without TLS, and the slot
@@ -838,17 +851,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and from 6.14 the rings are charged to the same limit, so at the common
   8 MiB limit a guard smaller than 8 MiB can reach it. A `send_chain` with a
   guard part still fails on `-ENOMEM`, as on any send error (#642).
-
-- On io_uring, the `forward_hold_cap` receive throttle of a `forward_to`
-  source is lowered to a quarter of the receive ring's buffers without
-  `recv_incremental`, and the buffers a connection's sends hold count
-  toward its cap: those of a `forward_recv_buf` send of a lent receive
-  buffer, and the ring buffers a `forward_to` write pins (#638). The cap is
-  checked as completions arrive, so a multishot receive can take buffers
-  past it before its cancel lands. A connection
-  that forwards accumulator-backed data with `forward_recv_buf` is not
-  throttled: in a test the server accepted 64 MiB from a peer that did
-  not read (#638).
 
 - io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
   `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the

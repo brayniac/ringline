@@ -218,6 +218,10 @@ fn main() {
     let workers = env_u64("WORKERS", 1) as usize;
     let secs = env_u64("SECS", 5);
     let mode = std::env::var("MODE").unwrap_or_else(|_| "whole".into());
+    if !matches!(mode.as_str(), "whole" | "bytes" | "mixed" | "forward") {
+        eprintln!("[ring_fill_bench] unknown MODE={mode}: use whole, bytes, mixed or forward");
+        std::process::exit(2);
+    }
     // ROLE=server: run only the echo server (for cross-host: server on one box).
     // ROLE=client: run only the ringline adaptive-recv client against TARGET.
     // unset: localhost — in-process server + client (default).

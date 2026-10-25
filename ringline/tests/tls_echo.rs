@@ -2552,12 +2552,11 @@ fn forward_to_a_file_from_a_tls_source() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ── Forwards from a TLS source left in the segmented domain ─────────────
+// ── Reads and forwards from a TLS source after a failed forward ─────────
 
 /// Reads a length header with `with_data`, runs a `forward_to` of the junk
-/// that follows into a read-only file, whose write fails and leaves the
-/// source in the segmented domain, then forwards the body to a backend with
-/// `forward_to_conn`.
+/// that follows into a read-only file, whose write fails, then forwards the
+/// body to a backend with `forward_to_conn`.
 #[cfg(has_io_uring)]
 struct TlsFailedForwardThenForward;
 #[cfg(has_io_uring)]
@@ -2611,9 +2610,8 @@ impl AsyncEventHandler for TlsFailedForwardThenForward {
 #[cfg(has_io_uring)]
 const TLS_SEG_FORWARD_JUNK: usize = 100;
 
-/// A `forward_to_conn` from a TLS source that a failed `forward_to` left in
-/// the segmented domain forwards from the hold (Mode A), not from the empty
-/// accumulator.
+/// A `forward_to_conn` from a TLS source after a `forward_to` that failed on
+/// a write forwards the body that follows.
 #[cfg(has_io_uring)]
 #[test]
 fn forward_to_conn_after_a_failed_forward_to_on_a_tls_source() {
@@ -2680,6 +2678,126 @@ fn forward_to_conn_after_a_failed_forward_to_on_a_tls_source() {
         res,
         Some(format!(
             "forward_to Err(Some({})) forward Ok({LEN}) of {LEN}",
+            libc::EBADF
+        ))
+    );
+}
+
+/// Reads a length header with `with_data`, runs a `forward_to` of the junk
+/// that follows into a read-only file, whose write fails, then reads the
+/// body with `with_data` under a timeout.
+#[cfg(has_io_uring)]
+struct TlsFailedForwardThenRead;
+#[cfg(has_io_uring)]
+static TLS_FAILED_FORWARD_READ: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsFailedForwardThenRead {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let mut hdr = [0u8; 4];
+            let n = conn
+                .with_data(|d| {
+                    if d.len() < 4 {
+                        return ParseResult::NeedMore;
+                    }
+                    hdr.copy_from_slice(&d[..4]);
+                    ParseResult::Consumed(4)
+                })
+                .await;
+            if n != 4 {
+                *TLS_FAILED_FORWARD_READ.lock().unwrap() = Some(format!("hdr {n}"));
+                return;
+            }
+            let len = u32::from_be_bytes(hdr) as usize;
+            let read_only = std::fs::File::open("/dev/null").expect("open /dev/null");
+            let sink =
+                ringline::SinkFd::file(std::os::fd::AsFd::as_fd(&read_only)).expect("file sink");
+            let junk = conn.forward_to(&sink, TLS_SEG_FORWARD_JUNK).await;
+            let mut body = Vec::new();
+            let read = ringline::timeout(Duration::from_secs(5), async {
+                while body.len() < len {
+                    let n = conn
+                        .with_data(|d| {
+                            body.extend_from_slice(d);
+                            ParseResult::Consumed(d.len())
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            *TLS_FAILED_FORWARD_READ.lock().unwrap() = Some(format!(
+                "forward_to {:?} read {:?} body {} of {len} ok {}",
+                junk.map_err(|e| e.raw_os_error()),
+                read.map_err(|_| "timeout"),
+                body.len(),
+                body.iter().enumerate().all(|(i, &b)| b == (i * 7) as u8)
+            ));
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TlsFailedForwardThenRead
+    }
+}
+
+/// After a `forward_to` from a TLS source fails on a write, `with_data` reads
+/// the bytes that follow.
+#[cfg(has_io_uring)]
+#[test]
+fn with_data_after_a_failed_forward_to_on_a_tls_source() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    const LEN: usize = 20_000;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsFailedForwardThenRead>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    // The header and the junk go in one write, so one record carries both.
+    let mut first = (LEN as u32).to_be_bytes().to_vec();
+    first.extend_from_slice(&[0xee; TLS_SEG_FORWARD_JUNK]);
+    stream.write_all(&first).unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let payload: Vec<u8> = (0..LEN).map(|i| (i * 7) as u8).collect();
+    for c in payload.chunks(4096) {
+        stream.write_all(c).unwrap();
+        stream.flush().unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let res = loop {
+        if let Some(r) = TLS_FAILED_FORWARD_READ.lock().unwrap().clone() {
+            break Some(r);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = stream;
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+    assert_eq!(
+        res,
+        Some(format!(
+            "forward_to Err(Some({})) read Ok(()) body {LEN} of {LEN} ok true",
             libc::EBADF
         ))
     );

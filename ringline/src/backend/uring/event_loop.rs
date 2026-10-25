@@ -2022,11 +2022,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
-            // A segmented TLS connection (a forward source or a segment
-            // reader) holds decrypted plaintext until the forward or the
-            // reader drains it. Stop receiving at the hold cap, as the
-            // plaintext segmented path does, so a slow sink or reader stops
-            // the peer instead of growing the hold to `recv_accumulator_max`.
+            // A segmented TLS connection (a `forward_to` source) holds
+            // decrypted plaintext until the forward drains it. Stop receiving
+            // at the hold cap, as the plaintext segmented path does, so a slow
+            // sink stops the peer instead of growing the hold to
+            // `recv_accumulator_max`.
             if self.driver.recv_domain[conn_index as usize]
                 == crate::recv::domain::RecvDomain::Segmented
                 && self
@@ -3708,6 +3708,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.forward_progress[conn_index as usize] = None;
         self.driver.forward_done[conn_index as usize] = Some(Err(errno));
+        // Held bytes not yet written go to the accumulator and the source
+        // leaves the segmented domain, as at the end of any other forward, so
+        // `with_data` reads what follows.
+        if !self.driver.settle_forward_end(conn_index) {
+            self.driver.close_connection(conn_index);
+        }
         self.executor.wake_recv(conn_index);
     }
 
