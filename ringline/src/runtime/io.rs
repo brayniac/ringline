@@ -1198,6 +1198,10 @@ impl ConnCtx {
     /// [`AsyncEventHandler::on_adopt`](crate::AsyncEventHandler::on_adopt),
     /// so `state` is the only thing that survives.
     ///
+    /// Once the connection is parked, sends on this handle, from the handler,
+    /// a spawned task or `on_tick`, return `NotConnected` until the future is
+    /// dropped.
+    ///
     /// **This is the opt-in.** A connection whose handler never calls this is
     /// never parked, whatever the load imbalance.
     ///
@@ -1225,6 +1229,10 @@ impl ConnCtx {
     /// memory, for example a `ConnStream`'s buffered data, `Bytes` kept from
     /// `with_bytes`, or requests the handler has queued. Do not offer while
     /// holding any.
+    ///
+    /// A TLS connection keeps its TLS session when parked: the session moves
+    /// with it, with any ciphertext received but not yet decrypted, so the
+    /// peer sees no new handshake.
     ///
     /// Park also requires the io_uring backend and a kernel with
     /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does

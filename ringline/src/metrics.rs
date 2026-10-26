@@ -225,7 +225,7 @@ pub mod park_diag {
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
-/// Slots 2, 8 and 10 are unused.
+/// Slots 2, 5, 8 and 10 are unused.
 /// Nothing is collapsed: an earlier version grouped the variants believed
 /// unreachable at the install re-check into a single `other_blocker`, and that
 /// slot then absorbed 97.8% of abandonments (18,844 of 19,268 in a saturated
@@ -244,8 +244,7 @@ pub mod park_abandon {
     /// moment bytes arrive and is *not* restored when the handler consumes
     /// them, so this can hold while the connection is otherwise quiescent.
     pub const NOT_OFFERED: usize = 4;
-    /// A TLS session, whose transfer is unimplemented.
-    pub const TLS_SESSION: usize = 5;
+    // Slot 5 has no blocker.
     /// Teardown was requested across the round trip.
     pub const CLOSING: usize = 6;
     /// Queued or in-flight sends hold this worker's pool slots.
@@ -573,7 +572,6 @@ pub fn init_metadata() {
     );
     PARK_ABANDONED.insert_metadata(park_abandon::OUTBOUND, "op".into(), "outbound".into());
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OFFERED, "op".into(), "not_offered".into());
-    PARK_ABANDONED.insert_metadata(park_abandon::TLS_SESSION, "op".into(), "tls_session".into());
     PARK_ABANDONED.insert_metadata(park_abandon::CLOSING, "op".into(), "closing".into());
     PARK_ABANDONED.insert_metadata(park_abandon::SENDS, "op".into(), "sends".into());
     PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());

@@ -121,6 +121,14 @@ impl Driver {
     }
 }
 
+/// What an adopted connection brings from the worker that parked it.
+pub(crate) struct Adopt {
+    /// What the handler deposited via `offer_for_park`.
+    pub(crate) state: Option<crate::park::ParkState>,
+    /// The TLS state of a TLS connection.
+    pub(crate) tls: Option<crate::tls::TlsConn>,
+}
+
 /// An in-flight direct receive: the connection it was armed for and the
 /// buffer the kernel writes into, behind its existing contents.
 pub(crate) struct DirectRecv {
@@ -970,9 +978,6 @@ pub(crate) enum ParkBlocker {
     /// The handler has not offered this connection via `offer_for_park`.
     /// Park is opt-in, so this is the common answer, not an error.
     NotOffered,
-    /// A TLS session that cannot travel yet. Temporary: the state is plain
-    /// owned data, it is the transfer that is unimplemented.
-    TlsSession,
     /// Teardown is already requested. Park loses this race deliberately:
     /// moving a connection the peer is closing buys nothing, and the close
     /// path is the one carrying the invariants.
@@ -1005,7 +1010,6 @@ impl ParkBlocker {
             ParkBlocker::DataPending => pa::DATA_PENDING,
             ParkBlocker::Outbound => pa::OUTBOUND,
             ParkBlocker::NotOffered => pa::NOT_OFFERED,
-            ParkBlocker::TlsSession => pa::TLS_SESSION,
             ParkBlocker::Closing => pa::CLOSING,
             ParkBlocker::Sends => pa::SENDS,
             ParkBlocker::Chain => pa::CHAIN,
@@ -1031,7 +1035,6 @@ mod park_blocker_tests {
             ParkBlocker::DataPending,
             ParkBlocker::Outbound,
             ParkBlocker::NotOffered,
-            ParkBlocker::TlsSession,
             ParkBlocker::Closing,
             ParkBlocker::Sends,
             ParkBlocker::Chain,
@@ -1732,11 +1735,16 @@ impl Driver {
     }
 
     /// Whether the connection holds received bytes that no consumer has
-    /// finished with: `recv_buffered` is nonzero. `park_blocker` refuses a
-    /// park while this holds (`ParkBlocker::DataPending`), and `offer_park`
-    /// declines an offer.
+    /// finished with: `recv_buffered` is nonzero, or its TLS engine holds
+    /// decrypted plaintext not yet delivered to the accumulator.
+    /// `park_blocker` refuses a park while this holds
+    /// (`ParkBlocker::DataPending`), and `offer_park` declines an offer.
     pub(crate) fn holds_unread(&self, conn_index: u32) -> bool {
         self.recv_buffered(conn_index) > 0
+            || self
+                .tls_table
+                .as_ref()
+                .is_some_and(|t| t.has_undelivered_plaintext(conn_index))
     }
 
     /// Record a handler's park offer, with the state to carry
@@ -1783,8 +1791,10 @@ impl Driver {
     /// which park drops, so they clear as part of the move rather than
     /// blocking it.
     ///
-    /// Unread bytes block as `ParkBlocker::DataPending`: the accumulator and a
-    /// lent buffer in `pending_recv_bufs`.
+    /// Unread bytes block as `ParkBlocker::DataPending` (`holds_unread`).
+    ///
+    /// A TLS connection's state moves with it (`ParkedFd::tls`), including
+    /// any ciphertext received but not yet processed.
     pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
         let Some(conn) = self.connections.get(conn_index) else {
             return Some(ParkBlocker::NotOpen);
@@ -1821,16 +1831,6 @@ impl Driver {
         // wedge the connection waiting for a ClientHello.
         if conn.listener.is_none() {
             return Some(ParkBlocker::Outbound);
-        }
-
-        // A TLS connection's session lives in this worker's `TlsTable`, and
-        // carrying it is not implemented yet — adopting would install a fresh
-        // entry and the peer would face a renegotiation on an established
-        // session. Refused rather than silently broken; carrying the session
-        // is the next increment (open question 4 established that
-        // `UnbufferedConn` is plain owned data and moves as one value).
-        if self.tls_table.as_ref().is_some_and(|t| t.has(conn_index)) {
-            return Some(ParkBlocker::TlsSession);
         }
 
         // Backstop for the withdraw-on-recv rule, and the reason it is a
