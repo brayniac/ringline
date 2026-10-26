@@ -559,14 +559,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ring's buffers (4 MiB by default) or registers the ring, whose entry array
   (one page by default) Linux 6.14+ charged to `RLIMIT_MEMLOCK`. With it go
   `ConfigBuilder::recv_buffer` and `recv_buffer_bgid`; remove those calls.
-  On io_uring a receive is up to `recv_direct_region` bytes. On mio,
-  accumulators now start at `recv_accumulator_capacity` (4 KiB by default)
-  instead of the `recv_buffer` size (16 KiB by default);
-  `recv_accumulator_capacity(16384)` restores 0.6's starting size.
-  `recv_accumulator_max` must be at least 1 instead of at least that size.
-  `pool::BUFFER_RING_EMPTY` counts only the UDP ring. Also removed: the fallback
-  receive for messages larger than the ring, and the receive throttle for
-  connections whose `forward_recv_buf` sends held ring buffers.
+  On io_uring, `recv_direct_region` (32 KiB by default) sets the buffer an
+  idle plaintext connection receives into and the most ciphertext a TLS
+  connection receives at a time; a message larger than that buffer borrows
+  a larger one (`recv_direct_pool_max`). On mio, accumulators now start at
+  `recv_accumulator_capacity` (4 KiB by default) instead of the
+  `recv_buffer` size (16 KiB by default); `recv_accumulator_capacity(16384)`
+  restores 0.6's starting size. `recv_accumulator_max` must be at least 1
+  instead of at least that size. `pool::BUFFER_RING_EMPTY` counts only the
+  UDP ring. Also removed: the fallback receive for messages larger than the
+  ring, and the receive throttle for connections whose `forward_recv_buf`
+  sends held ring buffers.
   `udp_recv_buffer_bgid(0)` with UDP configured, which 0.6 refused because
   it equalled the TCP ring's default group id, is accepted.
 - **Breaking:** the `ringline/pool` counters `recv_parked`, `recv_fallback`
@@ -729,7 +732,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection buffered, and `reset` keeps the allocation, so each slot kept
   that size until a new connection took it, and then for that connection's
   lifetime. After a 1 MiB forward echo at 512 connections on one io_uring
-  worker with the incremental TCP receive ring (removed in this release),
+  worker with an incremental TCP receive ring, which no release shipped,
   RSS once every connection had closed was 791 and 874 MiB in two runs
   without this change and 276 and 336 MiB with it. Both backends.
 - io_uring: the error text of a failed buffer registration names a failed

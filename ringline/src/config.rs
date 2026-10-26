@@ -825,10 +825,9 @@ impl ConfigBuilder {
     /// Print per-worker event-loop diagnostics to stderr at shutdown.
     ///
     /// Each worker prints a `[ringline diag]` line (iteration mix: dead
-    /// iterations, CQEs and tasks per iteration) and a
-    /// `[ringline stall]` line (wait/work stall buckets). Recording the
-    /// stall buckets costs ~4 clock reads per iteration, so this is off by
-    /// default. io_uring backend only; the mio backend prints nothing.
+    /// iterations, CQEs and tasks per iteration) and a `[ringline stall]` line
+    /// (wait/work stall buckets). Recording the stall buckets costs ~4 clock
+    /// reads per iteration, so this is off by default. io_uring backend only; the mio backend prints nothing.
     pub fn loop_diag(mut self, enable: bool) -> Self {
         self.config.loop_diag = enable;
         self
@@ -949,8 +948,9 @@ impl ConfigBuilder {
     /// pages stay local to that worker's NUMA node.
     ///
     /// With it, the pool's pages are resident from startup, so the pool adds
-    /// nothing to RSS under load, and a pool the machine cannot back fails at
-    /// launch instead of during a burst. Without it, the part of the pool no
+    /// nothing to RSS under load, and a pool the machine cannot back runs out
+    /// of memory while the worker starts rather than during a traffic burst
+    /// (as an OOM kill, not an error from `launch()`). Without it, the part of the pool no
     /// send touches stays virtual. A `send_pool(1024, 16448)` pool is about
     /// 16 MiB per worker. Startup grows by roughly one pass over the
     /// allocation.

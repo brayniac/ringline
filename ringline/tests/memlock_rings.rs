@@ -8,10 +8,10 @@
 //! each exactly.
 //!
 //! One test, sequential: the hard limit is lowered only for the four launch
-//! steps at the end, because lowering it is irreversible for the process. The kernel compares the limit
-//! with what every process of this user has charged, so this test must not
-//! share the machine with other io_uring tests; `.config/nextest.toml` runs it
-//! alone.
+//! steps at the end, because lowering it is irreversible for the process. The
+//! kernel compares the limit with what every process of this user has
+//! charged, so this test must not share the machine with other io_uring
+//! tests; `.config/nextest.toml` runs it alone.
 
 #![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]

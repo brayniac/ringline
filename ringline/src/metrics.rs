@@ -111,8 +111,8 @@ pub mod conn {
 ///
 /// Slot index is the `OpTag` discriminant, so the array is sized to the largest
 /// one and the discriminants the enum skips are unused slots. That wastes those
-/// slots and keeps the increment a plain cast with no lookup table to fall out of step
-/// with the enum.
+/// slots and keeps the increment a plain cast with no lookup table to fall out
+/// of step with the enum.
 #[metric(
     name = "ringline/cqe_by_tag",
     description = "Completions processed, by operation tag"

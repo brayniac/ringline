@@ -6534,7 +6534,7 @@ mod tests {
                 generation,
             });
 
-        // ECANCELED: the linked recv-cancel failed, so the install never ran.
+        // A failed install (here ECANCELED); every negative result takes this path.
         el.handle_park_install(park_install_ud(conn_index, generation), -libc::ECANCELED);
 
         assert!(

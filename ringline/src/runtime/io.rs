@@ -1553,10 +1553,10 @@ impl ConnCtx {
 
             // The bytes are in the accumulator. Copying the whole message into
             // a send-pool slot is what made ringline lose to its own mio
-            // fallback at 16 KiB (#397) — 93.9%
-            // of forwards took this path, averaging 15 KB copied per
-            // operation. Detach the accumulator instead (O(1) freeze) and send
-            // it under a guard, so the message reaches the wire uncopied.
+            // fallback at 16 KiB (#397) — 93.9% of forwards took this path,
+            // averaging 15 KB copied per operation. Detach the accumulator
+            // instead (O(1) freeze) and send it under a guard, so the message
+            // reaches the wire uncopied.
             //
             // Only when the forward covers the whole accumulator: then the
             // detach is a single `take_frozen` with no remainder to put back,
