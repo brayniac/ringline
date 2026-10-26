@@ -115,8 +115,8 @@ impl Drop for DriverStateGuard {
 // `offer_for_park` declines an offer made from inside the connection's own
 // reader callback, while it is the innermost one running. `with_bytes` takes
 // the request out of the driver before its callback runs. A
-// `forward_recv_buf` that sends the whole lent buffer or the whole
-// accumulator takes it out during the callback. `holds_unread` returns false
+// `forward_recv_buf` that sends the whole accumulator takes it out during the
+// callback. `holds_unread` returns false
 // for a request taken out either way (#669).
 #[cfg(has_io_uring)]
 thread_local! {
@@ -1221,7 +1221,7 @@ impl ConnCtx {
     /// inside a callback on connection B, itself inside A's callback, is
     /// declined only while the runtime still holds A's bytes. It does not
     /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
-    /// that sent the whole lent buffer or the whole accumulator.
+    /// that sent the whole accumulator.
     /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
     /// a running reader callback or held bytes.
     ///
@@ -1551,9 +1551,7 @@ impl ConnCtx {
             #[cfg(has_io_uring)]
             let closing = driver.send_queues[conn_index as usize].close_submitted;
 
-            // The bytes are accumulator-backed: either they arrived across
-            // several recv completions, or a previous parse left a remainder.
-            // Copying the whole message into a send-pool slot is what made
+            // The bytes are in the accumulator. Copying the whole message into a send-pool slot is what made
             // ringline lose to its own mio fallback at 16 KiB (#397) — 93.9%
             // of forwards took this path, averaging 15 KB copied per
             // operation. Detach the accumulator instead (O(1) freeze) and send
@@ -1596,7 +1594,7 @@ impl ConnCtx {
                 }
             }
 
-            // No pending recv buffer (or mio backend) — fall back to copy send.
+            // Not the whole accumulator, or mio: copy send.
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)
         })
@@ -3761,8 +3759,8 @@ impl Future for ForwardToFuture<'_> {
 // ── RecvReadyFuture ──────────────────────────────────────────────────
 
 /// Future returned by [`Connection::recv_ready`]. Resolves when:
-/// 1. The driver holds received bytes for the connection: in the
-///    accumulator, or on io_uring in a lent buffer, OR
+/// 1. The driver holds received bytes for the connection in its
+///    accumulator, OR
 /// 2. The connection has finished receiving.
 pub struct RecvReadyFuture {
     conn_index: u32,

@@ -3,29 +3,25 @@
 //! `vec![0u8; n]` goes through `alloc_zeroed`, which for a large allocation
 //! hands back mapped-but-untouched pages: the mapping exists, but every page is
 //! the shared zero page until something writes to it. The first write takes a
-//! minor fault — and for a recv buffer that write is the *kernel* copying an
-//! skb into it, so the fault lands on the completion path rather than at
-//! startup.
+//! minor fault. For the send copy pool, the only buffer prefaulted, that write
+//! is the first send through a slot.
 //!
-//! Prefaulting moves that cost to launch. What it buys is predictability, not
-//! throughput:
+//! Prefaulting moves that cost to launch:
 //!
 //! - **Latency.** Faults stop appearing in the ramp, where they show up as p99
 //!   and p999 outliers rather than as a throughput number.
-//! - **Honest memory.** RSS after startup equals RSS under load, so a
-//!   configuration that asks for more memory than the machine has fails at
-//!   launch instead of during a traffic burst. That matches what `launch()`
-//!   already does for `RLIMIT_NOFILE` and `RLIMIT_MEMLOCK` — memory is the one
-//!   resource currently committed lazily.
+//! - **Memory.** RSS after startup equals RSS under load, so a configuration
+//!   that asks for more memory than the machine has fails at launch instead
+//!   of during a traffic burst, as `launch()` already does for
+//!   `RLIMIT_NOFILE` and `RLIMIT_MEMLOCK`.
 //! - **NUMA.** First touch decides the node. Ringline builds each worker's
-//!   driver *after* `pin_to_core` (see `worker.rs`), so prefaulting from the
+//!   driver after `pin_to_core` (see `worker.rs`), so prefaulting from the
 //!   constructor keeps every worker's buffers on its own node. Prefaulting from
-//!   an unpinned launching thread would do the opposite — pull every worker's
-//!   buffers onto one node — so this must stay on the worker thread.
+//!   an unpinned launching thread would pull every worker's buffers onto one
+//!   node, so this must stay on the worker thread.
 //!
-//! The cost is that over-provisioning stops being free. That is the point:
-//! a ring sized `256 × 1 MiB` is 256 MiB per worker whether or not the workload
-//! ever touches all of it, and an operator should find that out at startup.
+//! The cost is that the whole pool is resident from startup, whether or not
+//! the workload uses every slot.
 
 /// Page size, or 4096 if the platform will not say.
 ///

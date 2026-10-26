@@ -81,8 +81,7 @@ pub struct Config {
     pub(crate) close_lead_override: Option<crate::backend::uring::ring::CloseLead>,
     /// Recv buffer configuration for UDP multishot recvmsg.
     ///
-    /// UDP uses a separate provided buffer ring from TCP so the two can be
-    /// sized independently. Each buffer must fit an `io_uring_recvmsg_out`
+    /// Each buffer must fit an `io_uring_recvmsg_out`
     /// header (16 bytes) + `sockaddr_storage` (128 bytes) + the datagram
     /// payload. Default: 128 buffers × 2048 bytes (room for a standard-MTU
     /// datagram plus the multishot metadata); bump `buffer_size` if you
@@ -136,10 +135,10 @@ pub struct Config {
     /// Most bytes of free buffers a worker keeps for direct connections to
     /// borrow. See `ConfigBuilder::recv_direct_pool_max`.
     pub(crate) recv_direct_pool_max: usize,
-    /// Per-connection cap on received data a forward or a lend holds. See
-    /// `ConfigBuilder::forward_hold_cap`.
+    /// Sends a `forward_to_conn` sink may queue before its source stops
+    /// reading (mio). See `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
-    /// Fault recv and send buffer pages in at worker startup instead of on
+    /// Fault the send copy pool's pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its

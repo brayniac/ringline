@@ -303,15 +303,15 @@ impl Driver {
         }
     }
 
-    /// Whether a receive that completed should be re-armed at once. A TLS
-    /// connection re-arms during its handshake and after its hangup poll has
-    /// completed; otherwise its next parked read arms the receive, so a task
-    /// that does not read stops its peer. It is true for a connection with no
-    /// TLS state.
+    /// Whether a TLS connection's receive that completed should be re-armed
+    /// at once: during the handshake and after its hangup poll has completed.
+    /// Otherwise its next parked read arms the receive, so a task that does
+    /// not read stops its peer. False for a connection with no TLS state,
+    /// such as one whose completion closed it.
     pub(crate) fn rearms_after_completion(&self, conn_index: u32) -> bool {
         let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
         if !tls {
-            return true;
+            return false;
         }
         self.connections
             .get(conn_index)
@@ -2307,10 +2307,9 @@ impl Driver {
         }
     }
 
-    /// Re-arm the UDP multishot recvmsg for a socket. Called when the kernel
-    /// tears the multishot down (e.g. on `ENOBUFS` after the buffer ring
-    /// emptied) — the CQE handler pushes the hint here once replenishment
-    /// has refilled the ring.
+    /// Re-arm the UDP multishot recvmsg for a socket. The completion handlers
+    /// call it at once when the kernel ends the multishot, including on
+    /// `ENOBUFS`.
     pub(crate) fn rearm_udp_recvmsg(&mut self, udp_index: u32, bgid: u16) {
         let idx = udp_index as usize;
         if idx >= self.udp_sockets.len() {

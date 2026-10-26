@@ -369,9 +369,7 @@ fn feed_handshake_bytes_in_small_pieces() {
 }
 
 // A single `feed` call larger than MAX_SINGLE_APPEND is chunked rather
-// than tripping `append`'s debug_assert. `ConfigBuilder::recv_buffer`
-// accepts buffer sizes above 64 KiB, so this is reachable from public
-// config; the assert is silent in release.
+// than tripping `append`'s debug_assert; the assert is silent in release.
 #[test]
 fn feed_chunks_oversized_input() {
     let (mut server, _client) = conn_pair();

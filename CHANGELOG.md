@@ -555,15 +555,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Breaking:** on io_uring, the TCP provided-buffer ring: TCP and Unix
   connections receive directly (see Changed and Added), and only UDP
-  receives through a provided ring. A worker no longer allocates or
-  registers the TCP ring (4 MiB by default) or charges it to
-  `RLIMIT_MEMLOCK`. With it go `ConfigBuilder::recv_buffer` and
+  receives through a provided ring. A worker no longer allocates the TCP
+  ring's buffers (4 MiB by default) or registers the ring, whose entry array
+  (one page by default) Linux 6.14+ charged to `RLIMIT_MEMLOCK`. With it go `ConfigBuilder::recv_buffer` and
   `recv_buffer_bgid`; remove those calls. On mio, accumulators now start at
   `recv_accumulator_capacity` (4 KiB by default) instead of the
   `recv_buffer` size (16 KiB by default), and `recv_accumulator_max` must
   be at least 1 instead of at least that size. Also removed: the fallback
   receive for messages larger than the ring, and the receive throttle for
   connections whose `forward_recv_buf` sends held ring buffers.
+  `udp_recv_buffer_bgid(0)` with UDP configured, which 0.6 refused because
+  it equalled the TCP ring's default group id, is accepted.
 - **Breaking:** the `ringline/pool` counters `recv_parked`, `recv_fallback`
   and `forward_throttled` (`metrics::pool::RECV_PARKED`, `RECV_FALLBACK`,
   `FORWARD_THROTTLED`), and the `fallback_received` counter of

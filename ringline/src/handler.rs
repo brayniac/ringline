@@ -1604,9 +1604,9 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
-        // A close already requested owns the teardown (and its own recv
-        // cancel from try_finalize_close); a cancel in that window is a
-        // no-op, as it was when the old `Closed` state covered both.
+        // A close already requested owns the teardown (the close lead linked
+        // ahead of its Close ends its requests); a cancel in that window is a
+        // no-op.
         if cs.close_requested() {
             return Ok(());
         }

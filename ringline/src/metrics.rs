@@ -175,10 +175,9 @@ pub mod park_drain_us {
 
 /// Park diagnostic counters.
 ///
-/// The first four show whether `begin_park` submits the recv cancel, whether
-/// the `ECANCELED` re-arm suppression fires, and whether an arrival withdraws
-/// an offer while the connection drains
-/// (`docs/journal/2026-09-two-phase-park.md`).
+/// The first slots show whether `begin_park` submits a cancel and whether an
+/// arrival withdraws an offer while the connection drains
+/// (`docs/journal/2026-09-two-phase-park.md`). Slot 2 is unused.
 ///
 /// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
 /// unread or the connection's reader callback was the innermost one running
@@ -190,9 +189,7 @@ pub mod park_diag {
     /// `begin_park` started a park with no cancel, because neither a receive
     /// nor the hangup poll was armed.
     pub const CANCEL_ABSENT: usize = 1;
-    /// The `ECANCELED` branch took the draining early-return and skipped both
-    /// re-arms. If this is ~0 the suppression is dead code in practice.
-    pub const REARM_SUPPRESSED: usize = 2;
+    // Slot 2 is unused.
     /// An offer was withdrawn while the connection was marked draining — data
     /// reached it despite the cancel. If this tracks `not_offered`, the cancel
     /// is not stopping delivery and the premise is wrong at the root.
@@ -439,11 +436,6 @@ pub fn init_metadata() {
         park_diag::CANCEL_ABSENT,
         "op".into(),
         "cancel_absent".into(),
-    );
-    PARK_DIAG.insert_metadata(
-        park_diag::REARM_SUPPRESSED,
-        "op".into(),
-        "rearm_suppressed".into(),
     );
     PARK_DIAG.insert_metadata(
         park_diag::WITHDRAW_WHILE_DRAINING,

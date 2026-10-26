@@ -4774,12 +4774,11 @@ mod tests {
         // ENOMEM (e.g. runs 31887895010, 31710717130). The pressure clears as
         // sibling tests finish, so retry briefly before failing.
         //
-        // On Linux 6.14+ each ring and provided buffer ring is charged to
-        // RLIMIT_MEMLOCK, and a dropped ring's charge is released
-        // asynchronously. A test that sets up loops in quick succession (the
-        // proptests) can reach an 8 MiB limit before earlier rings are freed;
-        // setup then fails with an `Error::RingSetup` or
-        // `Error::BufferRegistration` naming ENOMEM. It clears once the
+        // On Linux 6.14+ each ring is charged to RLIMIT_MEMLOCK, and a dropped
+        // ring's charge is released asynchronously. A test that sets up loops
+        // in quick succession (the proptests) can reach an 8 MiB limit before
+        // earlier rings are freed; setup then fails with an `Error::RingSetup`
+        // naming ENOMEM. It clears once the
         // kernel's exit work frees those rings (#589).
         let mut io_attempts = 0;
         let mut memlock_attempts = 0;
@@ -6553,9 +6552,7 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         // Deliberately no buffered bytes: `DataPending` refuses while
         // anything is unconsumed, so a connection that reaches a successful
-        // park is idle by construction. Carrying leftovers was the earlier
-        // design and is superseded — see
-        // `held_ring_buffers_block_the_park_as_unconsumed_data`.
+        // park is idle by construction.
         el.driver.park_offered[conn_index as usize] = true;
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {

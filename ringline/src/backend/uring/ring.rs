@@ -583,29 +583,12 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit an async cancel targeting a specific user_data value.
-    /// Recover a real fd for a registered connection, so it can be handed to
-    /// another worker (tier 3, #443).
+    /// Cancel a request on `conn_index` ahead of a park: its direct receive
+    /// or its hangup poll, matched by `cancel_recv_user_data`.
     ///
-    /// When `cancel_recv_user_data` is given, an `AsyncCancel` for the armed
-    /// multishot recv is pushed first with `IOSQE_IO_LINK`, so the kernel
-    /// runs it *before* the install. That ordering is load-bearing: an armed
-    /// multishot recv pins the socket independently of the fixed-file table
-    /// (see `try_finalize_close`), so a recv left armed on this worker would
-    /// keep consuming bytes from a socket already handed to another one.
-    ///
-    /// A link is all-or-nothing: if the cancel fails — most likely `ENOENT`
-    /// because the recv self-terminated between the check and the kernel
-    /// running it — the install is completed with `ECANCELED` instead. The
-    /// caller treats that as "abandon this park and try again later", which
-    /// is the correct outcome rather than an error: park is best-effort.
-    /// Cancel a connection's multishot recv ahead of a park.
-    ///
-    /// Not linked to the install any more. A cancel cannot retract recv CQEs the
-    /// kernel has already posted, so an install linked behind it lands while
-    /// those are still being delivered and finds the handler's offer already
-    /// withdrawn — measured at 9,427 of 9,427 abandonments. The install is
-    /// submitted separately, once the handler has drained and re-offered.
+    /// Not linked to the install. A cancel cannot retract completions the
+    /// kernel has already posted, so the install is submitted separately,
+    /// once the handler has drained and re-offered.
     pub fn submit_park_recv_cancel(
         &mut self,
         conn_index: u32,
@@ -634,6 +617,7 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit an async cancel targeting a specific user_data value.
     pub fn submit_async_cancel(
         &mut self,
         target_user_data: u64,

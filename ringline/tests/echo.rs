@@ -6462,9 +6462,10 @@ fn forward_echo_large_message() {
 }
 
 #[test]
-fn forward_echo_sends_the_accumulator_under_a_guard() {
-    // forward_recv_buf detaches the accumulator and sends it under a guard
-    // rather than copying it into the send pool (#397).
+fn forward_echo_8_kib_message() {
+    // On io_uring forward_recv_buf detaches the accumulator and sends it under
+    // a guard rather than copying it into the send pool (#397). This checks
+    // only that the echo is correct.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
