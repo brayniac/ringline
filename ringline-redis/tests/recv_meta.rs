@@ -25,10 +25,6 @@ fn test_config() -> Config {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
-        // recv_buffer sizes the provided buffers of the stub server's accepted
-        // connections. On io_uring the client's outbound connection receives
-        // directly and does not use them.
-        .recv_buffer(128, 4096)
         .max_connections(64)
         // Large send-pool slot so the server can push the whole value in one send.
         .send_pool(16, 262_144)

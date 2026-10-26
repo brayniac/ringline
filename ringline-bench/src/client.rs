@@ -620,7 +620,6 @@ mod ringline_client {
                 .workers(workers)
                 .pin_to_core(false)
                 .sq_entries(4096)
-                .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
                 .max_connections(max_conns)
                 .send_pool(slots as u16, msg_size.next_power_of_two().max(256) as u32)
                 .build()

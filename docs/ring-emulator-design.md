@@ -2,6 +2,10 @@
 
 Note (2026-10-25): segmented recv and `forward_to` were removed.
 
+Note (2026-10-25): the TCP provided-buffer ring was removed, with
+`OpTag::RecvMulti`, `OpTag::SendRecvBuf`, `OpTag::RecvFallback` and
+`recv_incremental`.
+
 Status: proposal. Nothing here is implemented.
 
 ## Goal

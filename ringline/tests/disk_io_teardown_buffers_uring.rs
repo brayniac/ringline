@@ -106,7 +106,6 @@ fn a_read_dropped_with_its_connection_frees_its_buffer() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         .blocking_threads(0)

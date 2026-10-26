@@ -27,7 +27,6 @@ fn small_config_builder() -> ConfigBuilder {
         .workers(2)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         .max_registered_regions(4)

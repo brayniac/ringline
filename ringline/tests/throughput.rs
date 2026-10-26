@@ -48,10 +48,9 @@ fn test_config_builder() -> ConfigBuilder {
         .pin_to_core(false)
         // Sized so an 8 MiB sustained echo fits without stalling on
         // resource limits — the slot count covers the worst-case in-flight
-        // pipeline given default 16 KiB slots, the SQ holds enough entries
-        // to keep io_uring busy, and the recv buffer ring matches.
+        // pipeline given default 16 KiB slots, and the SQ holds enough
+        // entries to keep io_uring busy.
         .sq_entries(2048)
-        .recv_buffer(512, 16 * 1024)
         .max_connections(64)
         .send_pool(2048, 16384)
         .standalone_task_capacity(32)

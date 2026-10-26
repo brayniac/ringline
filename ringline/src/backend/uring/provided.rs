@@ -25,31 +25,10 @@ pub struct ProvidedBufRing {
     tail: u16,
     /// Mask for ring index wrapping.
     mask: u16,
-    /// Buffers out of the ring: exhausted by the kernel and not yet
+    /// Buffers out of the ring: handed to a completion and not yet
     /// returned. `ring_size - outstanding` buffers are free in the ring for
-    /// the kernel to pick. Maintained by `complete` and `release_batch`, or
-    /// by `on_handout` and `replenish_batch` for a ring that does not track
-    /// buffer state (UDP). Backpressure decisions read `free()`.
+    /// the kernel to pick. Maintained by `on_handout` and `replenish_batch`.
     outstanding: u32,
-    /// Whether the ring is registered with `IOU_PBUF_RING_INC`. On a plain
-    /// ring every completion exhausts its buffer.
-    incremental: bool,
-    /// Per-buffer state, indexed by bid; see `complete` and `release_batch`.
-    state: Vec<BufState>,
-    /// Buffers with at least one hold: the count the lend cap compares.
-    held: u32,
-}
-
-/// What the driver knows about one buffer since it was last posted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct BufState {
-    /// Bytes the kernel has written into the buffer.
-    written: u32,
-    /// Completions whose data is still in use: each completion takes one,
-    /// and each release drops one.
-    holds: u32,
-    /// The kernel is done with the buffer.
-    exhausted: bool,
 }
 
 /// An io_uring buf_ring entry (matches kernel struct io_uring_buf).
@@ -100,9 +79,6 @@ impl ProvidedBufRing {
             tail: 0,
             mask: ring_size - 1,
             outstanding: 0,
-            incremental: false,
-            state: vec![BufState::default(); ring_size as usize],
-            held: 0,
         };
 
         // Pre-fill the ring with all buffers
@@ -113,33 +89,6 @@ impl ProvidedBufRing {
         ring.commit_tail();
 
         Ok(ring)
-    }
-
-    /// Ask the kernel not to back the buffers with transparent huge pages
-    /// (`MADV_NOHUGEPAGE`), so a completion makes resident only the pages it
-    /// writes. Advisory: an error leaves the default in place.
-    pub(crate) fn advise_no_huge_pages(&mut self) {
-        // Safety: sysconf has no preconditions.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let start = self.mem.as_ptr() as usize;
-        let end = start + self.mem.len();
-        let aligned = start.next_multiple_of(page);
-        let len = end.saturating_sub(aligned) / page * page;
-        if len > 0 {
-            // Safety: `[aligned, aligned + len)` lies inside `mem`,
-            // which this ring owns; the advice changes no contents.
-            unsafe { libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_NOHUGEPAGE) };
-        }
-    }
-
-    /// Fault every provided buffer in before the ring is armed.
-    ///
-    /// The recv path's first touch of a buffer is the *kernel* copying an skb
-    /// into it, so an unfaulted page costs a minor fault on the completion
-    /// path. See [`crate::buffer::prefault`]; this must run on the worker
-    /// thread that owns the ring, which is where the driver is built.
-    pub(crate) fn prefault(&mut self) {
-        crate::buffer::prefault::prefault(self.mem.as_mut_slice());
     }
 
     /// Get the ring pointer for `register_buf_ring()`.
@@ -158,10 +107,8 @@ impl ProvidedBufRing {
     }
 
     /// Record that the kernel handed one buffer to a completion (consumed one
-    /// from the ring), for a ring that does not track buffer state (UDP).
-    /// Call exactly once per recv completion that selected a buffer, before it
-    /// is processed, and balance it with `replenish_batch`. The TCP ring uses
-    /// `complete` and `release_batch` instead.
+    /// from the ring). Call exactly once per recv completion that selected a
+    /// buffer, before it is processed, and balance it with `replenish_batch`.
     #[inline]
     pub fn on_handout(&mut self) {
         self.outstanding += 1;
@@ -173,116 +120,10 @@ impl ProvidedBufRing {
         );
     }
 
-    /// Record a receive completion that selected buffer `bid` and delivered
-    /// `res` bytes, and take a hold on it for that completion. Returns the
-    /// offset of the completion's data in the buffer. `buf_more` is the
-    /// completion's `IORING_CQE_F_BUF_MORE`; on a plain ring every completion
-    /// exhausts its buffer.
-    ///
-    /// Call once per completion that carries `IORING_CQE_F_BUFFER`, the
-    /// stale-CQE early returns included, before its data is read, and release
-    /// the hold through `release_batch`.
-    ///
-    /// # Panics
-    /// If the buffer is already exhausted, or if `written` disagrees with
-    /// `buf_more` on an incremental ring.
-    pub(crate) fn complete(&mut self, bid: u16, res: u32, buf_more: bool) -> u32 {
-        let buf_size = self.buf_size;
-        let s = &mut self.state[bid as usize];
-        assert!(!s.exhausted, "completion on exhausted buffer {bid}");
-        let offset = s.written;
-        s.written += res;
-        s.holds += 1;
-        if s.holds == 1 {
-            self.held += 1;
-        }
-        s.exhausted = !self.incremental || !buf_more;
-        if self.incremental {
-            assert_eq!(
-                s.written == buf_size,
-                s.exhausted,
-                "buffer {bid}: {} of {buf_size} bytes written, F_BUF_MORE {buf_more}",
-                s.written
-            );
-        }
-        if s.exhausted {
-            self.outstanding += 1;
-            debug_assert!(self.outstanding <= self.ring_size as u32);
-        }
-        offset
-    }
-
-    /// Drop one completion's hold on each bid in `bids`, and
-    /// post every buffer that is then exhausted with no holds back to the
-    /// ring, whole. A bid may appear more than once, once per hold it drops.
-    ///
-    /// # Panics
-    /// If a bid has no hold to drop: it was released more times than it was
-    /// held. A duplicate release that arrives after the buffer was
-    /// posted and completed again takes that completion's hold and is not
-    /// detected.
-    pub(crate) fn release_batch(&mut self, bids: &[u16]) {
-        let mut posted = false;
-        for &bid in bids {
-            let s = &mut self.state[bid as usize];
-            assert!(s.holds > 0, "release of buffer {bid}, which has no hold");
-            s.holds -= 1;
-            if s.holds == 0 {
-                self.held -= 1;
-            }
-            if s.exhausted && s.holds == 0 {
-                *s = BufState::default();
-                self.outstanding -= 1;
-                self.push_entry(bid);
-                posted = true;
-            }
-        }
-        if posted {
-            self.commit_tail();
-        }
-    }
-
-    /// Treat the ring as incremental (`IOU_PBUF_RING_INC`): a completion
-    /// exhausts its buffer only when it clears `IORING_CQE_F_BUF_MORE`. Call
-    /// before the first completion, when the ring is registered as
-    /// incremental.
-    pub(crate) fn set_incremental(&mut self) {
-        self.incremental = true;
-    }
-
-    /// Buffers with at least one hold: completions whose data a lend still
-    /// holds, plus those whose release is queued for the next flush.
-    pub(crate) fn held(&self) -> u32 {
-        self.held
-    }
-
-    /// Size of each buffer in bytes.
-    pub(crate) fn buffer_size(&self) -> u32 {
-        self.buf_size
-    }
-
     /// Buffers currently available in the ring for the kernel to select.
-    #[inline]
+    #[cfg(test)]
     pub fn free(&self) -> u32 {
         self.ring_entries().saturating_sub(self.outstanding)
-    }
-
-    /// The `(addr, len, bid)` of ring entry `index`, as the kernel left it.
-    /// An incremental ring's entry advances in place.
-    pub(crate) fn entry(&self, index: u16) -> (u64, u32, u16) {
-        let off = (index & self.mask) as usize * Self::ENTRY_SIZE;
-        // Safety: `off` is inside the mapped ring; the kernel writes the
-        // entry, so it is read volatile.
-        let e = unsafe { ptr::read_volatile(self.ring_ptr.add(off) as *const BufRingEntry) };
-        (e.addr, e.len, e.bid)
-    }
-
-    /// Address of the byte at `off` in buffer `bid`: the data of a completion
-    /// that `complete` placed at that offset.
-    pub(crate) fn data_ptr(&self, bid: u16, off: u32) -> *const u8 {
-        debug_assert!(off <= self.buf_size);
-        // Safety: `off` is within buffer `bid`, which is inside `mem`.
-        unsafe { self.get_buffer(bid).0.add(off as usize) }
     }
 
     /// Get a pointer and length for a buffer by its ID.
@@ -300,10 +141,9 @@ impl ProvidedBufRing {
         }
         if !bids.is_empty() {
             // Tripwire: replenishing more buffers than are outstanding means a bid
-            // was returned to the ring more than once (a double-replenish) — the
-            // recurring failure mode for the zero-copy hold/segment/forward paths.
-            // `saturating_sub` keeps `free()` sane in release; this catches the bug
-            // in debug/tests before it can silently corrupt ring accounting.
+            // was returned to the ring more than once (a double-replenish).
+            // `saturating_sub` keeps the count from underflowing in release; this
+            // catches the bug in debug and tests.
             debug_assert!(
                 self.outstanding >= bids.len() as u32,
                 "double-replenish: returning {} buffers but only {} outstanding",
@@ -411,88 +251,6 @@ mod tests {
         ring.replenish_batch(&[0, 1, 2]);
         assert_eq!(ring.free(), 4);
         assert_eq!(ring.ring_entries(), 4);
-    }
-
-    /// A plain ring: each completion exhausts its buffer at offset 0, and the
-    /// release returns it.
-    #[test]
-    fn a_plain_completion_returns_on_release() {
-        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
-        assert_eq!(ring.complete(2, 100, true), 0);
-        assert_eq!(ring.free(), 3);
-        ring.release_batch(&[2]);
-        assert_eq!(ring.free(), 4);
-        assert_eq!(ring.state[2], BufState::default());
-        // Posted again, it can complete again.
-        assert_eq!(ring.complete(2, 50, false), 0);
-    }
-
-    /// An incremental ring: completions append at increasing offsets, and the
-    /// buffer returns only once it is exhausted and every hold is released.
-    #[test]
-    fn an_incremental_buffer_returns_when_exhausted_and_released() {
-        let mut ring = ProvidedBufRing::new(0, 4, 100).expect("ring");
-        ring.incremental = true;
-        assert_eq!(ring.complete(1, 30, true), 0);
-        assert_eq!(ring.complete(1, 30, true), 30);
-        ring.release_batch(&[1, 1]);
-        assert_eq!(ring.free(), 4, "partly used: still in the ring");
-        assert_eq!(ring.complete(1, 40, false), 60);
-        assert_eq!(ring.free(), 3);
-        ring.release_batch(&[1]);
-        assert_eq!(ring.free(), 4);
-        assert_eq!(ring.state[1], BufState::default());
-    }
-
-    #[test]
-    fn an_exhausted_buffer_waits_for_its_last_hold() {
-        let mut ring = ProvidedBufRing::new(0, 4, 100).expect("ring");
-        ring.incremental = true;
-        ring.complete(0, 60, true);
-        ring.complete(0, 40, false);
-        ring.release_batch(&[0]);
-        assert_eq!(ring.free(), 3);
-        ring.release_batch(&[0]);
-        assert_eq!(ring.free(), 4);
-    }
-
-    /// `held()` counts buffers with any hold once, however many holds.
-    #[test]
-    fn held_counts_each_buffer_once() {
-        let mut ring = ProvidedBufRing::new(0, 4, 100).expect("ring");
-        ring.incremental = true;
-        ring.complete(0, 10, true);
-        ring.complete(0, 10, true);
-        ring.complete(1, 10, true);
-        assert_eq!(ring.held(), 2);
-        ring.release_batch(&[0]);
-        assert_eq!(ring.held(), 2, "buffer 0 still has a hold");
-        ring.release_batch(&[0, 1]);
-        assert_eq!(ring.held(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "release of buffer 3, which has no hold")]
-    fn a_second_release_panics() {
-        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
-        ring.complete(3, 10, false);
-        ring.release_batch(&[3, 3]);
-    }
-
-    #[test]
-    #[should_panic(expected = "completion on exhausted buffer 1")]
-    fn a_completion_on_an_exhausted_buffer_panics() {
-        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
-        ring.complete(1, 10, false);
-        ring.complete(1, 10, false);
-    }
-
-    #[test]
-    #[should_panic(expected = "buffer 0: 50 of 100 bytes written, F_BUF_MORE false")]
-    fn an_incremental_buffer_exhausted_early_panics() {
-        let mut ring = ProvidedBufRing::new(0, 4, 100).expect("ring");
-        ring.incremental = true;
-        ring.complete(0, 50, false);
     }
 
     #[test]

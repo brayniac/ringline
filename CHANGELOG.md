@@ -112,24 +112,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::ttlb_ns`, the time from the operation's start to the
   arrival of the response's last byte.
-- io_uring: `ConfigBuilder::recv_incremental(true)` registers each worker's
-  TCP receive ring as incremental (`IOU_PBUF_RING_INC`), where successive
-  receives share a buffer at increasing offsets (#622). Each worker first
-  checks, on a one-entry ring and a socketpair, that the kernel behaves as
-  the receive path relies on, and otherwise uses a plain ring. Without a
-  `recv_buffer` call the geometry follows the ring kind: 64 × 1 MiB
-  incremental, 4096 × 64 KiB plain with `MADV_NOHUGEPAGE`, and `build()`
-  requires `recv_accumulator_max` of at least 1 MiB. Default off.
-  `ringline/recv_ring` counts the kind each worker selected, and
-  `ringline/recv_preflight_failed` the step a failed check stopped at.
-  Data is lent (held in place) only while at most half the ring's buffers
-  have a hold (a lend, or a completion whose release is queued for the
-  next flush), and copied above that (`ringline/recv_ring`
-  `lend_refused`), and the fallback
-  receive reads 1 MiB chunks, re-arming the multishot instead when the
-  ring's free buffers hold more. With `prefault_buffers(true)` the plain
-  geometry makes 256 MiB per worker resident.
-
 - Three connection counters (`ringline/connections`, `op` label) count three
   ways an accepted connection can be closed before it reaches a handler:
   `accept_table_full` (the worker's connection table was full),
@@ -205,9 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with recv batching, send coalescing, or both. The split answers it — both
   halves move together, because the forward path returns each received
   buffer as one send, so a buffer holding *k* pipelined requests costs one
-  recv completion and one send completion. Two slots are never registered
-  (the enum skips discriminants 1 and 17); a metrics dump reports those as
-  `idx1`/`idx17` at zero rather than omitting them (#486).
+  recv completion and one send completion. A slot whose discriminant no tag
+  uses is never registered; a metrics dump reports it as `idxN` at zero
+  rather than omitting it (#486).
 - `ConnCtx::with_data_result`: like `with_data`, but resolves to
   `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
   from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
@@ -235,12 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   writes into the buffer rustls processes records in, which removes one copy
   per received byte; a TLS receive costs 2 copies instead of 3. With
   `tls-buffered` it writes into a worker buffer that `read_tls` copies from,
-  as from a provided buffer before. The ring that `recv_buffer` and
-  `recv_incremental` configure is still registered, but no TCP connection
-  receives into it. `ringline/recv_direct` counts TLS receives and their
-  bytes. With `tls-buffered`, each TLS receive in flight holds a pooled
-  buffer of `recv_direct_region` bytes; the unbuffered engine receives into
-  its existing ciphertext buffer. A TLS receive that cannot be submitted
+  as from a provided buffer before. `ringline/recv_direct` counts TLS
+  receives and their bytes. With `tls-buffered`, each TLS receive in flight
+  holds a pooled buffer of `recv_direct_region` bytes; the unbuffered engine
+  receives into its existing ciphertext buffer. A TLS receive that cannot be submitted
   closes the connection, as a plaintext one does; before, it was retried.
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
@@ -277,8 +257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sends on the sink, with one chunk buffered, and below `send_zc_threshold`
   copied into a pool slot. A zero-copy send of such a forward to a sink that
   does not read holds worker exit for up to its bound, as any guarded send
-  does. `recv_multishot` has no effect: TLS connections, the only
-  ones it affected, always arm one-shot receives.
+  does.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from
@@ -353,38 +332,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   io_uring completion can name. At 65536 it takes about 1.7 MiB per worker.
   `ringline::TIMER_SLOTS` is the size. Remove `.timer_slots(n)` calls;
   `try_sleep` and `try_timeout` still report a full pool.
-- **Breaking, behaviour:** on io_uring, TCP connections arm a one-shot
-  buffer-select recv and re-arm it when it completes, instead of one
-  multishot recv per connection. `ConfigBuilder::recv_multishot(true)`
-  restores multishot. A multishot recv keeps taking provided
-  buffers while its socket has data, so with many connections and large
-  messages some connections held the ring while others were served nothing.
-  Measured on two machines with a RESP server (8 workers, 2048 connections,
-  80/20 GET/SET, three 60 s runs per mode, 5 s client request timeout). At
-  depth 16 and 64 KiB values, multishot timed out 176,848–178,272 requests
-  per run (4.2% of the requests the client sent), and the GET p99 of the
-  requests that completed was 0.69–0.73 s; one-shot timed out none, served
-  every connection in every 10 s window, and had a GET p99 of 1.36–1.40 s
-  and a p99.9 of 1.93–1.98 s. Both served 68–69k operations per second. The
-  cost is one SQE per received buffer. At depth 16, one-shot served 2–3%
-  fewer operations than multishot with 64 B and 4 KiB values (4.76–4.79M
-  against 4.89–4.91M ops/s; 945–951k against 969–983k) and used 1–4% more
-  server CPU per operation. At depth 1 with 64 KiB values it served 3–5%
-  fewer (64.95–65.19k against 67.41–68.08k ops/s) and used 4–6% more CPU per
-  operation, with a GET p99 of 36 ms against 55–56 ms. One connection
-  streaming 1 MiB writes over loopback received 7.7–7.9 GB/s one-shot
-  against 9.5–9.6 GB/s multishot. `recv_parked` and `buffer_ring_empty`
-  count once per recv arm that completes with `ENOBUFS` in both modes;
-  one-shot arms once per received buffer, so on the rig the one-shot rate
-  was 0.94–2.4 times the multishot rate, depending on value size and depth.
-  At depth 16 with 64 KiB values the multishot rate rose with the
-  connections accumulating on the server, from about the one-shot rate to 12
-  times it by the end of the run. In both modes, `forward_throttled` counts
-  every time a connection reaches its hold cap, a re-arm whose SQE cannot be
-  pushed at the end of a completion is retried instead of closing the
-  connection, and the incremental-ring preflight tests one-shot as well as
-  multishot receives, falling back to plain rings if either fails.
-
 - On io_uring, consecutive queued copy sends on one connection, plaintext
   or TLS ciphertext, go out as one `sendmsg` even when they belong to
   different `send` calls (#628); before, each call took its own operation.
@@ -397,13 +344,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `send_nowait`, a client pipelining 32 requests per write cost 32 send
   operations per round before this change and 2 after; at depth 1 both
   cost 1.
-
-- On io_uring, each TCP provided receive buffer keeps a count of the
-  completions whose data is still in use, and returns to the ring only when
-  the kernel is done with it and the count is zero (#622). A buffer
-  released more times than it completed panics the worker, naming the
-  buffer, in release builds as well as debug; before, a release build
-  clamped the ring's free count, posted the buffer twice, and continued.
 
 - On mio, the event loop no longer waits out its idle poll timeout (10 ms
   by default) while a writable connection has sends queued. A task that
@@ -443,13 +383,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ConfigBuilder::sq_entries` must be at least 2: a
   connection's close pushes a linked shutdown and `Close` together (#581).
   `sq_entries(1)` now fails `build()`.
-
-- **Breaking:** `ConfigBuilder::build` rejects a TCP or UDP receive buffer
-  group id of 65535 (`recv_buffer_bgid`, `udp_recv_buffer_bgid`), on both
-  backends. The io_uring backend uses that group id to check whether the
-  kernel supports incremental buffer rings (`IOU_PBUF_RING_INC`). A
-  `recv_buffer_bgid(65535)` or `udp_recv_buffer_bgid(65535)` config now
-  fails `build()` (#625).
 
 - **Breaking:** `JoinHandle` (from `spawn_with_handle`) and
   `BlockingJoinHandle` (from `spawn_blocking`) resolve to
@@ -620,6 +553,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** on io_uring, the TCP provided-buffer ring: TCP and Unix
+  connections receive directly (see Changed and Added), and only UDP
+  receives through a provided ring. A worker no longer allocates the TCP
+  ring's buffers (4 MiB by default) or registers the ring, whose entry array
+  (one page by default) Linux 6.14+ charged to `RLIMIT_MEMLOCK`. With it go
+  `ConfigBuilder::recv_buffer` and `recv_buffer_bgid`; remove those calls.
+  On io_uring, `recv_direct_region` (32 KiB by default) sets the buffer an
+  idle plaintext connection receives into and the most ciphertext a TLS
+  connection receives at a time; a message larger than that buffer borrows
+  a larger one (`recv_direct_pool_max`). On mio, accumulators now start at
+  `recv_accumulator_capacity` (4 KiB by default) instead of the
+  `recv_buffer` size (16 KiB by default); `recv_accumulator_capacity(16384)`
+  restores 0.6's starting size. `recv_accumulator_max` must be at least 1
+  instead of at least that size. `pool::BUFFER_RING_EMPTY` counts only the
+  UDP ring. Also removed: the fallback receive for messages larger than the
+  ring, and the receive throttle for connections whose `forward_recv_buf`
+  sends held ring buffers.
+  `udp_recv_buffer_bgid(0)` with UDP configured, which 0.6 refused because
+  it equalled the TCP ring's default group id, is accepted.
+- **Breaking:** the `ringline/pool` counters `recv_parked`, `recv_fallback`
+  and `forward_throttled` (`metrics::pool::RECV_PARKED`, `RECV_FALLBACK`,
+  `FORWARD_THROTTLED`), and the `fallback_received` counter of
+  `ringline/bytes` (`metrics::bytes::FALLBACK_RECEIVED`), which counted the
+  TCP ring. The `[ringline diag]` line of `loop_diag` loses its `parks=` and
+  `fallbacks=` fields.
+
 - **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), which
   wrote a connection's received bytes to a socket or a buffered file, and
   `ConfigBuilder::recv_segment_reserve`, which in 0.6 applied to `forward_to`
@@ -638,7 +597,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with `with_data`.
 - **Breaking:** `metrics::pool::SEGMENT_STRANDED_ADOPTED`, the
   `segment_stranded_adopted` op of `ringline/pool`, which counted bytes a
-  segment reader found in the accumulator. Slot 7 of the group is unused.
+  segment reader found in the accumulator.
 - **Breaking:** `enable_recv_forward`, `forward_held`, `run_direct_echo`
   (io_uring only, with `DirectEchoFuture`), `set_recv_sink` and
   `take_recv_sink`, wherever `ConnCtx`, `Connection` or `RecvHalf` had them,
@@ -742,10 +701,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   arrived while it had unread bytes. The reconnect runs inside `client()`,
   which waits for the connect (and AUTH on redis), bounded per slot by
   `connect_timeout_ms`; with the default of 0 there is no bound.
-- io_uring: `recv_ready` resolves for bytes in a lent receive buffer, as
-  well as for bytes in the accumulator. It stayed pending for a receive lent
-  in place on a connection with an empty accumulator until the next receive
-  or the close. mio is unchanged.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::rx_bytes` is 0 for an operation that fails at send. It
   reported the previous operation's byte count. The guarded SET paths
@@ -763,14 +718,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the time the handler offers is not parked.
   `metrics::park_diag::OFFER_DECLINED` counts ignored offers. Found by
   reading the code; not observed. Park (#443) is not in a release. (#669)
-- io_uring: a connection with a lent receive buffer is not parked. The park
-  check refused a connection holding unread bytes in its accumulator or
-  receive holds, but not one whose bytes were in a lent provided buffer
-  (`pending_recv_bufs`), and the park does not carry that buffer. Bytes that
-  arrived before the handler offered to park, and that the handler had not
-  read when the park completed, were discarded when the park closed the
-  connection on the old worker. Found by reading the code; not observed.
-  Park (#443) is not in a release.
 - `ringline-memcache`: a client built with `with_metrics()` and no
   `on_result` callback records the latency of `fire_*`/`recv` operations.
   It read the clock only when a callback was set, so those operations
@@ -785,25 +732,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection buffered, and `reset` keeps the allocation, so each slot kept
   that size until a new connection took it, and then for that connection's
   lifetime. After a 1 MiB forward echo at 512 connections on one io_uring
-  worker with `recv_incremental`, RSS once every connection had closed was
-  791 and 874 MiB in two runs without this change and 276 and 336 MiB with
-  it (measured on a development branch whose bench server has
-  `--recv-incremental`). Both backends.
-- io_uring: with more connections than provided receive buffers, a worker
-  could leave some connections without a response for the whole 12 s
-  measurement window of a benchmark run. When any buffer was free, each pass
-  re-armed every connection parked on `ENOBUFS`; most re-arms got `ENOBUFS`
-  again, and the order of the parked list decided which connections were
-  re-armed first. Parked connections are now re-armed oldest first, the passes
-  between two waits of the event loop share a budget of one re-arm per free
-  buffer, and a connection that parks again goes to the back. Measured on loopback
-  with one worker, 10,000 closed-loop connections, the default one-shot
-  receive, a handler that echoes with `with_data` and `forward_recv_buf`, and
-  a 256 × 16 KiB ring, 4 runs each: at 64 KiB per request, throughput went
-  from 10.5–10.7k to 31.1–33.7k requests/s, p99 from 4.2–7.1 s to
-  0.31–0.40 s, and the connections without a response from 0–486 to 0. At
-  256 B, one of 4 runs before the change fell to 54k requests/s with 56M
-  `buffer_ring_empty`; all 4 runs after stayed at 399–408k.
+  worker with an incremental TCP receive ring, which no release shipped,
+  RSS once every connection had closed was 791 and 874 MiB in two runs
+  without this change and 276 and 336 MiB with it. Both backends.
 - io_uring: the error text of a failed buffer registration names a failed
   page migration as a cause, and the `EFAULT` text names io_uring's 1 GiB
   per-buffer limit. A long-term pin migrates pages in `ZONE_MOVABLE` or in

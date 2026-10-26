@@ -501,12 +501,19 @@ mod tests {
 
         assert!(ciphertext_to_sends(&mut pool, 0, 0, &ciphertext, &mut out));
         assert_eq!(out.len(), 3, "130 bytes over 64-byte slots is 64 + 64 + 2");
+        let lens: Vec<u32> = out
+            .iter()
+            .map(|b| match b.entry.op {
+                crate::backend::uring::sqe::Op::Send { len, .. } => len,
+                op => panic!("expected a send, got {op:?}"),
+            })
+            .collect();
         assert_eq!(
-            out.iter().map(|b| b.total_len).sum::<u32>(),
+            lens.iter().sum::<u32>(),
             130,
             "every byte must be accounted for exactly once"
         );
-        assert_eq!(out[2].total_len, 2, "the tail slot carries the remainder");
+        assert_eq!(lens[2], 2, "the tail slot carries the remainder");
         assert_eq!(pool.free_count(), 1);
     }
 

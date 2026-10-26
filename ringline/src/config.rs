@@ -79,18 +79,13 @@ pub struct Config {
     /// on one host.
     #[cfg(all(test, has_io_uring))]
     pub(crate) close_lead_override: Option<crate::backend::uring::ring::CloseLead>,
-    /// Recv buffer configuration (provided buffer ring) for TCP recv.
-    pub(crate) recv_buffer: RecvBufferConfig,
     /// Recv buffer configuration for UDP multishot recvmsg.
     ///
-    /// UDP uses a separate provided buffer ring from TCP so the two can be
-    /// sized independently. Each buffer must fit an `io_uring_recvmsg_out`
+    /// Each buffer must fit an `io_uring_recvmsg_out`
     /// header (16 bytes) + `sockaddr_storage` (128 bytes) + the datagram
     /// payload. Default: 128 buffers × 2048 bytes (room for a standard-MTU
     /// datagram plus the multishot metadata); bump `buffer_size` if you
     /// expect jumbo datagrams.
-    ///
-    /// `bgid` must differ from `recv_buffer.bgid` when UDP is in use.
     pub(crate) udp_recv_buffer: RecvBufferConfig,
     /// User-registered memory regions (e.g., mmap'd storage arenas).
     ///
@@ -132,7 +127,7 @@ pub struct Config {
     /// untrusted peers should set something much smaller (4–16× the typical
     /// request size). Setting it too low will close legitimate
     /// slow-consumer workloads (where kernel recv CQEs batch faster than
-    /// the handler runs); it must be at least `recv_buffer_size`.
+    /// the handler runs).
     pub(crate) recv_accumulator_max: usize,
     /// Size of a direct connection's own receive buffer. See
     /// `ConfigBuilder::recv_direct_region`.
@@ -140,17 +135,12 @@ pub struct Config {
     /// Most bytes of free buffers a worker keeps for direct connections to
     /// borrow. See `ConfigBuilder::recv_direct_pool_max`.
     pub(crate) recv_direct_pool_max: usize,
-    /// Per-connection cap on received data a forward or a lend holds. See
-    /// `ConfigBuilder::forward_hold_cap`.
+    /// Sends a `forward_to_conn` sink may queue before its source stops
+    /// reading (mio). See `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
-    /// Fault recv and send buffer pages in at worker startup instead of on
+    /// Fault the send copy pool's pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
-    /// Try an incremental TCP receive ring. See
-    /// `ConfigBuilder::recv_incremental`.
-    pub(crate) recv_incremental: bool,
-    /// `ConfigBuilder::recv_multishot`. Has no effect outside unit tests.
-    pub(crate) recv_multishot: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -401,12 +391,10 @@ impl Default for Config {
             iowq_max_workers: 0,
             #[cfg(all(test, has_io_uring))]
             close_lead_override: None,
-            recv_buffer: RecvBufferConfig::default(),
             udp_recv_buffer: RecvBufferConfig {
                 ring_size: 128,
                 buffer_size: 2048,
                 bgid: 1,
-                explicit: false,
             },
             registered_regions: Vec::new(),
             max_registered_regions: 64,
@@ -423,8 +411,6 @@ impl Default for Config {
             // the intent but is also a behaviour change for anything that
             // over-provisions today and never touches what it asked for.
             prefault_buffers: false,
-            recv_incremental: false,
-            recv_multishot: false,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -543,28 +529,10 @@ impl Config {
 
     /// Validate configuration values. Returns an error if any value is out of range.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
-        if !self.recv_buffer.ring_size.is_power_of_two() {
+        if self.recv_accumulator_max == 0 {
             return Err(crate::error::Error::RingSetup(
-                "recv_buffer.ring_size must be a power of two".into(),
+                "recv_accumulator_max must be > 0 (use usize::MAX to disable the cap)".into(),
             ));
-        }
-        if self.recv_buffer.buffer_size == 0 {
-            return Err(crate::error::Error::RingSetup(
-                "recv_buffer.buffer_size must be > 0".into(),
-            ));
-        }
-        // A cap below one recv buffer would overflow on the first full
-        // buffer, and some pending-buffer flush paths assume a single
-        // buffer's append into an empty accumulator cannot fail.
-        let largest_buffer = self
-            .tcp_recv_geometry(true)
-            .1
-            .max(self.tcp_recv_geometry(false).1);
-        if self.recv_accumulator_max < largest_buffer as usize {
-            return Err(crate::error::Error::RingSetup(format!(
-                "recv_accumulator_max must be >= the TCP receive buffer size, {largest_buffer} \
-                 (use usize::MAX to disable the cap)"
-            )));
         }
         if self.recv_direct_region == 0 {
             return Err(crate::error::Error::RingSetup(
@@ -685,18 +653,6 @@ impl Config {
                         .into(),
                 ));
             }
-            if self.udp_recv_buffer.bgid == self.recv_buffer.bgid {
-                return Err(crate::error::Error::RingSetup(
-                    "udp_recv_buffer.bgid must differ from recv_buffer.bgid".into(),
-                ));
-            }
-        }
-        // The io_uring engine probes incremental buffer rings under bgid
-        // u16::MAX, so no configured group may use it.
-        if self.recv_buffer.bgid == u16::MAX || self.udp_recv_buffer.bgid == u16::MAX {
-            return Err(crate::error::Error::RingSetup(
-                "recv_buffer.bgid and udp_recv_buffer.bgid must not be 65535 (reserved)".into(),
-            ));
         }
         if self.close_notify_timeout_ms == 0 || self.close_notify_timeout_ms > 60000 {
             return Err(crate::error::Error::RingSetup(
@@ -707,7 +663,7 @@ impl Config {
     }
 }
 
-/// Configuration for the provided buffer ring (TCP recv).
+/// Configuration for a provided buffer ring (UDP recv).
 #[derive(Clone)]
 pub(crate) struct RecvBufferConfig {
     /// Number of buffers in the ring (must be power of 2).
@@ -716,41 +672,6 @@ pub(crate) struct RecvBufferConfig {
     pub buffer_size: u32,
     /// Buffer group ID for the provided buffer ring.
     pub bgid: u16,
-    /// Whether `ConfigBuilder::recv_buffer` set the geometry. With
-    /// `recv_incremental` on, a geometry not set follows the ring kind.
-    pub explicit: bool,
-}
-
-impl Default for RecvBufferConfig {
-    fn default() -> Self {
-        Self {
-            ring_size: 256,
-            buffer_size: 16384,
-            bgid: 0,
-            explicit: false,
-        }
-    }
-}
-
-/// The TCP receive ring's geometry, `(ring_size, buffer_size)`, for an
-/// incremental ring, with `recv_incremental` on and no `recv_buffer` call.
-pub(crate) const RECV_INCREMENTAL_GEOMETRY: (u16, u32) = (64, 1 << 20);
-/// The TCP receive ring's geometry for a plain ring, with
-/// `recv_incremental` on and no `recv_buffer` call.
-pub(crate) const RECV_PLAIN_GEOMETRY: (u16, u32) = (4096, 64 << 10);
-
-impl Config {
-    /// The TCP receive ring's `(ring_size, buffer_size)` for a ring
-    /// registered as incremental or not.
-    pub(crate) fn tcp_recv_geometry(&self, incremental: bool) -> (u16, u32) {
-        if !self.recv_incremental || self.recv_buffer.explicit {
-            (self.recv_buffer.ring_size, self.recv_buffer.buffer_size)
-        } else if incremental {
-            RECV_INCREMENTAL_GEOMETRY
-        } else {
-            RECV_PLAIN_GEOMETRY
-        }
-    }
 }
 
 /// Configuration for the thread-per-core worker model.
@@ -797,7 +718,6 @@ impl Default for WorkerConfig {
 ///     .max_connections(8000)
 ///     .sq_entries(512)
 ///     .tcp_nodelay(true)
-///     .recv_buffer(256, 4096)
 ///     .send_pool(512, 8192)
 ///     .build()
 ///     .expect("invalid config");
@@ -905,10 +825,9 @@ impl ConfigBuilder {
     /// Print per-worker event-loop diagnostics to stderr at shutdown.
     ///
     /// Each worker prints a `[ringline diag]` line (iteration mix: dead
-    /// iterations, CQEs and tasks per iteration, parks, fallbacks) and a
-    /// `[ringline stall]` line (wait/work stall buckets). Recording the
-    /// stall buckets costs ~4 clock reads per iteration, so this is off by
-    /// default. io_uring backend only; the mio backend prints nothing.
+    /// iterations, CQEs and tasks per iteration) and a `[ringline stall]` line
+    /// (wait/work stall buckets). Recording the stall buckets costs ~4 clock
+    /// reads per iteration, so this is off by default. io_uring backend only; the mio backend prints nothing.
     pub fn loop_diag(mut self, enable: bool) -> Self {
         self.config.loop_diag = enable;
         self
@@ -966,63 +885,8 @@ impl ConfigBuilder {
 
     // ── Buffer settings ──────────────────────────────────────────────
 
-    /// Set recv buffer configuration.
-    ///
-    /// On io_uring no connection receives into this ring: a plaintext
-    /// connection receives directly into its accumulator, and a TLS one into
-    /// its TLS engine's buffer (see [`connect`](crate::connect)).
-    pub fn recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
-        self.config.recv_buffer.ring_size = ring_size;
-        self.config.recv_buffer.buffer_size = buffer_size;
-        self.config.recv_buffer.explicit = true;
-        self
-    }
-
-    /// Has no effect. On io_uring every connection receives directly, with a
-    /// one-shot receive armed when a read parks (see
-    /// [`connect`](crate::connect)), so a task that does not read stops its
-    /// peer.
-    ///
-    /// io_uring only; the mio backend reads on readiness.
-    /// **Default: false**.
-    pub fn recv_multishot(mut self, enabled: bool) -> Self {
-        self.config.recv_multishot = enabled;
-        self
-    }
-
-    /// Try an incremental TCP receive ring (`IOU_PBUF_RING_INC`), where
-    /// successive receives share a buffer at increasing offsets.
-    ///
-    /// Each worker first checks, on a one-entry ring, that the running kernel
-    /// behaves as the receive path relies on; if the kernel lacks incremental
-    /// rings or the check fails, it uses a plain ring. Without a
-    /// [`recv_buffer`](Self::recv_buffer) call the geometry follows the ring
-    /// kind: 64 × 1 MiB incremental, or 4096 × 64 KiB plain, and `build()`
-    /// then requires `recv_accumulator_max` to be at least 1 MiB on either
-    /// backend.
-    ///
-    /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
-    /// resident, against 4 MiB for the 256 × 16 KiB default.
-    ///
-    /// The ring kind is an io_uring choice; the mio backend uses its own
-    /// receive buffers. **Default: false**, which keeps the plain ring
-    /// `recv_buffer` sets (256 × 16 KiB by default).
-    ///
-    /// On io_uring no connection receives into this ring; see
-    /// [`recv_buffer`](Self::recv_buffer).
-    pub fn recv_incremental(mut self, enabled: bool) -> Self {
-        self.config.recv_incremental = enabled;
-        self
-    }
-
-    /// Set the recv buffer group ID (bgid) for the TCP provided buffer ring.
-    /// 65535 is reserved.
-    pub fn recv_buffer_bgid(mut self, bgid: u16) -> Self {
-        self.config.recv_buffer.bgid = bgid;
-        self
-    }
-
     /// Set the initial capacity for per-connection recv accumulators.
+    /// Defaults to 4 KiB.
     pub fn recv_accumulator_capacity(mut self, n: usize) -> Self {
         self.config.recv_accumulator_capacity = n;
         self
@@ -1030,7 +894,7 @@ impl ConfigBuilder {
 
     /// Set the upper bound on a single per-connection recv accumulator.
     /// The connection is closed if the cap is exceeded. Defaults to 1 GiB;
-    /// `usize::MAX` disables the cap. Must be at least `recv_buffer_size`.
+    /// `usize::MAX` disables the cap. Must be at least 1.
     ///
     /// Servers accepting data from untrusted peers should set this to
     /// 4–16× the typical request size. The parser must be able to see a
@@ -1074,27 +938,22 @@ impl ConfigBuilder {
         self
     }
 
-    /// Fault buffer pages in at worker startup rather than on first use.
+    /// Fault the send copy pool's pages in at worker startup rather than on
+    /// first use.
     ///
-    /// The provided recv ring and the send copy pool are allocated zeroed,
-    /// which means mapped but untouched: every page is the shared zero page
-    /// until something writes to it. On the recv path that first write is the
-    /// kernel copying an skb into the buffer, so the minor fault lands on the
-    /// completion path. Enabling this walks both allocations once at startup,
-    /// on the worker thread that owns them (so the pages stay NUMA-local to
-    /// that worker).
+    /// The pool is allocated zeroed, which means mapped but untouched: every
+    /// page is the shared zero page until something writes to it, so the
+    /// first send through a slot takes a minor fault. Enabling this walks the
+    /// allocation once at startup, on the worker thread that owns it, so the
+    /// pages stay local to that worker's NUMA node.
     ///
-    /// What it buys is predictability rather than throughput: faults stop
-    /// appearing as ramp-phase p99 outliers, and RSS after startup equals RSS
-    /// under load — so a ring the machine cannot back fails at launch instead
-    /// of during a traffic burst, which is how `RLIMIT_NOFILE` and
-    /// `RLIMIT_MEMLOCK` are already handled.
-    ///
-    /// What it costs is that over-provisioning stops being free. A
-    /// `recv_buffer(256, 1 << 20)` ring is 256 MiB per worker whether or not
-    /// the workload ever touches all of it; without this it is mostly virtual,
-    /// with it the memory is resident from startup. Startup grows by roughly
-    /// one pass over the allocation.
+    /// With it, the pool's pages are resident from startup, so the pool adds
+    /// nothing to RSS under load, and a pool the machine cannot back runs out
+    /// of memory while the worker starts rather than during a traffic burst
+    /// (as an OOM kill, not an error from `launch()`). Without it, the part of the pool no
+    /// send touches stays virtual. A `send_pool(1024, 16448)` pool is about
+    /// 16 MiB per worker. Startup grows by roughly one pass over the
+    /// allocation.
     ///
     /// **Default: false** while the trade is being measured (#416).
     pub fn prefault_buffers(mut self, enabled: bool) -> Self {
@@ -1102,14 +961,11 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the per-connection cap on received data a forward or a lend holds.
+    /// Set how many sends a [`forward_to_conn`](crate::ConnCtx::forward_to_conn)
+    /// sink may have queued before its source stops reading, on mio.
     ///
-    /// On mio, a [`forward_to_conn`](crate::ConnCtx::forward_to_conn) source
-    /// stops reading once its sink has this many sends queued, so its TCP
-    /// receive window closes, and reads again once the sink drains. On
-    /// io_uring it has no effect: no connection lends a receive buffer, since
-    /// plaintext connections receive into their accumulators and TLS ones
-    /// copy. Must be `>= 1`.
+    /// The source's TCP receive window then closes, and it reads again once
+    /// the sink drains. On io_uring it has no effect. Must be `>= 1`.
     ///
     /// Default: 64.
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
@@ -1227,8 +1083,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the UDP recv buffer group ID (bgid). Must differ from the TCP
-    /// `recv_buffer` bgid when UDP is in use. 65535 is reserved.
+    /// Set the UDP recv buffer group ID (bgid).
     pub fn udp_recv_buffer_bgid(mut self, bgid: u16) -> Self {
         self.config.udp_recv_buffer.bgid = bgid;
         self
@@ -1362,28 +1217,6 @@ impl ConfigBuilder {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn bgid_65535_is_reserved() {
-        assert!(
-            ConfigBuilder::new()
-                .recv_buffer_bgid(u16::MAX)
-                .build()
-                .is_err()
-        );
-        assert!(
-            ConfigBuilder::new()
-                .udp_recv_buffer_bgid(u16::MAX)
-                .build()
-                .is_err()
-        );
-        assert!(
-            ConfigBuilder::new()
-                .recv_buffer_bgid(u16::MAX - 1)
-                .build()
-                .is_ok()
-        );
-    }
     use super::*;
 
     /// Helper: create a Config with a single field override.
@@ -1415,42 +1248,15 @@ mod tests {
         assert_eq!(c.recv_accumulator_max, 1024 * 1024 * 1024);
     }
 
-    /// With `recv_incremental` on and no `recv_buffer` call, the buffer may
-    /// be the incremental geometry's 1 MiB, so a smaller cap is rejected; an
-    /// explicit geometry keeps its own floor.
     #[test]
-    fn validate_recv_accumulator_max_covers_the_incremental_geometry() {
-        let inc = |max: usize| {
-            config_with(|c| {
-                c.recv_incremental = true;
-                c.recv_accumulator_max = max;
-            })
-        };
-        assert!(inc((1 << 20) - 1).validate().is_err());
-        assert!(inc(1 << 20).validate().is_ok());
-        let explicit = config_with(|c| {
-            c.recv_incremental = true;
-            c.recv_buffer.explicit = true;
-            c.recv_accumulator_max = c.recv_buffer.buffer_size as usize;
-        });
-        assert!(explicit.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_recv_accumulator_max_below_buffer_size_rejected() {
-        // Also covers 0: any cap below one recv buffer is rejected.
+    fn validate_recv_accumulator_max_zero_rejected() {
         assert!(
             config_with(|c| c.recv_accumulator_max = 0)
                 .validate()
                 .is_err()
         );
         assert!(
-            config_with(|c| c.recv_accumulator_max = c.recv_buffer.buffer_size as usize - 1)
-                .validate()
-                .is_err()
-        );
-        assert!(
-            config_with(|c| c.recv_accumulator_max = c.recv_buffer.buffer_size as usize)
+            config_with(|c| c.recv_accumulator_max = 1)
                 .validate()
                 .is_ok()
         );
@@ -1469,45 +1275,6 @@ mod tests {
             config_with(|c| c.accept_queue_capacity = 0)
                 .validate()
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn validate_buffer_size_zero_rejected() {
-        assert!(
-            config_with(|c| c.recv_buffer.buffer_size = 0)
-                .validate()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn validate_buffer_size_accepted_65535() {
-        assert!(
-            config_with(|c| c.recv_buffer.buffer_size = 65535)
-                .validate()
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_buffer_size_accepted_65536() {
-        // 65536 is the first value that previously caused a crash; it must now be
-        // accepted (the remaining-bytes counter is stored in the driver, not in the
-        // 16-bit CQE payload).
-        assert!(
-            config_with(|c| c.recv_buffer.buffer_size = 65536)
-                .validate()
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_buffer_size_accepted_large() {
-        assert!(
-            config_with(|c| c.recv_buffer.buffer_size = 131072)
-                .validate()
-                .is_ok()
         );
     }
 
@@ -1551,9 +1318,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_ring_size_not_power_of_two_rejected() {
+    fn validate_udp_ring_size_not_power_of_two_rejected() {
         assert!(
-            config_with(|c| c.recv_buffer.ring_size = 3)
+            udp_config_with(|c| c.udp_recv_buffer.ring_size = 3)
                 .validate()
                 .is_err()
         );

@@ -1,10 +1,8 @@
 //! Recv throughput harness.
 //!
 //! On io_uring the client's connection is a plaintext outbound connection,
-//! which receives directly into its accumulator (`docs/recv-direct-design.md`),
-//! so `RING`, `BUF` and the ring counters in the result line do not apply to
-//! it, and every MODE measures direct receive. On mio they measure the mio
-//! read path.
+//! which receives directly into its accumulator (`docs/recv-direct-design.md`).
+//! On mio every MODE measures the mio read path.
 //!
 //! Protocol: the ringline client sends a 4-byte little-endian length request;
 //! the in-process std-thread server echoes back exactly that many bytes. This
@@ -17,8 +15,6 @@
 //!   LARGE     large size for MODE=mixed (default 262144)
 //!   CONNS     concurrent connections (default 1)
 //!   SECS      run duration seconds (default 5)
-//!   RING      provided-ring entry count / power of two (default 256)
-//!   BUF       provided-ring buffer size bytes (default 16384)
 //!   MODE      whole | bytes | mixed (default whole)
 //!             whole    = with_data, parse a full response (1 accumulator copy)
 //!             bytes    = with_bytes (zero-copy value slices; redis-shaped)
@@ -177,8 +173,6 @@ fn main() {
     let port = env_u64("PORT", 7891) as u16;
     let msg = env_u64("MSG_SIZE", 1 << 18) as usize;
     let large = env_u64("LARGE", 1 << 18) as usize;
-    let ring = env_u64("RING", 256) as u16;
-    let buf = env_u64("BUF", 16384) as u32;
     let conns = env_u64("CONNS", 1);
     let workers = env_u64("WORKERS", 1) as usize;
     let secs = env_u64("SECS", 5);
@@ -215,7 +209,6 @@ fn main() {
         .workers(workers)
         .pin_to_core(true)
         .sq_entries(1024)
-        .recv_buffer(ring, buf)
         .max_connections((conns + 8) as u32)
         .build()
         .expect("valid config");
@@ -233,23 +226,12 @@ fn main() {
     let elapsed_s = secs as f64;
     let mib_s = bytes as f64 / (1 << 20) as f64 / elapsed_s;
 
-    use ringline::metrics::{BYTES, POOL, bytes as bx, pool};
+    use ringline::metrics::{BYTES, bytes as bx};
     let received = BYTES.value(bx::RECEIVED).unwrap_or(0);
-    let fallback_rx = BYTES.value(bx::FALLBACK_RECEIVED).unwrap_or(0);
-    let ring_empty = POOL.value(pool::BUFFER_RING_EMPTY).unwrap_or(0);
-    let parked = POOL.value(pool::RECV_PARKED).unwrap_or(0);
-    let fallbacks = POOL.value(pool::RECV_FALLBACK).unwrap_or(0);
-    let throttled = POOL.value(pool::FORWARD_THROTTLED).unwrap_or(0);
 
     println!(
-        "RESULT mode={mode} workers={workers} msg={msg} conns={conns} ring={ring} buf={buf} rounds={rounds} \
-         MiB/s={mib_s:.1} ring_empty={ring_empty} parked={parked} fallbacks={fallbacks} throttled={throttled} \
-         fallback_rx_frac={:.3} elapsed_s={elapsed_s:.2} rx_bytes={received}",
-        if received > 0 {
-            fallback_rx as f64 / received as f64
-        } else {
-            0.0
-        },
+        "RESULT mode={mode} workers={workers} msg={msg} conns={conns} rounds={rounds} \
+         MiB/s={mib_s:.1} elapsed_s={elapsed_s:.2} rx_bytes={received}",
     );
     // Workers are still running; exit rather than join.
     std::process::exit(0);

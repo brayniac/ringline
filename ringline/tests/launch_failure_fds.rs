@@ -48,7 +48,6 @@ fn failed_merged_launches_do_not_leak_sockets() {
             .workers(2)
             .pin_to_core(false)
             .sq_entries(64)
-            .recv_buffer(16, 1024)
             .max_connections(16)
             .send_pool(16, 16384)
             .blocking_threads(0)

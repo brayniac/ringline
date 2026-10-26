@@ -160,7 +160,6 @@ fn start_ringline_server(
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
-        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .build()
@@ -401,11 +400,6 @@ fn make_ringline_client_config_builder(num_clients: usize, msg_size: usize) -> C
         .pin_to_core(false)
         // Each connection needs a send SQE + a recv SQE; add headroom.
         .sq_entries((num_clients * 4).next_power_of_two().max(256) as u32)
-        // One provided recv buffer in flight per connection.
-        .recv_buffer(
-            (num_clients * 2).next_power_of_two().max(64) as u16,
-            msg_size.next_power_of_two().max(4096) as u32,
-        )
         .send_pool(1024, msg_size.next_power_of_two().max(4096) as u32)
         // One standalone task per connection, plus the on_start task.
         .standalone_task_capacity((num_clients + 1).next_power_of_two().max(64) as u32)

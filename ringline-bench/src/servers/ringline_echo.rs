@@ -51,7 +51,6 @@ impl RinglineServer {
             .workers(workers)
             .pin_to_core(false)
             .sq_entries(4096)
-            .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
             .max_connections(4096)
             .send_pool(4096, msg_size.next_power_of_two().max(4096) as u32)
             .build()

@@ -15,17 +15,17 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
 pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(8);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
-pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
+pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
 
 #[metric(name = "ringline/ring", description = "Ring utilization counters")]
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(5);
 
 #[metric(
     name = "ringline/recv_ring",
-    description = "TCP receive: the ring kind each worker selected, lends refused, and receive copies"
+    description = "TCP receive: bytes copied into receive storage"
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
@@ -36,13 +36,6 @@ pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::
     description = "Direct receives into connection accumulators and TLS ciphertext buffers: armed, sized for a known length, bytes, stale, pooled buffers reused and allocated"
 )]
 pub static RECV_DIRECT: ShardedCounterGroup = ShardedCounterGroup::new(recv_direct::COUNT);
-
-#[metric(
-    name = "ringline/recv_preflight_failed",
-    description = "Incremental-ring preflights that failed, by step"
-)]
-pub static RECV_PREFLIGHT_FAILED: ShardedCounterGroup =
-    ShardedCounterGroup::new(recv_preflight::COUNT);
 
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
@@ -117,9 +110,9 @@ pub mod conn {
 /// conflates causes.
 ///
 /// Slot index is the `OpTag` discriminant, so the array is sized to the largest
-/// one and slot 1 is permanently unused (the enum skips it). That wastes a slot
-/// and keeps the increment a plain cast with no lookup table to fall out of step
-/// with the enum.
+/// one and the discriminants the enum skips are unused slots. That wastes those
+/// slots and keeps the increment a plain cast with no lookup table to fall out
+/// of step with the enum.
 #[metric(
     name = "ringline/cqe_by_tag",
     description = "Completions processed, by operation tag"
@@ -182,24 +175,21 @@ pub mod park_drain_us {
 
 /// Park diagnostic counters.
 ///
-/// The first four show whether `begin_park` submits the recv cancel, whether
-/// the `ECANCELED` re-arm suppression fires, and whether an arrival withdraws
-/// an offer while the connection drains
-/// (`docs/journal/2026-09-two-phase-park.md`).
+/// The first slots show whether `begin_park` submits a cancel and whether an
+/// arrival withdraws an offer while the connection drains
+/// (`docs/journal/2026-09-two-phase-park.md`). Slot 2 is unused.
 ///
 /// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
 /// unread or the connection's reader callback was the innermost one running
 /// (#669).
 pub mod park_diag {
-    /// `begin_park` submitted a recv-cancel, because a multishot was armed.
+    /// `begin_park` submitted a cancel, because a receive or the hangup poll
+    /// was armed.
     pub const CANCEL_SUBMITTED: usize = 0;
-    /// `begin_park` started a park with *no* cancel, because no multishot was
-    /// armed. Such a park gets no suppression either, so anything still
-    /// delivering keeps delivering.
+    /// `begin_park` started a park with no cancel, because neither a receive
+    /// nor the hangup poll was armed.
     pub const CANCEL_ABSENT: usize = 1;
-    /// The `ECANCELED` branch took the draining early-return and skipped both
-    /// re-arms. If this is ~0 the suppression is dead code in practice.
-    pub const REARM_SUPPRESSED: usize = 2;
+    // Slot 2 is unused.
     /// An offer was withdrawn while the connection was marked draining — data
     /// reached it despite the cancel. If this tracks `not_offered`, the cancel
     /// is not stopping delivery and the premise is wrong at the root.
@@ -225,7 +215,7 @@ pub mod park_diag {
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
-/// Slots 2, 5, 8 and 10 are unused.
+/// Slots 2, 5, 8, 10 and 11 are unused.
 /// Nothing is collapsed: an earlier version grouped the variants believed
 /// unreachable at the install re-check into a single `other_blocker`, and that
 /// slot then absorbed 97.8% of abandonments (18,844 of 19,268 in a saturated
@@ -252,13 +242,10 @@ pub mod park_abandon {
     // Slot 8 has no blocker.
     /// A send chain has SQEs in the kernel.
     pub const CHAIN: usize = 9;
-    // Slot 10 has no blocker.
-    /// A fallback recv is in flight against this worker's send pool.
-    pub const RECV_FALLBACK: usize = 11;
+    // Slots 10 and 11 have no blocker.
     /// The slot was recycled while the install was in flight.
     pub const SLOT_RECYCLED: usize = 12;
-    /// The `FixedFdInstall` failed, or the linked recv-cancel returned
-    /// `ECANCELED` because the recv had self-terminated.
+    /// The `FixedFdInstall` failed.
     pub const INSTALL_FAILED: usize = 13;
     /// A receive, a hangup poll or a hangup peek was armed when the install
     /// completed. Arms are refused while a park is pending, so this counts
@@ -274,10 +261,6 @@ pub mod park_abandon {
 pub mod bytes {
     pub const RECEIVED: usize = 0;
     pub const SENT: usize = 1;
-    /// Bytes received via fallback one-shot recvs (also counted in
-    /// `RECEIVED`); the fraction of traffic arriving through the
-    /// degraded path when the provided ring is smaller than a response.
-    pub const FALLBACK_RECEIVED: usize = 2;
 }
 
 /// Counter slot indices for ring utilization metrics.
@@ -298,25 +281,14 @@ pub mod ring {
     pub const SHUTDOWN_STALE: usize = 5;
 }
 
-/// Slot indices for `RECV_RING`: one count per worker by the TCP receive
-/// ring it registered (`ConfigBuilder::recv_incremental`), the lends the
-/// lend cap refused, and copies in the receive path.
+/// Slot indices for `RECV_RING`: copies in the receive path.
 pub mod recv_ring {
-    /// An incremental ring (`IOU_PBUF_RING_INC`).
-    pub const INCREMENTAL: usize = 0;
-    /// A plain ring.
-    pub const PLAIN: usize = 1;
-    /// Completions copied instead of lent because more than half the ring's
-    /// buffers had a hold, this completion's and queued releases included
-    /// (`recv_incremental` only). A per-completion event, unlike the
-    /// per-worker kind counts.
-    pub const LEND_REFUSED: usize = 2;
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
     /// moves) or prepended to it, and TLS plaintext the unbuffered engine stashes when the send path
     /// decrypts it. Ciphertext staged for TLS is not counted.
-    pub const BYTES_COPIED: usize = 3;
-    pub const COUNT: usize = 4;
+    pub const BYTES_COPIED: usize = 0;
+    pub const COUNT: usize = 1;
 }
 
 /// Slot indices for `RECV_DIRECT`.
@@ -357,30 +329,6 @@ pub mod recv_arrival {
     pub const COUNT: usize = 2;
 }
 
-/// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of the
-/// incremental-ring preflight that did not behave as the receive path
-/// relies on (`backend/uring/engine/preflight.rs`). A failed preflight
-/// selects a plain ring.
-pub mod recv_preflight {
-    /// The socketpair could not be created.
-    pub const SOCKETPAIR: usize = 0;
-    /// A write, read or ring operation failed.
-    pub const IO_ERROR: usize = 1;
-    /// A step's completion did not arrive within 1 s.
-    pub const TIMEOUT: usize = 2;
-    /// The first or second appended completion.
-    pub const APPEND: usize = 3;
-    /// The appended data or the ring entry's advance.
-    pub const OFFSETS: usize = 4;
-    /// The completion that uses the buffer up, or the `ENOBUFS` after it.
-    pub const EXHAUSTION: usize = 5;
-    /// The completion after the buffer was posted again.
-    pub const REPOST: usize = 6;
-    /// The half-close completion or the ring entry it leaves.
-    pub const EOF: usize = 7;
-    pub const COUNT: usize = 8;
-}
-
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
@@ -405,37 +353,6 @@ pub mod pool {
     /// generates them; tune `tcp_*_buffer_size` or apply application-level
     /// backpressure.
     pub const SEND_EAGAIN: usize = 3;
-    /// A connection's recv completed with `ENOBUFS` and the connection was
-    /// parked until provided-ring buffers are returned (see `recv_starved` in
-    /// the uring driver). It counts once per recv arm that completed with
-    /// `ENOBUFS`. A one-shot recv (the default) is armed once per received
-    /// buffer and a multishot recv once per run of buffers, so the count is
-    /// not comparable between the two modes. While parked the socket
-    /// is not being drained, so the kernel receive buffer fills and the
-    /// advertised TCP window closes — sustained counts with large
-    /// payloads mean single responses exceed the provided ring
-    /// (`ConfigBuilder::recv_buffer`) and throughput is gated on buffer
-    /// recycling rather than on the wire.
-    pub const RECV_PARKED: usize = 4;
-    /// A fallback one-shot recv was submitted for a connection parked on
-    /// ENOBUFS with a partial message accumulated — the graceful-
-    /// degradation path that keeps draining the socket when a single
-    /// response exceeds the provided ring.
-    pub const RECV_FALLBACK: usize = 5;
-    /// A connection holding received data reached its hold cap and had its
-    /// recv stopped (a one-shot recv not re-armed, a multishot one
-    /// cancelled), so its TCP window closes and its peer is backpressured;
-    /// the recv is re-armed once the hold drains below the cap. Sustained counts
-    /// mean a consumer is slower than its peer for large
-    /// objects; unlike `RECV_PARKED` (ENOBUFS starvation) this is deliberate
-    /// per-connection backpressure that prevents one slow consumer from depleting
-    /// the shared recv ring. On io_uring only a connection holding lent
-    /// receive buffers can reach the cap, and none lends one (plaintext
-    /// connections receive into their accumulators and TLS ones copy). A mio
-    /// `forward_to_conn` source that stops reading at `forward_hold_cap` is
-    /// not counted, so this stays at zero on both backends.
-    pub const FORWARD_THROTTLED: usize = 6;
-    // Slot 7 is unused.
     /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
     /// that send went out as plain `send`s. On Linux the usual cause is
     /// that the pages the send would pin do not fit under
@@ -444,7 +361,7 @@ pub mod pool {
     /// the initial user namespace is not charged.
     /// Sustained counts mean zero-copy sends are paying a failed submission
     /// and a copy: raise the memlock limit, or raise `send_zc_threshold`.
-    pub const SEND_ZC_ENOMEM: usize = 8;
+    pub const SEND_ZC_ENOMEM: usize = 4;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -478,22 +395,7 @@ pub fn init_metadata() {
         "pool_allocated".into(),
     );
     RECV_DIRECT.insert_metadata(recv_direct::HANGUP, "op".into(), "hangup".into());
-    RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
-    RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
-    RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
     RECV_RING.insert_metadata(recv_ring::BYTES_COPIED, "op".into(), "bytes_copied".into());
-    for (step, name) in [
-        (recv_preflight::SOCKETPAIR, "socketpair"),
-        (recv_preflight::IO_ERROR, "io_error"),
-        (recv_preflight::TIMEOUT, "timeout"),
-        (recv_preflight::APPEND, "append"),
-        (recv_preflight::OFFSETS, "offsets"),
-        (recv_preflight::EXHAUSTION, "exhaustion"),
-        (recv_preflight::REPOST, "repost"),
-        (recv_preflight::EOF, "eof"),
-    ] {
-        RECV_PREFLIGHT_FAILED.insert_metadata(step, "op".into(), name.into());
-    }
     CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
     CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
@@ -535,11 +437,6 @@ pub fn init_metadata() {
         "cancel_absent".into(),
     );
     PARK_DIAG.insert_metadata(
-        park_diag::REARM_SUPPRESSED,
-        "op".into(),
-        "rearm_suppressed".into(),
-    );
-    PARK_DIAG.insert_metadata(
         park_diag::WITHDRAW_WHILE_DRAINING,
         "op".into(),
         "withdraw_while_draining".into(),
@@ -576,11 +473,6 @@ pub fn init_metadata() {
     PARK_ABANDONED.insert_metadata(park_abandon::SENDS, "op".into(), "sends".into());
     PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());
     PARK_ABANDONED.insert_metadata(
-        park_abandon::RECV_FALLBACK,
-        "op".into(),
-        "recv_fallback".into(),
-    );
-    PARK_ABANDONED.insert_metadata(
         park_abandon::SLOT_RECYCLED,
         "op".into(),
         "slot_recycled".into(),
@@ -598,11 +490,6 @@ pub fn init_metadata() {
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());
     BYTES.insert_metadata(bytes::SENT, "op".into(), "sent".into());
-    BYTES.insert_metadata(
-        bytes::FALLBACK_RECEIVED,
-        "op".into(),
-        "fallback_received".into(),
-    );
 
     RING.insert_metadata(ring::CQE_PROCESSED, "op".into(), "cqe_processed".into());
     RING.insert_metadata(
@@ -623,7 +510,7 @@ pub fn init_metadata() {
 
     // Names come from `OpTag::as_str` rather than a table here, so a new tag
     // cannot be added with its counter left unlabelled. Slots the enum does not
-    // use (discriminant 1) are simply never registered.
+    // use are never registered.
     for v in 0..=u8::MAX {
         if let Some(tag) = crate::completion::OpTag::from_u8(v) {
             let slot = v as usize;
@@ -643,13 +530,6 @@ pub fn init_metadata() {
         "buffer_ring_empty".into(),
     );
     POOL.insert_metadata(pool::SEND_EAGAIN, "op".into(), "send_eagain".into());
-    POOL.insert_metadata(pool::RECV_PARKED, "op".into(), "recv_parked".into());
-    POOL.insert_metadata(pool::RECV_FALLBACK, "op".into(), "recv_fallback".into());
-    POOL.insert_metadata(
-        pool::FORWARD_THROTTLED,
-        "op".into(),
-        "forward_throttled".into(),
-    );
     POOL.insert_metadata(pool::SEND_ZC_ENOMEM, "op".into(), "send_zc_enomem".into());
 
     UDP.insert_metadata(
@@ -691,7 +571,7 @@ mod tests {
                 "CONNECTIONS[{idx}] out of bounds"
             );
         }
-        for idx in [bytes::RECEIVED, bytes::SENT, bytes::FALLBACK_RECEIVED] {
+        for idx in [bytes::RECEIVED, bytes::SENT] {
             assert!(BYTES.increment(idx), "BYTES[{idx}] out of bounds");
         }
         for idx in [
@@ -709,9 +589,6 @@ mod tests {
             pool::TIMER_EXHAUSTED,
             pool::BUFFER_RING_EMPTY,
             pool::SEND_EAGAIN,
-            pool::RECV_PARKED,
-            pool::RECV_FALLBACK,
-            pool::FORWARD_THROTTLED,
             pool::SEND_ZC_ENOMEM,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
@@ -724,20 +601,11 @@ mod tests {
         ] {
             assert!(UDP.increment(idx), "UDP[{idx}] out of bounds");
         }
-        for idx in [
-            recv_ring::INCREMENTAL,
-            recv_ring::PLAIN,
-            recv_ring::LEND_REFUSED,
-            recv_ring::BYTES_COPIED,
-        ] {
-            assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
-        }
-        for idx in 0..recv_preflight::COUNT {
-            assert!(
-                RECV_PREFLIGHT_FAILED.increment(idx),
-                "RECV_PREFLIGHT_FAILED[{idx}] out of bounds"
-            );
-        }
+        assert!(
+            RECV_RING.increment(recv_ring::BYTES_COPIED),
+            "RECV_RING[{}] out of bounds",
+            recv_ring::BYTES_COPIED
+        );
         for idx in [recv_arrival::CLAMPED, recv_arrival::MERGED] {
             assert!(
                 RECV_ARRIVAL.increment(idx),
@@ -756,9 +624,6 @@ mod tests {
                 .load_metadata(idx)
                 .and_then(|m| m.get("op").cloned())
         };
-        assert_eq!(op(recv_ring::INCREMENTAL).as_deref(), Some("incremental"));
-        assert_eq!(op(recv_ring::PLAIN).as_deref(), Some("plain"));
-        assert_eq!(op(recv_ring::LEND_REFUSED).as_deref(), Some("lend_refused"));
         assert_eq!(op(recv_ring::BYTES_COPIED).as_deref(), Some("bytes_copied"));
         for idx in 0..recv_ring::COUNT {
             assert!(
@@ -766,14 +631,6 @@ mod tests {
                     .load_metadata(idx)
                     .is_some_and(|m| m.contains_key("op")),
                 "RECV_RING[{idx}] has no op label"
-            );
-        }
-        for idx in 0..recv_preflight::COUNT {
-            assert!(
-                RECV_PREFLIGHT_FAILED
-                    .load_metadata(idx)
-                    .is_some_and(|m| m.contains_key("op")),
-                "RECV_PREFLIGHT_FAILED[{idx}] has no op label"
             );
         }
         for idx in 0..recv_arrival::COUNT {
@@ -850,7 +707,7 @@ mod cqe_tag_tests {
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 1, 17, 26, 27, 29 and 30 have no `OpTag` variant.
+    /// Slots 0, 1, 17, 20, 26 to 30 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
@@ -858,7 +715,7 @@ mod cqe_tag_tests {
             .collect();
         assert_eq!(
             unused,
-            vec![1, 17, 26, 27, 29, 30],
+            vec![0, 1, 17, 20, 26, 27, 28, 29, 30],
             "unexpected unused CQE_BY_TAG slots"
         );
     }

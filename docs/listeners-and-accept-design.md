@@ -5,6 +5,10 @@ Note (2026-10-25): `SegmentReader` was removed.
 Note (2026-10-25): `forward_to` was removed, with the segment hold
 (`segment_hold`) and Mode A forward writes.
 
+Note (2026-10-25): the TCP provided-buffer ring was removed, with the
+fallback receive and the `pool/recv_parked` and `pool/recv_fallback`
+counters.
+
 - **Status:** proposal — intent only, nothing implemented
 - **Motivated by:** the single-listener limit found while reviewing whether
   `Connection` should split per transport

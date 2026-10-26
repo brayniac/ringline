@@ -25,19 +25,6 @@ impl fmt::Display for PeerAddr {
     }
 }
 
-/// Which receive operation the driver currently has armed. Mechanism, not
-/// lifecycle: `Idle` says nothing about whether more data will arrive —
-/// read [`ConnectionState::recv_finished`] for that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvArm {
-    /// Nothing armed: slot inactive, connect in flight, recv cancelled, or
-    /// the recv ended and has not been re-armed.
-    Idle,
-    /// Recv with the provided buffer ring (io_uring) / readable interest
-    /// (mio). On io_uring each arm of a TLS connection is one-shot.
-    Multi,
-}
-
 /// The TCP read half as this end observed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadHalf {
@@ -91,8 +78,6 @@ pub enum WriteHalf {
 
 /// Per-connection state tracked by the driver.
 pub struct ConnectionState {
-    /// Which receive operation is armed (mechanism; see `recv_finished`).
-    pub recv_arm: RecvArm,
     /// The TCP read half as observed by this end.
     pub read: ReadHalf,
     /// Where the connection is in its life.
@@ -123,15 +108,6 @@ pub struct ConnectionState {
     pub listener: Option<crate::ListenerId>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
-    /// Whether a plain multishot `RecvMulti` SQE is currently in-flight in the
-    /// kernel (armed). Set when the multishot is (re-)armed; cleared when a
-    /// completion arrives without `IORING_CQE_F_MORE` (the kernel terminated
-    /// the multishot). On a proactive close this tells the close path it must
-    /// cancel the still-armed recv so its reference on the socket file is
-    /// dropped and the kernel actually sends the peer a FIN — closing the fixed
-    /// descriptor alone does not, since the in-flight recv pins the socket.
-    #[cfg(has_io_uring)]
-    pub recv_multishot_armed: bool,
     /// The socket was handed to another worker (a park install, #443), so
     /// closing this slot must not shut the socket down. Other closes link a shutdown
     /// (before Linux 6.13) or a cancel of the connection's requests (from
@@ -139,10 +115,10 @@ pub struct ConnectionState {
     #[cfg(has_io_uring)]
     pub socket_handed_off: bool,
     /// The connection receives with one-shot receives into its own
-    /// accumulator instead of the provided ring: every plaintext TCP or Unix
-    /// connection, accepted or from `connect` or `connect_unix`. Set when the
-    /// connect is submitted or the connection is installed, for the
-    /// connection's life.
+    /// accumulator: every plaintext TCP or Unix connection, accepted or from
+    /// `connect` or `connect_unix`. A TLS connection receives into its TLS
+    /// engine's buffer and leaves this unset. Set when the connect is
+    /// submitted or the connection is installed, for the connection's life.
     #[cfg(has_io_uring)]
     pub recv_direct: bool,
     /// A direct receive is in flight; the accumulator's buffer is held by
@@ -209,7 +185,6 @@ impl Default for ConnectionState {
 impl ConnectionState {
     pub fn new() -> Self {
         ConnectionState {
-            recv_arm: RecvArm::Idle,
             read: ReadHalf::Open,
             lifecycle: Lifecycle::Inactive,
             write: WriteHalf::Open,
@@ -220,8 +195,6 @@ impl ConnectionState {
             peer_addr: None,
             listener: None,
             connect_timeout_armed: false,
-            #[cfg(has_io_uring)]
-            recv_multishot_armed: false,
             #[cfg(has_io_uring)]
             socket_handed_off: false,
             #[cfg(has_io_uring)]
@@ -255,7 +228,6 @@ impl ConnectionState {
         self.active = true;
         self.lifecycle = Lifecycle::Open;
         self.read = ReadHalf::Open;
-        self.recv_arm = RecvArm::Multi;
         self.write = WriteHalf::Open;
     }
 
@@ -266,16 +238,13 @@ impl ConnectionState {
         self.established = false;
         self.lifecycle = Lifecycle::Connecting;
         self.read = ReadHalf::Open;
-        self.recv_arm = RecvArm::Idle;
         self.write = WriteHalf::Open;
     }
 
-    /// An outbound connect completed: the connection is open and its
-    /// multishot recv is (about to be) armed.
+    /// An outbound connect completed: the connection is open.
     pub fn mark_connected(&mut self) {
         self.lifecycle = Lifecycle::Open;
         self.read = ReadHalf::Open;
-        self.recv_arm = RecvArm::Multi;
     }
 
     /// A recv future must resolve to EOF instead of parking: the peer
@@ -302,7 +271,6 @@ impl ConnectionState {
         self.active = false;
         self.lifecycle = Lifecycle::Inactive;
         self.read = ReadHalf::Open;
-        self.recv_arm = RecvArm::Idle;
         self.write = WriteHalf::Open;
         self.outbound = false;
         self.established = false;
@@ -313,7 +281,6 @@ impl ConnectionState {
         self.connect_timeout_armed = false;
         #[cfg(has_io_uring)]
         {
-            self.recv_multishot_armed = false;
             self.socket_handed_off = false;
             self.recv_direct = false;
             self.recv_direct_armed = false;
@@ -416,7 +383,7 @@ mod tests {
         assert!(table.get(idx).is_some());
         assert!(table.get(idx).unwrap().active);
         let cs = table.get(idx).unwrap();
-        assert!(cs.lifecycle == Lifecycle::Open && cs.recv_arm == RecvArm::Multi);
+        assert!(cs.lifecycle == Lifecycle::Open);
     }
 
     #[test]
@@ -649,15 +616,12 @@ mod tests {
         let mut cs = ConnectionState::new();
         cs.activate_outbound();
         assert_eq!(cs.lifecycle, Lifecycle::Connecting);
-        assert_eq!(cs.recv_arm, RecvArm::Idle);
         assert!(!cs.recv_finished(), "connecting is not finished");
         cs.mark_connected();
         assert_eq!(cs.lifecycle, Lifecycle::Open);
-        assert_eq!(cs.recv_arm, RecvArm::Multi);
         cs.deactivate();
         assert_eq!(cs.lifecycle, Lifecycle::Inactive);
         assert_eq!(cs.read, ReadHalf::Open);
-        assert_eq!(cs.recv_arm, RecvArm::Idle);
     }
 
     #[test]

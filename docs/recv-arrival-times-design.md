@@ -7,6 +7,9 @@ are `with_data`, `with_data_result`, `with_bytes` and `try_with_data`.
 Note (2026-10-25): `forward_to` and the segment hold (`segment_hold`) were
 removed.
 
+Note (2026-10-25): the fallback receive was removed with the TCP
+provided-buffer ring.
+
 Status: implemented. The cost is measured under "Cost".
 
 A reader on a TCP connection can ask when the first and the last byte it

@@ -5,6 +5,9 @@ Note (2026-10-25): `with_segments` and `end_segments` were removed.
 Note (2026-10-25): `forward_to` and the segment hold (`segment_hold`) were
 removed.
 
+Note (2026-10-25): the lent receive buffer (`pending_recv_bufs`) was removed
+with the TCP provided-buffer ring.
+
 Status: Option A implemented (`Client::recv_ready`, and
 `RecvReadyFuture::poll` checks `recv_buffered`); its measurements
 (Measurements) not yet taken. Option B not implemented. The sections below

@@ -2,6 +2,9 @@
 
 Note (2026-10-25): `forward_to` (Mode A) was removed.
 
+Note (2026-10-25): `OpTag::RecvMulti`, `recv_multishot_armed` and
+`ConnectionState::recv_arm` were removed with the TCP provided-buffer ring.
+
 ## 1. The bug
 
 `OpTag::RecvMulti` (and its `timestamps` twin `OpTag::RecvMsgMultiTs`) is the

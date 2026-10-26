@@ -7,11 +7,11 @@
 //! source. Here the kernel itself must refuse one page below each and accept
 //! each exactly.
 //!
-//! One test, sequential: the hard limit is lowered only for the last two
-//! steps, because lowering it is irreversible for the process. The kernel compares the limit
-//! with what every process of this user has charged, so this test must not
-//! share the machine with other io_uring tests; `.config/nextest.toml` runs it
-//! alone.
+//! One test, sequential: the hard limit is lowered only for the four launch
+//! steps at the end, because lowering it is irreversible for the process. The
+//! kernel compares the limit with what every process of this user has
+//! charged, so this test must not share the machine with other io_uring
+//! tests; `.config/nextest.toml` runs it alone.
 
 #![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]
@@ -32,8 +32,8 @@ const RING_64: u64 = 5 * PAGE;
 const RING_256: u64 = 17 * PAGE;
 /// A provided buffer ring of 512 16-byte entries.
 const PBUF_512: u64 = 2 * PAGE;
-/// A provided buffer ring of 16 entries, the size `builder()` configures.
-const PBUF_16: u64 = PAGE;
+/// A provided buffer ring of 128 entries, the default UDP ring.
+const PBUF_128: u64 = PAGE;
 
 struct Idle;
 
@@ -51,7 +51,6 @@ fn builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
 }
@@ -150,7 +149,11 @@ fn expect_enomem<T>(what: &str, r: io::Result<T>) {
 }
 
 fn launch_and_stop() -> Result<(), Error> {
-    let (runtime, handles) = RinglineBuilder::new(builder().build().unwrap()).launch::<Idle>()?;
+    launch_and_stop_with(builder())
+}
+
+fn launch_and_stop_with(builder: ConfigBuilder) -> Result<(), Error> {
+    let (runtime, handles) = RinglineBuilder::new(builder.build().unwrap()).launch::<Idle>()?;
     runtime.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
@@ -209,11 +212,37 @@ fn ring_memory_charged_to_memlock_matches_the_kernel() {
     );
     drop(held);
 
-    // A whole worker: its ring and its recv provided buffer ring, which is
-    // what the preflight computes for `builder()`.
+    // A worker with a UDP bind: its ring and its UDP provided buffer ring.
+    // Soft and hard at the figure; the hard limit only goes down from here.
+    let udp_worker = RING_64 + PBUF_128;
+    set_memlock(udp_worker, udp_worker);
+    within_limit("a one-worker launch with UDP", || {
+        launch_and_stop_with(builder().udp_bind("127.0.0.1:0".parse().unwrap())).map_err(
+            |e| match e {
+                Error::RingSetup(ref text) | Error::BufferRegistration(ref text)
+                    if text.contains("ENOMEM") =>
+                {
+                    io::Error::from_raw_os_error(libc::ENOMEM)
+                }
+                other => io::Error::other(other.to_string()),
+            },
+        )
+    });
+
+    // One page short: the preflight counts the UDP ring and refuses.
+    set_memlock(udp_worker - PAGE, udp_worker - PAGE);
+    let err = launch_and_stop_with(builder().udp_bind("127.0.0.1:0".parse().unwrap()))
+        .expect_err("launch must refuse a memlock limit below its rings");
+    assert!(
+        matches!(err, Error::ResourceLimit(_)),
+        "expected the preflight's ResourceLimit with UDP, got {err:?}"
+    );
+
+    // A whole worker without UDP: its ring, which is what the preflight
+    // computes for `builder()`.
     // Soft and hard both at the figure, so a preflight that overcounted by a
     // page would have no room to raise into and would refuse.
-    let worker = RING_64 + PBUF_16;
+    let worker = RING_64;
     set_memlock(worker, worker);
     within_limit("a one-worker launch", || {
         launch_and_stop().map_err(|e| match e {

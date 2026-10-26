@@ -1760,7 +1760,7 @@ fn ensure_nofile_limit(
 /// before any worker thread exists.
 ///
 /// Every worker registers the configured regions as fixed buffers, and on
-/// Linux 6.14+ each worker's ring and provided buffer rings are charged too
+/// Linux 6.14+ each worker's ring and its UDP provided buffer ring are charged too
 /// (see [`crate::memlock`]). The kernel's default limit is 8 MiB (64 KiB
 /// before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`. When
 /// the hard limit covers the need, this raises the soft limit to the hard
@@ -1821,8 +1821,8 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
 }
 
 /// The bytes `workers` workers charge to `RLIMIT_MEMLOCK` when they start:
-/// each worker's registered regions, plus its ring and provided buffer rings
-/// when the kernel charges those (`charges_rings`).
+/// each worker's registered regions, plus its ring and its UDP provided
+/// buffer ring when the kernel charges those (`charges_rings`).
 #[cfg(any(has_io_uring, test))]
 fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: u64) -> u64 {
     use crate::memlock::{provided_ring_bytes, ring_bytes};
@@ -1838,14 +1838,7 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         })
         .sum();
     let rings = if charges_rings {
-        // The ring kind is chosen per worker at startup, so count the TCP
-        // ring with the more entries of the two geometries.
-        let tcp_entries = config
-            .tcp_recv_geometry(true)
-            .0
-            .max(config.tcp_recv_geometry(false).0);
-        let mut bytes =
-            ring_bytes(config.sq_entries, page) + provided_ring_bytes(tcp_entries, page);
+        let mut bytes = ring_bytes(config.sq_entries, page);
         if !config.udp_bind.is_empty() {
             bytes += provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
         }
@@ -2378,43 +2371,27 @@ mod memlock_required_tests {
     const PAGE: u64 = 4096;
 
     fn builder() -> ConfigBuilder {
-        ConfigBuilder::new().sq_entries(64).recv_buffer(16, 1024)
+        ConfigBuilder::new().sq_entries(64)
     }
 
     #[test]
     fn rings_count_per_worker_only_when_the_kernel_charges_them() {
         let config = builder().build().unwrap();
-        // ring 5 pages + recv provided ring 1 page.
-        assert_eq!(memlock_required(&config, 1, true, PAGE), 6 * PAGE);
-        assert_eq!(memlock_required(&config, 4, true, PAGE), 24 * PAGE);
+        // The ring is 5 pages.
+        assert_eq!(memlock_required(&config, 1, true, PAGE), 5 * PAGE);
+        assert_eq!(memlock_required(&config, 4, true, PAGE), 20 * PAGE);
         assert_eq!(memlock_required(&config, 4, false, PAGE), 0);
-    }
-
-    /// With `recv_incremental` and no `recv_buffer` call, the ring kind is
-    /// chosen per worker, so the larger geometry's entries are counted: the
-    /// plain ring's 4096 entries * 16 bytes = 16 pages.
-    #[test]
-    fn recv_incremental_counts_the_larger_geometry() {
-        let config = ConfigBuilder::new()
-            .sq_entries(64)
-            .recv_incremental(true)
-            .build()
-            .unwrap();
-        assert_eq!(memlock_required(&config, 1, true, PAGE), (5 + 16) * PAGE);
-        // An explicit geometry is used as given.
-        let explicit = builder().recv_incremental(true).build().unwrap();
-        assert_eq!(memlock_required(&explicit, 1, true, PAGE), 6 * PAGE);
     }
 
     #[test]
     fn the_udp_provided_ring_counts_only_with_a_udp_bind() {
         let without = builder().udp_recv_buffer(512, 2048).build().unwrap();
-        assert_eq!(memlock_required(&without, 1, true, PAGE), 6 * PAGE);
+        assert_eq!(memlock_required(&without, 1, true, PAGE), 5 * PAGE);
         let mut with = without.clone();
         with.udp_bind.push("127.0.0.1:0".parse().unwrap());
         with.udp_connect_peers.push(None);
         // + 512 entries * 16 bytes = 2 pages.
-        assert_eq!(memlock_required(&with, 1, true, PAGE), 8 * PAGE);
+        assert_eq!(memlock_required(&with, 1, true, PAGE), 7 * PAGE);
     }
 
     /// A region at `addr`, for counting only: `memlock_required` reads its
@@ -2445,6 +2422,6 @@ mod memlock_required_tests {
             .build()
             .unwrap();
         assert_eq!(memlock_required(&config, 3, false, PAGE), 9 * PAGE);
-        assert_eq!(memlock_required(&config, 3, true, PAGE), 3 * (3 + 6) * PAGE);
+        assert_eq!(memlock_required(&config, 3, true, PAGE), 3 * (3 + 5) * PAGE);
     }
 }

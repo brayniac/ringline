@@ -6,6 +6,9 @@ Note (2026-10-25): on io_uring a TLS receive writes ciphertext directly into
 `CiphertextBuf`, so the `CiphertextBuf::append` copy under "Receive path" is
 no longer made there.
 
+Note (2026-10-25): the TCP provided-buffer ring was removed, with
+`OpTag::RecvMulti` and the fallback receive.
+
 **Status:** Scoping only. No code, no plan of tasks, no commitment. Every
 load-bearing premise below carries a verification record; the ones that could
 not be verified are labelled, not smoothed over.

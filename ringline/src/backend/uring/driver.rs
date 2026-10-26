@@ -12,7 +12,6 @@ use crate::backend::uring::abi::cqueue;
 use crate::accumulator::AccumulatorTable;
 use crate::backend::ProvidedBufRing;
 use crate::backend::Ring;
-use crate::backend::uring::engine::RingKind;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::InFlightSendSlab;
@@ -23,13 +22,6 @@ use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::metrics;
 use crate::runtime::send_completion::SendId;
-
-/// Slots in the lazily-constructed fallback recv pool. At most one
-/// fallback is in flight per connection, so this bounds how many
-/// connections can be in fallback simultaneously; when exhausted the
-/// remaining starved connections stay parked (the pre-fallback status
-/// quo) until slots free up.
-const FALLBACK_RECV_SLOTS: u16 = 32;
 
 /// One in-flight UDP send slot. Owns the `sockaddr` + `iovec` + `msghdr`
 /// triple referenced by a single `sendmsg` SQE; returned to the freelist
@@ -89,36 +81,6 @@ pub(crate) struct UdpSocketState {
     // ── Send state: fixed-size ring of per-SQE slots + a stack-freelist ──
     pub send_slots: Box<[UdpSendSlot]>,
     pub send_freelist: Vec<u16>,
-}
-
-/// A kernel recv buffer held in-place for zero-copy access.
-///
-/// The pointer is into `ProvidedBufRing::mem` (a `RingMemory`), which is
-/// allocated once and never resized, so it remains valid until its hold is released.
-#[derive(Clone, Copy)]
-pub(crate) struct PendingRecvBuf {
-    pub(crate) bid: u16,
-    pub(crate) len: u32,
-    pub(crate) ptr: *const u8,
-}
-
-impl Driver {
-    /// Whether a completion's data may be lent (held in place) rather than
-    /// copied: always without a lend cap, and with one while the buffers
-    /// with a hold number at most half the ring. Those include this
-    /// completion's buffer and completions whose release is queued for the
-    /// next flush, copied ones too, so within one pass copies alone can
-    /// refuse a lend; a refusal costs a copy. A refusal is counted.
-    pub(crate) fn may_lend(&self) -> bool {
-        match self.lend_cap {
-            None => true,
-            Some(cap) if self.provided_bufs.held() <= cap => true,
-            Some(_) => {
-                metrics::RECV_RING.increment(metrics::recv_ring::LEND_REFUSED);
-                false
-            }
-        }
-    }
 }
 
 /// What an adopted connection brings from the worker that parked it.
@@ -341,14 +303,15 @@ impl Driver {
         }
     }
 
-    /// Whether a receive that completed should be re-armed at once. A TLS
-    /// connection re-arms during its handshake and after its hangup poll has
-    /// completed; otherwise its next parked read arms the receive, so a task
-    /// that does not read stops its peer. Every ring connection re-arms.
+    /// Whether a TLS connection's receive that completed should be re-armed
+    /// at once: during the handshake and after its hangup poll has completed.
+    /// Otherwise its next parked read arms the receive, so a task that does
+    /// not read stops its peer. False for a connection with no TLS state,
+    /// such as one whose completion closed it.
     pub(crate) fn rearms_after_completion(&self, conn_index: u32) -> bool {
         let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
         if !tls {
-            return true;
+            return false;
         }
         self.connections
             .get(conn_index)
@@ -374,74 +337,6 @@ impl Driver {
         }
         true
     }
-
-    /// Arm a TCP ring recv on `conn_index`, carrying the `RecvMulti`
-    /// user_data. Only plaintext ring connections that unit tests construct
-    /// reach it.
-    pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
-        debug_assert!(
-            !self.tls_table.as_ref().is_some_and(|t| t.has(conn_index)),
-            "a TLS connection receives directly, not through the ring"
-        );
-        // A direct connection never takes a provided buffer; its receive is
-        // armed by the parked receive future (`arm_direct_recv_or_close`).
-        if self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_direct)
-        {
-            return Ok(());
-        }
-        if !self.recv_multishot {
-            self.ring.submit_single_recv(conn_index, generation)
-        } else {
-            self.ring.submit_multishot_recv(conn_index, generation)
-        }
-    }
-
-    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers.
-    pub(crate) fn quarter_ring_cap(&self) -> usize {
-        let quarter = (self.provided_bufs.ring_entries() as usize / 4).max(1);
-        self.forward_hold_cap.min(quarter)
-    }
-
-    /// Record that `n` received buffers of `conn_index` were released by the
-    /// send that held them (`send_held_recv`).
-    pub(crate) fn release_send_held(&mut self, conn_index: u32, n: u32) {
-        let held = &mut self.send_held_recv[conn_index as usize];
-        debug_assert!(*held >= n, "released more send-held buffers than were held");
-        *held = held.saturating_sub(n);
-    }
-
-    /// Release every queued bid through `ProvidedBufRing::release_batch`.
-    ///
-    /// # Panics
-    /// If a ring buffer has no hold.
-    pub(crate) fn release_pending(&mut self) {
-        let mut bids = std::mem::take(&mut self.pending_replenish);
-        self.provided_bufs.release_batch(&bids);
-        bids.clear();
-        self.pending_replenish = bids;
-    }
-}
-
-/// Whether the worker registers its TCP receive ring as incremental: only
-/// with `recv_incremental` on and the kernel passing the incremental-ring
-/// preflight. A failed preflight is counted by step and selects a plain
-/// ring.
-fn select_incremental(config: &Config, ring: &mut Ring) -> Result<bool, crate::error::Error> {
-    if !config.recv_incremental {
-        return Ok(false);
-    }
-    use crate::backend::uring::engine::preflight::{IncPreflight, inc_preflight};
-    Ok(match inc_preflight(&mut ring.engine)? {
-        IncPreflight::Passed => true,
-        IncPreflight::Unsupported => false,
-        IncPreflight::Failed(step) => {
-            metrics::RECV_PREFLIGHT_FAILED.increment(step);
-            false
-        }
-    })
 }
 
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
@@ -463,7 +358,6 @@ pub(crate) struct Driver {
     pub(crate) ring: Ring,
     pub(crate) connections: ConnectionTable,
     pub(crate) fixed_buffers: FixedBufferRegistry,
-    pub(crate) provided_bufs: ProvidedBufRing,
     /// Provided buffer ring backing UDP multishot recvmsg. `None` when no UDP
     /// sockets are configured.
     pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,
@@ -473,37 +367,6 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
-    /// TCP bids whose completion hold is released at the next
-    /// `flush_replenish_and_rearm` (`ProvidedBufRing::release_batch`): one
-    /// entry per hold.
-    pub(crate) pending_replenish: Vec<u16>,
-    /// Per-connection pending recv buffer for zero-copy recv. When `Some`, the
-    /// buffer ID has NOT been pushed to `pending_replenish` and must be
-    /// replenished when the slot is cleared.
-    pub(crate) pending_recv_bufs: Vec<Option<PendingRecvBuf>>,
-    /// Per-connection original data length of the in-flight SendRecvBuf. Set
-    /// when a `SendRecvBuf` SQE is pushed (`note_send_recv_buf_pushed`);
-    /// `handle_send_recv_buf` uses it to compute the resubmit offset of a
-    /// partial send.
-    pub(crate) send_recv_buf_original_lens: Vec<u32>,
-    /// Per-connection offset, in its provided buffer, of the in-flight
-    /// SendRecvBuf's first byte. Set with `send_recv_buf_original_lens`; 0 on
-    /// a plain ring.
-    pub(crate) send_recv_buf_offs: Vec<u32>,
-    /// Per-connection remaining bytes for in-flight SendRecvBuf operations.
-    /// Tracks how many bytes still need to be sent (decremented on each partial send).
-    /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
-    /// supported.
-    pub(crate) send_recv_buf_remaining: Vec<u32>,
-    /// Per connection, the received ring buffers held by its queued or
-    /// in-flight `forward_recv_buf` sends of a lent receive buffer
-    /// (`SendRecvBuf`).
-    /// Raised when a buffer leaves `pending_recv_bufs` for a
-    /// send, lowered when the send releases its bids (`release_send_held`,
-    /// or `release_queued_sends` for a queued `SendRecvBuf`). The receive
-    /// throttle counts it (`at_hold_cap`): against a peer that does not read,
-    /// the send never completes and keeps these buffers held (#638).
-    pub(crate) send_held_recv: Vec<u32>,
     /// Bytes already detached from the accumulator by a zero-copy
     /// `forward_recv_buf` during the current `with_data` / `with_bytes`
     /// closure. The delivery future subtracts this from what the closure
@@ -524,21 +387,16 @@ pub(crate) struct Driver {
     /// through `offer_park`, which declines while bytes are unread or while
     /// the innermost running reader callback is this connection's.
     pub(crate) park_offered: Vec<bool>,
-    /// Per connection: a park cancelled this connection's multishot recv and is
-    /// waiting for the handler to come back to a quiescent point.
+    /// Per connection: a park cancelled this connection's receive and hangup
+    /// poll and is waiting for the handler to come back to a quiescent point.
     ///
-    /// Two measurements shaped this. Without the cancel staying cancelled the
-    /// `ECANCELED` branch re-arms and fresh data keeps arriving; with it, the
-    /// suppression fires on every park (9,809 of 9,809) and data *still* arrives,
-    /// because a cancel cannot retract recv CQEs the kernel had already posted —
-    /// which withdrew the offer 9,427 times out of 9,427 abandonments. So the
-    /// install cannot be linked to the cancel: it has to wait until the handler
-    /// re-offers, by which point nothing can be in flight.
-    /// See `docs/journal/2026-09-two-phase-park.md`.
+    /// A cancel cannot retract completions the kernel had already posted, so
+    /// the install is not linked to the cancel: it waits until the handler
+    /// re-offers and nothing is armed. See
+    /// `docs/journal/2026-09-two-phase-park.md`.
     ///
-    /// Every path that stops a drain must clear this *and* re-arm, or the
-    /// connection is left `Open` with no recv armed and its bytes piling up
-    /// forever — the failure the unconditional re-arm was added to prevent.
+    /// Every path that stops a drain must clear this and give the connection
+    /// back its hangup poll (`rearm_direct_after_park`).
     ///
     /// Written only through [`Driver::set_park_drain`], which keeps
     /// `park_drain_pending` in step.
@@ -600,27 +458,6 @@ pub(crate) struct Driver {
     /// writes" a real claim rather than a convention, and it is what lets a
     /// forward refuse a sink somebody else is already writing to.
     pub(crate) send_half_taken: Vec<bool>,
-    /// Per-connection flag: `true` while a connection's recv has been
-    /// throttled (cancelled) because the lent buffers its `forward_recv_buf`
-    /// sends hold reached the hold cap (`throttle_if_held`). Cleared when the
-    /// recv is re-armed after they drop below the cap
-    /// (`maybe_rearm_throttled_recv`) or on close.
-    /// Gates re-arm so the starved-connection path does not fight the throttle.
-    pub(crate) forward_hold_throttled: Vec<bool>,
-    /// Connections throttled by `throttle_if_held`, which the event loop
-    /// re-arms once their hold drains (`rearm_throttled_recvs`). May hold a
-    /// connection whose flag was cleared since; the next pass drops it.
-    pub(crate) throttled_recvs: Vec<u32>,
-    /// `(conn_index, generation)` of connections whose end-of-completion
-    /// recv re-arm could not be pushed (the submit that makes SQ room
-    /// failed); `drain_recv_rearm_retries` re-arms them on the next pass.
-    pub(crate) recv_rearm_retries: Vec<(u32, u32)>,
-    /// `Config::forward_hold_cap`; `throttle_if_held` applies it, lowered to a
-    /// quarter of the ring.
-    pub(crate) forward_hold_cap: usize,
-    /// `Config::recv_multishot`. No TCP connection arms a multishot receive:
-    /// plaintext ones receive directly and TLS ones one-shot.
-    pub(crate) recv_multishot: bool,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
     /// sockets)`. This worker accepts on socket `worker_index` of each, and
@@ -715,68 +552,6 @@ pub(crate) struct Driver {
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
     pub(crate) next_disk_io_seq: u16,
-    /// Connections waiting for `flush_replenish_and_rearm` to re-arm their
-    /// recv, oldest first: those whose recv completed with ENOBUFS, and
-    /// those whose fallback recv completed or was cancelled. Re-arming on
-    /// ENOBUFS immediately completes with ENOBUFS again while data is pending
-    /// and the ring is empty, a 100% CPU spin until some task releases a bid.
-    pub(crate) recv_starved: super::parked::ParkedConns,
-    /// Set when a pass of `flush_replenish_and_rearm` that started with a
-    /// free buffer used all its re-arms while a connection it would have
-    /// re-armed was still parked. The event loop does not block while it is
-    /// set, so the next pass runs even if none of the re-armed recvs
-    /// completes.
-    pub(crate) rearm_deferred: bool,
-    /// Re-arms `flush_replenish_and_rearm` has issued since the run loop's
-    /// last `submit_and_wait` or `submit_and_get_events`, which reset it.
-    /// Each pass subtracts it from its budget, so the passes between two of
-    /// those calls (after each of the two drains, then before the next wait)
-    /// share one budget of one re-arm per free buffer.
-    ///
-    /// A re-arm whose recv completed in the drain after the mid-iteration
-    /// `flush()`, and whose buffer is still held (a `forward_recv_buf` or
-    /// zero-copy hold), is counted both here and in the lower `free()`.
-    /// Resetting at each reap instead, which counts each re-arm once,
-    /// measured worse tail latency (#657).
-    pub(crate) rearms_since_wait: u32,
-    /// Lifetime count of ENOBUFS parks on this worker (pushes onto
-    /// `recv_starved`). Reported in the shutdown diag line; sustained
-    /// growth means responses exceed the provided ring and receive
-    /// throughput is gated on buffer recycling.
-    pub(crate) recv_park_count: u64,
-    /// Per-connection flag: a fallback one-shot recv is in flight. While
-    /// set, the connection must be neither re-armed for multishot recv nor
-    /// given a second fallback — io_uring does not order independent SQEs,
-    /// so two in-flight recvs on one stream could append out of order. The
-    /// flag is cleared only in `handle_recv_fallback` (the fallback's own
-    /// completion) and in `close_connection` (any still-in-flight CQE is
-    /// then generation-checked and releases its pool slot without touching
-    /// connection state).
-    pub(crate) recv_fallback_inflight: Vec<bool>,
-    /// Slot pool backing fallback one-shot recvs. Kernel writes land in
-    /// pool-owned memory whose slot is released only by the fallback CQE —
-    /// stale completions after close/slot-reuse are memory-safe by the same
-    /// lifecycle argument as `send_copy_pool` (SQE memory outlives the op).
-    /// Lazily constructed on first fallback so workloads that never starve
-    /// the provided ring pay nothing.
-    pub(crate) fallback_recv_pool: Option<SendCopyPool>,
-    /// Per-pool-slot owner: `(conn_index, generation)` recorded at submit,
-    /// validated in `handle_recv_fallback` before any connection state is
-    /// touched (slots recycle; stale CQEs are normal).
-    pub(crate) fallback_slot_owner: Vec<(u32, u32)>,
-    /// Size of each fallback recv chunk (bytes): `max(4 × buffer size,
-    /// 1 MiB)`, or 1 MiB with `recv_incremental`. One event-loop pass moves
-    /// one chunk per starved connection, so this bounds per-pass fallback
-    /// throughput.
-    pub(crate) fallback_chunk: u32,
-    /// With `recv_incremental` on, the most TCP receive buffers that may
-    /// have a hold when a lend is taken: half the ring. A lend is taken only
-    /// while `held()` is at or below it; above it, each lend path copies
-    /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
-    pub(crate) lend_cap: Option<u32>,
-    /// Lifetime count of fallback recv submissions on this worker
-    /// (reported in the shutdown diag line).
-    pub(crate) recv_fallback_count: u64,
     /// Buffers of in-flight direct receives,
     /// indexed by the `RecvDirect` payload. An entry holds the accumulator
     /// buffer the kernel writes into and is removed only by that receive's
@@ -990,8 +765,6 @@ pub(crate) enum ParkBlocker {
     /// A send chain has SQEs in the kernel whose CQEs drive its own
     /// accounting; it has to finish where it started.
     Chain,
-    /// A fallback recv is in flight against this worker's send pool.
-    RecvFallback,
 }
 
 impl ParkBlocker {
@@ -1013,7 +786,6 @@ impl ParkBlocker {
             ParkBlocker::Closing => pa::CLOSING,
             ParkBlocker::Sends => pa::SENDS,
             ParkBlocker::Chain => pa::CHAIN,
-            ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
         }
     }
 }
@@ -1038,7 +810,6 @@ mod park_blocker_tests {
             ParkBlocker::Closing,
             ParkBlocker::Sends,
             ParkBlocker::Chain,
-            ParkBlocker::RecvFallback,
         ];
         let mut seen = std::collections::HashMap::new();
         for b in all {
@@ -1089,26 +860,6 @@ impl Driver {
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
-        // Before anything else is armed: the preflight reaps every
-        // completion the ring holds.
-        let incremental = select_incremental(config, &mut ring)?;
-        let (recv_ring_size, recv_buffer_size) = config.tcp_recv_geometry(incremental);
-        let mut provided_bufs =
-            ProvidedBufRing::new(config.recv_buffer.bgid, recv_ring_size, recv_buffer_size)?;
-        if incremental {
-            provided_bufs.set_incremental();
-        } else if config.recv_incremental {
-            // A completion would otherwise make a whole transparent huge
-            // page resident in a ring this large.
-            provided_bufs.advise_no_huge_pages();
-        }
-        // On the worker thread, which `worker.rs` has already pinned — so the
-        // pages fault in on this worker's NUMA node rather than the launching
-        // thread's.
-        if config.prefault_buffers {
-            provided_bufs.prefault();
-        }
-
         let udp_count = config.udp_bind.len() as u32;
         let udp_provided_bufs = if udp_count > 0 {
             Some(ProvidedBufRing::new(
@@ -1136,19 +887,8 @@ impl Driver {
         ring.register_files_sparse(
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
-        let kind = if incremental {
-            RingKind::Incremental
-        } else {
-            RingKind::Plain
-        };
-        ring.register_buf_ring(&provided_bufs, kind)?;
-        metrics::RECV_RING.increment(if incremental {
-            metrics::recv_ring::INCREMENTAL
-        } else {
-            metrics::recv_ring::PLAIN
-        });
         if let Some(ref udp_bufs) = udp_provided_bufs {
-            ring.register_buf_ring(udp_bufs, RingKind::Plain)?;
+            ring.register_buf_ring(udp_bufs)?;
         }
 
         let connections = ConnectionTable::new(config.max_connections);
@@ -1235,18 +975,11 @@ impl Driver {
             ring,
             connections,
             fixed_buffers,
-            provided_bufs,
             udp_provided_bufs,
             udp_pending_replenish: Vec::new(),
             send_copy_pool,
             send_slab,
             accumulators,
-            pending_replenish: Vec::with_capacity(recv_ring_size as usize),
-            pending_recv_bufs: vec![None; config.max_connections as usize],
-            send_recv_buf_original_lens: vec![0; config.max_connections as usize],
-            send_recv_buf_offs: vec![0; config.max_connections as usize],
-            send_recv_buf_remaining: vec![0; config.max_connections as usize],
-            send_held_recv: vec![0; config.max_connections as usize],
             forward_zc_consumed: vec![0; config.max_connections as usize],
             arrival: (0..config.max_connections)
                 .map(|_| crate::recv::arrival::ArrivalLog::default())
@@ -1263,11 +996,6 @@ impl Driver {
             park_rx: config.park_rx.clone(),
             recv_half_taken: vec![false; config.max_connections as usize],
             send_half_taken: vec![false; config.max_connections as usize],
-            forward_hold_throttled: vec![false; config.max_connections as usize],
-            throttled_recvs: Vec::new(),
-            recv_rearm_retries: Vec::new(),
-            forward_hold_cap: config.forward_hold_cap,
-            recv_multishot: config.recv_multishot,
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),
             merged_accept_live: config.merged_accept_live.clone(),
@@ -1301,29 +1029,6 @@ impl Driver {
             close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
-            recv_starved: super::parked::ParkedConns::new(),
-            rearm_deferred: false,
-            rearms_since_wait: 0,
-            recv_park_count: 0,
-            recv_fallback_inflight: vec![false; config.max_connections as usize],
-            fallback_recv_pool: None,
-            fallback_slot_owner: Vec::new(),
-            // One event-loop pass moves at most one chunk per starved
-            // connection, so the chunk — not the provided ring — is the
-            // per-pass byte ceiling while degraded. Four buffers, at least
-            // 1 MiB. Without `recv_incremental`, the arbitration in
-            // `flush_replenish_and_rearm` prefers the fallback on the premise
-            // that the chunk exceeds the ring's capacity, which no geometry
-            // here meets (the default 256 × 16 KiB ring holds 4 MiB). With
-            // `recv_incremental` the chunk is 1 MiB and the arbitration
-            // re-arms when the ring's free bytes exceed it.
-            fallback_chunk: if config.recv_incremental {
-                1 << 20
-            } else {
-                recv_buffer_size.saturating_mul(4).max(1 << 20)
-            },
-            lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
-            recv_fallback_count: 0,
             direct_recvs: Vec::new(),
             direct_recv_free: Vec::new(),
             hangup_peek_buf: Box::new([0]),
@@ -1493,8 +1198,6 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
-            &mut self.pending_replenish,
-            &mut self.send_held_recv[conn_index as usize],
         );
         state.in_flight = false;
         state.parked = false;
@@ -1516,12 +1219,6 @@ impl Driver {
         // queue here (its close abandoned the drain); the new occupant must
         // not inherit it, and its caller is still waiting.
         self.fail_send_ids(settles);
-    }
-
-    /// Clear a (re)activated slot's receive throttle flag. Close clears it
-    /// too, so this is defensive.
-    pub(crate) fn reset_recv_throttle(&mut self, conn_index: u32) {
-        self.forward_hold_throttled[conn_index as usize] = false;
     }
 
     /// Clear the recv-side exclusivity claims for a slot that is being reused.
@@ -1549,9 +1246,8 @@ impl Driver {
     /// Whether a park of the connection is draining (`park_drain`) or its
     /// install is in flight (`park_in_flight`, for the connection's current
     /// generation). While draining, a cancel for its receive has been
-    /// submitted; while the install is in flight, no receive is armed. The
-    /// end-of-completion, throttled and starved-pass re-arms skip it while
-    /// this holds.
+    /// submitted; while the install is in flight, no receive is armed. Arms
+    /// are refused while this holds.
     pub(crate) fn park_pending(&self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
         let generation = self.connections.generation(conn_index);
@@ -1590,15 +1286,6 @@ impl Driver {
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
-        // The throttle flag tracks recv-arm state and needs no bid release. A
-        // throttle-cancel's ECANCELED (if still in flight) is a no-op in
-        // `handle_recv_multi` (result < 0 / generation checks).
-        self.forward_hold_throttled[conn_index as usize] = false;
-        // Clear the fallback-recv flag so the slot's next occupant starts
-        // clean. A still-in-flight fallback CQE for this occupant is
-        // generation-checked in handle_recv_fallback and only releases its
-        // pool slot — it can no longer touch connection state.
-        self.recv_fallback_inflight[conn_index as usize] = false;
         // An active chain keeps its state: its SQEs are already in the kernel
         // and their CQEs drive the chain accounting to completion (an error
         // in one linked op cancels the rest — still CQEs). `close_pending`
@@ -1665,9 +1352,7 @@ impl Driver {
     /// Normally returns nothing. `park_blocker` refuses while any bytes are
     /// unconsumed (`ParkBlocker::DataPending`), so a connection that reaches
     /// here has an empty accumulator. If bytes do get past that check, they
-    /// travel with the park instead of being discarded. A lent buffer in
-    /// `pending_recv_bufs` is not carried; `park_blocker` refuses a
-    /// connection that has one.
+    /// travel with the park instead of being discarded.
     pub(crate) fn take_pending_for_park(&mut self, conn_index: u32) -> Vec<bytes::Bytes> {
         let acc = self.accumulators.take_frozen(conn_index);
         if acc.is_empty() {
@@ -1678,19 +1363,17 @@ impl Driver {
     }
 
     /// Bytes the connection holds that no consumer has taken: the
-    /// accumulator, the bytes in the buffer a direct receive holds
-    /// (`recv_direct_held`) and a lent buffer in `pending_recv_bufs`.
+    /// accumulator and the bytes in the buffer a direct receive holds
+    /// (`recv_direct_held`).
     ///
     /// The arrival log takes the first unread stream offset as
     /// `delivered - recv_buffered`.
     pub(crate) fn recv_buffered(&self, conn_index: u32) -> usize {
-        let idx = conn_index as usize;
         self.accumulators.len(conn_index)
             + self
                 .connections
                 .get(conn_index)
                 .map_or(0, |c| c.recv_direct_held)
-            + self.pending_recv_bufs[idx].map_or(0, |p| p.len as usize)
     }
 
     /// Record `n` bytes delivered to the connection in the current batch.
@@ -1859,9 +1542,6 @@ impl Driver {
         if self.chain_table.is_active(conn_index) {
             return Some(ParkBlocker::Chain);
         }
-        if self.recv_fallback_inflight[conn_index as usize] {
-            return Some(ParkBlocker::RecvFallback);
-        }
         None
     }
 
@@ -1926,45 +1606,6 @@ impl Driver {
         {
             self.close_notify_armed.swap_remove(pos);
         }
-        // If a multishot recv is still armed on this connection, cancel it
-        // before closing. Closing the fixed descriptor alone removes its
-        // fixed-file table slot but does NOT drop the socket's last reference
-        // while an in-flight recv SQE still pins it — so the kernel never sends
-        // the peer a FIN and a parked reader on the other end hangs forever.
-        // Cancelling the recv (by its `RecvMulti` user_data, which is immune to
-        // Close reordering since it targets the request, not the fd) releases
-        // that reference. The `CloseLead` linked ahead of the Close ends the
-        // connection's other requests; before Linux 6.13, a shutdown, which
-        // also queues the FIN while other connections' requests delay the
-        // socket's release (#581, #586). The recv's
-        // ECANCELED completion is a no-op (generation/slot checks in
-        // `handle_recv_multi`). Skipped when the recv already self-terminated
-        // (e.g. a peer FIN drove this close) — nothing to cancel.
-        let recv_armed = self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed);
-        if recv_armed {
-            // Must reproduce the arm-time payload (the connection generation):
-            // `submit_async_cancel` matches the request by `user_data`.
-            let recv_ud = crate::completion::UserData::encode(
-                crate::completion::OpTag::RecvMulti,
-                conn_index,
-                self.connections.generation(conn_index),
-            );
-            let _ = self.ring.submit_async_cancel(recv_ud.raw(), conn_index);
-            // Cleared whether or not the cancel push landed. A failed push (SQ
-            // full) does leave a multishot armed in the kernel, but nothing
-            // retries the cancel (`drain_close_retries` re-drives only the
-            // `Close`), every remaining reader of this flag is gated on
-            // `Lifecycle::Open`, and `deactivate()` clears it again when the
-            // Close CQE releases the slot. The uncancelled multishot's late
-            // completions are rejected on the generation now carried in their
-            // payload — see `docs/recv-multi-identity-design.md`.
-            if let Some(cs) = self.connections.get_mut(conn_index) {
-                cs.recv_multishot_armed = false;
-            }
-        }
         let lead = self.close_lead(conn_index);
         if self.ring.submit_close(conn_index, lead).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
@@ -2001,8 +1642,6 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
-            &mut self.pending_replenish,
-            &mut self.send_held_recv[conn_index as usize],
         );
         state.in_flight = false;
         state.parked = false;
@@ -2014,45 +1653,6 @@ impl Driver {
             self.fail_send_ids(vec![id]);
         }
         self.try_finalize_close(conn_index);
-    }
-
-    /// Submit a one-shot fallback recv into a pool slot for a connection
-    /// parked on ENOBUFS with a partial message in its accumulator.
-    ///
-    /// Returns `true` if the SQE was submitted. The caller must have
-    /// already established eligibility (plaintext accumulator path, no
-    /// fallback in flight). On pool exhaustion or a full SQ the connection
-    /// simply stays parked — the pre-fallback status quo — and is retried
-    /// on a later flush.
-    pub(crate) fn try_submit_fallback_recv(&mut self, conn_index: u32) -> bool {
-        let chunk = self.fallback_chunk;
-        let pool = self
-            .fallback_recv_pool
-            .get_or_insert_with(|| SendCopyPool::new(FALLBACK_RECV_SLOTS, chunk));
-        if self.fallback_slot_owner.is_empty() {
-            self.fallback_slot_owner = vec![(u32::MAX, u32::MAX); FALLBACK_RECV_SLOTS as usize];
-        }
-        let Some((slot, ptr, cap)) = pool.alloc_raw() else {
-            return false;
-        };
-        if self
-            .ring
-            .submit_recv_fallback(conn_index, ptr, cap, slot)
-            .is_err()
-        {
-            metrics::RING.increment(metrics::ring::SQE_SUBMIT_FAILURES);
-            self.fallback_recv_pool
-                .as_mut()
-                .expect("pool constructed above")
-                .release(slot);
-            return false;
-        }
-        self.fallback_slot_owner[slot as usize] =
-            (conn_index, self.connections.generation(conn_index));
-        self.recv_fallback_inflight[conn_index as usize] = true;
-        self.recv_fallback_count += 1;
-        metrics::POOL.increment(metrics::pool::RECV_FALLBACK);
-        true
     }
 
     /// Submit the next queued send for a connection to the ring.
@@ -2107,11 +1707,8 @@ impl Driver {
             };
             return match pushed {
                 Ok(()) => {
-                    let built = state.queue.pop_front();
+                    state.queue.pop_front();
                     state.parked = false;
-                    if let Some(built) = built {
-                        self.note_send_recv_buf_pushed(conn_index, &built);
-                    }
                     true
                 }
                 Err(_) => {
@@ -2157,14 +1754,12 @@ impl Driver {
     /// Submit a built send SQE, or queue it if a send is already in flight.
     ///
     /// This is the Driver-level equivalent of `DriverCtx::submit_or_queue`,
-    /// used by zero-copy forward paths that bypass DriverCtx, and carries the
-    /// same contract: infallible, the entry is committed to the connection's
-    /// stream on return. If the push fails (SQ still full after submit) the
-    /// entry is parked at the head of the (empty) queue with
-    /// `in_flight = true` and the connection is registered on
-    /// `pending_send_retries`; `drain_send_retries` re-pushes it. A parked
-    /// `SendRecvBuf` keeps its provided buffer exactly as a queued one does —
-    /// the bid is replenished by its completion, not by the caller.
+    /// used by `queue_built_sends`, and carries the same contract:
+    /// infallible, the entry is committed to the connection's stream on
+    /// return. If the push fails (SQ still full after submit) the entry is
+    /// parked at the head of the (empty) queue with `in_flight = true` and
+    /// the connection is registered on `pending_send_retries`;
+    /// `drain_send_retries` re-pushes it.
     pub(crate) fn submit_or_queue_send(
         &mut self,
         conn_index: u32,
@@ -2187,7 +1782,6 @@ impl Driver {
         match unsafe { self.ring.push_sqe(&built.entry) } {
             Ok(()) => {
                 state.in_flight = true;
-                self.note_send_recv_buf_pushed(conn_index, &built);
             }
             Err(_) => {
                 // SQ still full after submit: park at the head and retry next
@@ -2199,48 +1793,6 @@ impl Driver {
                 self.pending_send_retries.push((conn_index, generation, 0));
             }
         }
-    }
-
-    /// Record the progress of a `SendRecvBuf` that has just been pushed: the
-    /// buffer's full length, all of it still to send. A connection has at
-    /// most one `SendRecvBuf` in the kernel, so the counts belong to whichever
-    /// was pushed last (#614). A remainder (`SEND_RECV_BUF_REMAINDER`) keeps the
-    /// counts `handle_send_recv_buf` recorded.
-    fn note_send_recv_buf_pushed(&mut self, conn_index: u32, built: &crate::handler::BuiltSend) {
-        let ud = crate::completion::UserData(built.entry.user_data);
-        if ud.tag() != Some(OpTag::SendRecvBuf)
-            || ud.payload() & crate::completion::SEND_RECV_BUF_REMAINDER != 0
-        {
-            return;
-        }
-        let ci = conn_index as usize;
-        self.send_recv_buf_original_lens[ci] = built.total_len;
-        self.send_recv_buf_remaining[ci] = built.total_len;
-        let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op else {
-            unreachable!("a SendRecvBuf is a plain send");
-        };
-        let bid = ud.payload() as u16;
-        let base = self.provided_bufs.data_ptr(bid, 0);
-        let off = (buf as usize).wrapping_sub(base as usize);
-        debug_assert!(
-            buf >= base && off < self.provided_bufs.buffer_size() as usize,
-            "send outside its data"
-        );
-        self.send_recv_buf_offs[ci] = off as u32;
-    }
-
-    /// Park `built` at the head of the connection's send queue, for
-    /// `drain_send_retries` to push. The caller is the completion handler of
-    /// the connection's only in-flight send, so nothing else is parked.
-    /// `built` continues that send, so it goes ahead of anything queued
-    /// behind it. `in_flight` stays set until the queue drains.
-    pub(crate) fn park_at_queue_head(&mut self, conn_index: u32, built: crate::handler::BuiltSend) {
-        let state = &mut self.send_queues[conn_index as usize];
-        state.queue.push_front(built);
-        state.in_flight = true;
-        state.parked = true;
-        let generation = self.connections.generation(conn_index);
-        self.pending_send_retries.push((conn_index, generation, 0));
     }
 
     /// Close a connection the application asked to close (`ConnCtx::close`, or
@@ -2311,8 +1863,6 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
-            &mut self.pending_replenish,
-            &mut self.send_held_recv[conn_index as usize],
         );
         state.in_flight = false;
         state.parked = false;
@@ -2326,12 +1876,6 @@ impl Driver {
     /// Release all entries from a send queue, returning the awaited sends
     /// they were carrying.
     ///
-    /// A queued `SendRecvBuf` entry (`forward_recv_buf`) owns
-    /// neither a pool slot nor a slab entry; it owns the ring buffer whose bid
-    /// is the SQE's payload. No CQE will ever replenish it, so the
-    /// bid is recovered from the entry's user_data here, exactly as the
-    /// completion handler would have done.
-    ///
     /// A queued entry was never submitted, so nothing will ever complete it:
     /// if its pool slot or slab entry carries an awaited send, that send has
     /// to be failed or its caller's future hangs — and
@@ -2339,7 +1883,7 @@ impl Driver {
     /// dropped silently. The ids are *returned*
     /// instead of pushed, so the three callers can put them on
     /// `Driver::settled_sends` themselves: every caller already
-    /// holds `&mut self` while this takes four disjoint field borrows, and
+    /// holds `&mut self` while this takes three disjoint field borrows, and
     /// threading a failures queue and an error constructor through a fifth
     /// `&mut` parameter is the change with the most call-site risk and the
     /// least visibility. `#[must_use]` is what keeps a caller from quietly
@@ -2353,18 +1897,10 @@ impl Driver {
         queue: &mut VecDeque<BuiltSend>,
         send_slab: &mut InFlightSendSlab,
         send_copy_pool: &mut SendCopyPool,
-        pending_replenish: &mut Vec<u16>,
-        send_held_recv: &mut u32,
     ) -> Vec<SendId> {
         let mut ids = Vec::new();
         for built in queue.drain(..) {
             if built.pool_slot == u16::MAX && built.slab_idx == u16::MAX {
-                let ud = crate::completion::UserData(built.entry.user_data);
-                if ud.tag() == Some(crate::completion::OpTag::SendRecvBuf) {
-                    pending_replenish.push(ud.payload() as u16);
-                    debug_assert!(*send_held_recv > 0, "a queued SendRecvBuf was not counted");
-                    *send_held_recv = send_held_recv.saturating_sub(1);
-                }
                 continue;
             }
             // Take before releasing: `release` asserts the slot is clean,
@@ -2771,10 +2307,9 @@ impl Driver {
         }
     }
 
-    /// Re-arm the UDP multishot recvmsg for a socket. Called when the kernel
-    /// tears the multishot down (e.g. on `ENOBUFS` after the buffer ring
-    /// emptied) — the CQE handler pushes the hint here once replenishment
-    /// has refilled the ring.
+    /// Re-arm the UDP multishot recvmsg for a socket. The completion handlers
+    /// call it at once when the kernel ends the multishot, including on
+    /// `ENOBUFS`.
     pub(crate) fn rearm_udp_recvmsg(&mut self, udp_index: u32, bgid: u16) {
         let idx = udp_index as usize;
         if idx >= self.udp_sockets.len() {
@@ -3013,17 +2548,10 @@ impl Driver {
             }
         }
 
-        // 4. Unregister the provided buffer rings before Driver is dropped
+        // 4. Unregister the UDP provided buffer ring before Driver is dropped
         // (which munmaps the ring memory). Unregistering releases the
         // kernel's pin on the ring pages; the error and panic exits skip it,
         // which is safe for the reason given at `UringEngine::register_buf_ring`.
-        if self
-            .ring
-            .unregister_buf_ring(self.provided_bufs.bgid())
-            .is_err()
-        {
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
-        }
         if let Some(ref udp_bufs) = self.udp_provided_bufs
             && self.ring.unregister_buf_ring(udp_bufs.bgid()).is_err()
         {
@@ -3208,14 +2736,14 @@ mod field_order_tests {
 
     /// Mirrors the head of `Driver`'s field declaration order. If a future
     /// edit moves `ring` out of first position, the order recorded here
-    /// will diverge from `["send_slab", "provided_bufs", "ring"]` and the
+    /// will diverge from `["ring", "udp_provided_bufs", "send_slab"]` and the
     /// test will fail loudly.
     #[allow(dead_code)]
     struct DriverFieldOrderMirror {
         ring: DropMarker,
         // `connections`, `fixed_buffers` etc. interleave here in the real
         // struct; only the kernel-DMA-sensitive ones matter for this test.
-        provided_bufs: DropMarker,
+        udp_provided_bufs: DropMarker,
         send_slab: DropMarker,
     }
 
@@ -3230,7 +2758,7 @@ mod field_order_tests {
         {
             let _m = DriverFieldOrderMirror {
                 ring: DropMarker("ring"),
-                provided_bufs: DropMarker("provided_bufs"),
+                udp_provided_bufs: DropMarker("udp_provided_bufs"),
                 send_slab: DropMarker("send_slab"),
             };
         } // drop runs here
@@ -3238,7 +2766,7 @@ mod field_order_tests {
         let order = DROP_ORDER.lock().unwrap().clone();
         assert_eq!(
             order,
-            vec!["ring", "provided_bufs", "send_slab"],
+            vec!["ring", "udp_provided_bufs", "send_slab"],
             "DriverFieldOrderMirror dropped in the wrong order — \
              reorder the fields to match `Driver`'s declaration so \
              `ring` is declared *first* and therefore drops *last*",
@@ -3251,14 +2779,14 @@ mod field_order_tests {
             .find("pub(crate) ring: Ring,")
             .expect("Driver::ring field signature not found — was it renamed?");
         let provided_pos = src
-            .find("pub(crate) provided_bufs: ProvidedBufRing,")
-            .expect("Driver::provided_bufs field signature not found");
+            .find("pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,")
+            .expect("Driver::udp_provided_bufs field signature not found");
         let send_slab_pos = src
             .find("pub(crate) send_slab: InFlightSendSlab,")
             .expect("Driver::send_slab field signature not found");
         assert!(
             ring_pos < provided_pos,
-            "Driver::ring must be declared before Driver::provided_bufs \
+            "Driver::ring must be declared before Driver::udp_provided_bufs \
              so it drops *after* it (kernel DMA reference safety)",
         );
         assert!(

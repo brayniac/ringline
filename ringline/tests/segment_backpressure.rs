@@ -80,21 +80,19 @@ impl AsyncEventHandler for Modes {
 /// Flood a connection in mode `mode` without reading from it, then check
 /// that its writes stalled and that an echo connection on the same worker
 /// still answers.
-fn idle_peer_is_throttled_alone(mode: u8, incremental: bool) {
-    idle_peers_are_throttled_alone(mode, incremental, 1);
+fn idle_peer_is_throttled_alone(mode: u8) {
+    idle_peers_are_throttled_alone(mode, 1);
 }
 
 /// `idle_peer_is_throttled_alone` with `peers` idle connections in mode
 /// `mode`, each flooded in turn.
-fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, peers: usize) {
+fn idle_peers_are_throttled_alone(mode: u8, peers: usize) {
     const LIMIT: u64 = 64 << 20;
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
         .max_connections(64)
         .send_pool(64, 16384)
-        .recv_buffer(16, 64 << 10)
-        .recv_incremental(incremental)
         .build()
         .expect("config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -138,10 +136,7 @@ fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, peers: usize) {
     for h in handles {
         let _ = h.join();
     }
-    let label = format!(
-        "mode {}, incremental {incremental}, {peers} idle",
-        mode as char
-    );
+    let label = format!("mode {}, {peers} idle", mode as char);
     assert!(
         most < LIMIT,
         "{label}: the server accepted {most} bytes unread"
@@ -152,7 +147,7 @@ fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, peers: usize) {
 /// A reader that never reads arms no receive, so its peer's writes stall.
 #[test]
 fn an_idle_reader_is_throttled_alone() {
-    idle_peer_is_throttled_alone(b'N', false);
+    idle_peer_is_throttled_alone(b'N');
 }
 
 /// A `forward_to_conn` from a direct connection stops receiving while its
@@ -160,18 +155,13 @@ fn an_idle_reader_is_throttled_alone() {
 /// stall.
 #[test]
 fn unread_forward_to_peers_are_throttled_alone() {
-    for incremental in [false, true] {
-        idle_peers_are_throttled_alone(b'T', incremental, 3);
-    }
+    idle_peers_are_throttled_alone(b'T', 3);
 }
 
 /// A connection that forwards each buffer with `forward_recv_buf` is not
-/// throttled: forwards of accumulator-backed data are not counted, and the
-/// server accepts all 64 MiB the idle peer writes (#638).
+/// throttled: the server accepts all 64 MiB the idle peer writes (#638).
 #[test]
-#[ignore = "#638: forward_recv_buf of accumulator-backed data is not throttled"]
+#[ignore = "#638: forward_recv_buf is not throttled"]
 fn an_unread_forward_recv_buf_is_throttled_alone() {
-    for incremental in [false, true] {
-        idle_peer_is_throttled_alone(b'R', incremental);
-    }
+    idle_peer_is_throttled_alone(b'R');
 }

@@ -1,11 +1,8 @@
 //! Dump ringline's runtime counters at shutdown.
 //!
-//! The runtime counts the things that explain a benchmark result rather than
-//! merely state it — `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
-//! `forward_throttled`, `recv_arm_failures` — but nothing in the workspace read
-//! them back out, so a sweep could report that an arm was slower without being
-//! able to say whether it starved its provided ring, degraded to the fallback
-//! recv, or did neither.
+//! The runtime counts things that explain a benchmark result, such as
+//! `send_eagain`, `send_exhausted` and `recv_arm_failures`. This module reads
+//! them back out, so a sweep can say why an arm was slower.
 //!
 //! This walks the metriken registry and writes it as JSON. It is a
 //! whole-process snapshot: ringline's counters are sharded per thread and
@@ -93,14 +90,10 @@ pub fn print_summary() {
     let entries = collect();
     let interesting = [
         "buffer_ring_empty",
-        "recv_parked",
-        "recv_fallback",
-        "forward_throttled",
         "recv_arm_failures",
         "send_eagain",
         "send_zc_enomem",
         "send_exhausted",
-        "fallback_received",
     ];
     let mut shown = false;
     for e in &entries {
@@ -111,7 +104,7 @@ pub fn print_summary() {
         }
     }
     if !shown {
-        eprintln!("bench-server: no ring starvation or pool exhaustion counted");
+        eprintln!("bench-server: no pool exhaustion counted");
     }
 }
 
@@ -132,7 +125,7 @@ mod tests {
             .filter(|e| e.name == "ringline/pool")
             .filter_map(|e| e.op.as_deref())
             .collect();
-        for want in ["buffer_ring_empty", "recv_parked", "recv_fallback"] {
+        for want in ["buffer_ring_empty", "send_eagain", "send_zc_enomem"] {
             assert!(
                 pool_ops.contains(&want),
                 "ringline/pool is missing `{want}`; found {pool_ops:?}"
