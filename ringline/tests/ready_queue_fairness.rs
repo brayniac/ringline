@@ -86,7 +86,6 @@ fn self_waking_task_does_not_starve_the_worker() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(64, 4096)
         .max_connections(64)
         .send_pool(64, 16384)
         .build()

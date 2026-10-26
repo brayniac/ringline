@@ -2,6 +2,9 @@
 
 Note (2026-10-25): `forward_to` was removed.
 
+Note (2026-10-25): `OpTag::RecvMulti` was removed with the TCP
+provided-buffer ring.
+
 Seventh PR of the series that lands #318
 (`docs/backpressured-sends-series-design.md`, "PR 7"), re-derived on current
 `main` rather than ported. Design origin: @thinkingfish in #318. Sits on

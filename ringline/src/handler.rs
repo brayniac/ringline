@@ -613,7 +613,6 @@ impl<'a> DriverCtx<'a> {
                 entry,
                 pool_slot: slot,
                 slab_idx: u16::MAX,
-                total_len: chunk.len() as u32,
             };
 
             if several {
@@ -838,7 +837,6 @@ impl<'a> DriverCtx<'a> {
                 entry,
                 pool_slot: slot,
                 slab_idx: u16::MAX,
-                total_len: chunk.len() as u32,
             };
 
             if several {
@@ -1595,8 +1593,6 @@ impl<'a> DriverCtx<'a> {
 
     /// Cancel pending operations on a connection.
     pub fn cancel(&mut self, conn: ConnToken) -> io::Result<()> {
-        // SAFETY: read-only probe; see the `tls_table` field's contract.
-        let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
         let cs = self
             .connections
             .get_mut(conn.index)
@@ -1615,14 +1611,16 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
-        // A direct or TLS connection's receive is armed when a read parks and
-        // stays in flight until it completes, even if that read is dropped;
-        // it is cancelled by the `direct_recvs` slot its user_data carries.
-        // Reads resolve to EOF from here on, as below, and the receive's
-        // `-ECANCELED` completion wakes a parked reader.
-        if (cs.recv_direct || tls)
-            && !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting)
-        {
+        // A connection's receive is armed when a read parks and stays in
+        // flight until it completes, even if that read is dropped; it is
+        // cancelled by the `direct_recvs` slot its user_data carries. The
+        // application cancelled the receive: recv futures resolve to EOF from
+        // here on, and the receive's `-ECANCELED` completion wakes a parked
+        // reader. The lifecycle is untouched: cancel is not a close, so a
+        // later close_connection still tears the connection down. A read
+        // half the peer already finished keeps its state, so an
+        // `Eof { truncated: true }` stays visible to `eof_truncated()`.
+        if !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
             if matches!(cs.read, crate::connection::ReadHalf::Open) {
                 cs.read = crate::connection::ReadHalf::Cancelled;
             }
@@ -1637,21 +1635,10 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
-        // Determine target op to cancel.
-        let target_tag = if matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
-            crate::completion::OpTag::Connect
-        } else {
-            match cs.recv_arm {
-                crate::connection::RecvArm::Multi => crate::completion::OpTag::RecvMulti,
-                crate::connection::RecvArm::Idle => {
-                    return Ok(()); // nothing to cancel
-                }
-            }
-        };
-
-        // If cancelling a connect with an armed timeout, also cancel the timeout
-        // so the Connect ECANCELED CQE is handled as user-initiated (not timeout-initiated).
-        if matches!(target_tag, crate::completion::OpTag::Connect) && cs.connect_timeout_armed {
+        // A connect in flight. With an armed timeout, also cancel the
+        // timeout so the Connect ECANCELED CQE is handled as user-initiated
+        // (not timeout-initiated).
+        if cs.connect_timeout_armed {
             cs.connect_timeout_armed = false;
             let timeout_ud = crate::completion::UserData::encode(
                 crate::completion::OpTag::Timeout,
@@ -1661,27 +1648,13 @@ impl<'a> DriverCtx<'a> {
             // Best effort cancel; timeout fires harmlessly if already established.
             let _ = self.ring.submit_async_cancel(timeout_ud.raw(), conn.index);
         }
-
-        // The application cancelled the receive: recv futures resolve to
-        // EOF from here on and nothing is armed. The lifecycle is untouched —
-        // cancel is not a close, so a later close_connection still tears the
-        // connection down (before the split, cancel set `Closed` and the later
-        // close was a no-op: the slot leaked).
-        // Never relabel a read half the peer already finished (an
-        // `Eof { truncated: true }` must stay visible to `eof_truncated()`).
         if matches!(cs.read, crate::connection::ReadHalf::Open) {
             cs.read = crate::connection::ReadHalf::Cancelled;
         }
-        cs.recv_arm = crate::connection::RecvArm::Idle;
-
         // A cancel matches its target by `user_data`, so the payload must be
-        // exactly what the arm site submitted: the connection generation for
-        // the multishot recv families, zero for `Connect`.
-        let target_payload = match target_tag {
-            crate::completion::OpTag::Connect => 0,
-            _ => conn.generation,
-        };
-        let target_ud = crate::completion::UserData::encode(target_tag, conn.index, target_payload);
+        // what the connect submitted: zero.
+        let target_ud =
+            crate::completion::UserData::encode(crate::completion::OpTag::Connect, conn.index, 0);
         self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
         Ok(())
     }
@@ -3976,8 +3949,6 @@ pub(crate) struct BuiltSend {
     /// InFlightSendSlab index. u16::MAX if none (only for SendMsgZc).
     #[cfg(has_io_uring)]
     pub slab_idx: u16,
-    /// Total bytes this send will transmit.
-    pub total_len: u32,
 }
 
 /// A pre-classified part for scatter-gather sends via `submit_batch`.
@@ -4210,7 +4181,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             entry,
             pool_slot: slot,
             slab_idx: u16::MAX,
-            total_len: self.total_len,
         })
     }
 
@@ -4307,7 +4277,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 entry,
                 pool_slot: slot,
                 slab_idx,
-                total_len,
             })
         } else {
             // No copy data, only guards.
@@ -4367,7 +4336,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 entry,
                 pool_slot: u16::MAX,
                 slab_idx,
-                total_len,
             })
         }
     }
@@ -4439,7 +4407,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             entry,
             pool_slot: slot,
             slab_idx: u16::MAX,
-            total_len: self.total_len,
         };
         // Data is in the pool slot now — guards can die with `self` after return.
         self.commit(built);
@@ -4528,7 +4495,6 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             entry,
             pool_slot: slot,
             slab_idx: u16::MAX,
-            total_len: data.len() as u32,
         });
         self
     }
@@ -4883,7 +4849,6 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         entry,
                         pool_slot: slot,
                         slab_idx: u16::MAX,
-                        total_len: self.total_len,
                     }
                 })
             } else {
@@ -4918,7 +4883,6 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         entry,
                         pool_slot: slot,
                         slab_idx: u16::MAX,
-                        total_len: self.total_len,
                     }
                 }
                 None => {
@@ -5020,7 +4984,6 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                                     entry,
                                     pool_slot: slot,
                                     slab_idx,
-                                    total_len,
                                 }
                             }
                             None => {
@@ -5092,7 +5055,6 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                             entry,
                             pool_slot: u16::MAX,
                             slab_idx,
-                            total_len,
                         }
                     }
                     None => {

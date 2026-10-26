@@ -10,7 +10,7 @@ use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
 use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
-use crate::connection::{Lifecycle, ReadHalf, RecvArm};
+use crate::connection::{Lifecycle, ReadHalf};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
@@ -378,9 +378,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // next completion; the wait below submits any timer cancels.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             self.executor.collect_wakeups();
-            // Commit buffer returns from the poll pass and revive
-            // ENOBUFS-parked receivers before we block.
-            self.flush_replenish_and_rearm();
             // A task polled in the second pass may have consumed the bytes
             // ahead of a hangup; peek before blocking rather than at the next
             // completion.
@@ -397,7 +394,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else {
                 self.driver.ring.submit_and_get_events()?;
             }
-            self.driver.rearms_since_wait = 0;
             let mut wait_ns: u64 = 0;
             if let Some(start) = wait_start {
                 wait_ns = start.elapsed().as_nanos() as u64;
@@ -435,13 +431,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     eprintln!(
                         "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
                          cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
-                         tasks_1st_avg={:.2} tasks_fp_avg={:.2} parks={} fallbacks={}",
+                         tasks_1st_avg={:.2} tasks_fp_avg={:.2}",
                         diag_cqes_1st as f64 / diag_iters.max(1) as f64,
                         diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
                         diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                         diag_tasks_fp as f64 / diag_iters.max(1) as f64,
-                        self.driver.recv_park_count,
-                        self.driver.recv_fallback_count,
                     );
                     eprintln!(
                         "[ringline stall] \
@@ -457,10 +451,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return Ok(());
             }
 
-            // Recv buffer replenish for TCP now happens eagerly at the end of
-            // `drain_completions` (same iteration the buffers were consumed).
-            // UDP replenish stays here — it is conditional on the UDP buffer
-            // ring being configured and is off the burst hot path.
+            // Return the UDP buffers consumed since the last pass to the UDP
+            // provided buffer ring, when one is configured.
             if !self.driver.udp_pending_replenish.is_empty()
                 && let Some(ref mut udp_bufs) = self.driver.udp_provided_bufs
             {
@@ -481,7 +473,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_retries();
             self.drain_close_retries();
             self.drain_send_pollout_retries();
-            self.drain_recv_rearm_retries();
             self.driver.tick_count += 1;
 
             // Check close_notify deadlines — force-close connections where
@@ -957,15 +948,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
         }
-
-        // Eagerly return consumed recv buffers to the kernel ring in the same
-        // iteration they were consumed, keeping the ring fuller under burst.
-        self.flush_replenish_and_rearm();
     }
 
     /// Whether the run loop may block in `submit_and_wait(1)`. It may not
-    /// while a task is runnable, once shutdown is pending, or while
-    /// `rearm_deferred` is set.
+    /// while a task is runnable or once shutdown is pending.
     ///
     /// Shutdown: the shutdown check in the run loop runs only after the wait.
     /// `request_shutdown()` sets `shutdown_local` without writing the eventfd.
@@ -976,309 +962,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
-        self.executor.ready_queue.is_empty() && !shutting_down && !self.driver.rearm_deferred
-    }
-
-    /// Commit pending provided-buffer returns to the kernel ring and re-arm
-    /// connections parked in `recv_starved`, oldest first. The passes between
-    /// two waits share a budget of one re-arm per free buffer
-    /// (`rearms_since_wait`).
-    ///
-    /// Safe because every bid pushed to `pending_replenish` had its contents
-    /// copied out (into the accumulator or TLS state) before being
-    /// pushed — dispatch has fully completed, so no handler still references
-    /// these buffers. Zero-copy held buffers are tracked in
-    /// `pending_recv_bufs` slots and are never in this queue.
-    ///
-    /// Also called from the run loop right before the blocking wait: bids
-    /// released by tasks during the poll pass would otherwise sit uncommitted
-    /// (and starved connections parked) until the next unrelated CQE.
-    fn flush_replenish_and_rearm(&mut self) {
-        self.rearm_throttled_recvs();
-        // Starved connections holding a zero-copy single-buffer hold
-        // (`pending_recv_bufs`) with data the parser hasn't consumed: flush
-        // the hold into the accumulator so its bid can rejoin the ring.
-        // This both frees a buffer (often enough to revive the multishot
-        // below) and moves the partial message where the fallback path
-        // expects it.
-        if !self.driver.recv_starved.is_empty() {
-            for i in 0..self.driver.recv_starved.len() {
-                let Some(conn_index) = self.driver.recv_starved.get(i) else {
-                    break;
-                };
-                if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-                    let data =
-                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                    if !self.driver.accumulators.append(conn_index, data) {
-                        self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
-                    }
-                    self.driver.pending_replenish.push(pending.bid);
-                }
-            }
-        }
-
-        // Commit returned bids up front so re-armed multishots find them.
-        if !self.driver.pending_replenish.is_empty() {
-            self.driver.release_pending();
-        }
-
-        self.driver.rearm_deferred = false;
-        if self.driver.recv_starved.is_empty() {
-            return;
-        }
-
-        // Arbitrate each parked connection:
-        //
-        // - Fallback in flight: stays parked untouched — a multishot armed
-        //   alongside the outstanding one-shot could append out of order
-        //   (io_uring does not order independent SQEs). The fallback's
-        //   completion re-parks it and a later pass hands off.
-        // - Partial message on the plaintext accumulator path, without
-        //   `recv_incremental`: prefer a fallback recv EVEN IF buffers were
-        //   replenished. Re-arming the multishot moves at most one ring's
-        //   worth before parking again — with responses larger than the ring
-        //   that park/re-arm churn is the pathology (per-pass throughput =
-        //   ring capacity × pass rate), while a fallback moves one
-        //   `fallback_chunk` per pass and never closes the TCP window. The
-        //   multishot resumes once the message completes and the
-        //   accumulator drains. With `recv_incremental`, see
-        //   `ring_beats_chunk` below.
-        // - Everything else: re-arm the recv while this pass has re-arms
-        //   left, otherwise move it to the back (nothing is half-delivered).
-        //
-        // Connections are visited oldest first. One that stays parked goes to
-        // the back of the queue, so it keeps its place relative to the others.
-        // A re-armed recv on a connection with data waiting takes a buffer
-        // as soon as it runs; one with no data waiting takes none. Re-arming
-        // more connections than there are free buffers parks again those of
-        // the excess that have data waiting. Re-arms issued since the last
-        // wait come out of this pass's budget (`rearms_since_wait`).
-        let free = self.driver.provided_bufs.free();
-        let unclaimed = free.saturating_sub(self.driver.rearms_since_wait);
-        let mut rearms_left = unclaimed as usize;
-        let had_free = free > 0;
-        let mut free_bytes =
-            u64::from(unclaimed) * u64::from(self.driver.provided_bufs.buffer_size());
-        for _ in 0..self.driver.recv_starved.len() {
-            let Some(conn_index) = self.driver.recv_starved.pop_front() else {
-                break;
-            };
-            if self.driver.recv_fallback_inflight[conn_index as usize] {
-                self.driver.recv_starved.push(conn_index);
-                continue;
-            }
-            // A connection throttled by the hold cap owns its own re-arm
-            // (`maybe_rearm_throttled_recv`, gated on the hold draining below
-            // the cap). Leave it parked here so the two paths do not both
-            // arm a multishot.
-            if self.driver.forward_hold_throttled[conn_index as usize] {
-                self.driver.recv_starved.push(conn_index);
-                continue;
-            }
-            let alive = self.driver.connections.get(conn_index).is_some_and(|c| {
-                matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
-            });
-            // `abandon_park_drain` and `handle_park_install` re-arm a
-            // connection whose park ends on this worker.
-            if !alive || self.driver.park_pending(conn_index) {
-                continue;
-            }
-            // With `recv_incremental`, a ring whose free buffers hold more
-            // than one fallback chunk feeds the multishot faster than the
-            // fallback would, so the connection re-arms instead. Each such
-            // re-arm takes one chunk from this pass's free bytes, so a pass
-            // does not re-arm more connections than the ring can feed.
-            let ring_beats_chunk = self.driver.lend_cap.is_some()
-                && free_bytes > u64::from(self.driver.fallback_chunk);
-            if ring_beats_chunk {
-                free_bytes -= u64::from(self.driver.fallback_chunk);
-            }
-            if !ring_beats_chunk
-                && self.fallback_eligible(conn_index)
-                && self.driver.try_submit_fallback_recv(conn_index)
-            {
-                continue;
-            }
-            // Re-arm while this pass's budget lasts, whether or not this pass
-            // returned bids. A connection parked while the ring was empty is
-            // then re-armed once buffers are free, even if no recv completes
-            // in between (for example, a fallback completion that re-parks it
-            // after the flush).
-            if rearms_left > 0 {
-                rearms_left -= 1;
-                self.driver.rearms_since_wait += 1;
-                let generation = self.driver.connections.generation(conn_index);
-                if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
-                    metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.recv_multishot_armed = true;
-                }
-                continue;
-            }
-            // With no free buffer at the start of the pass, a returned bid
-            // (from a completion, or from a task dropping a hold) is committed
-            // by the next flush, which runs the next pass. Otherwise the
-            // budget is spent. A re-armed connection with no data waiting
-            // takes no buffer and produces no completion, so `rearm_deferred`
-            // keeps the loop from blocking while connections are left over;
-            // the wait resets `rearms_since_wait` and the next pass has a
-            // budget again.
-            if had_free {
-                self.driver.rearm_deferred = true;
-            }
-            self.driver.recv_starved.push(conn_index);
-        }
-    }
-
-    /// Whether a parked connection may take the fallback recv path:
-    /// plaintext accumulator route only (not TLS, which keeps the
-    /// park-until-replenish behavior), with a partial message already
-    /// accumulated. The caller has already checked liveness and that no
-    /// fallback is in flight.
-    fn fallback_eligible(&mut self, conn_index: u32) -> bool {
-        let is_tls = self
-            .driver
-            .tls_table
-            .as_ref()
-            .is_some_and(|t| t.has(conn_index));
-        if is_tls {
-            return false;
-        }
-        // Only degrade when a message is half-delivered; an empty
-        // accumulator means nothing is torn and the connection can simply
-        // wait for replenish (holds were flushed above).
-        !self.driver.accumulators.data(conn_index).is_empty()
-    }
-
-    /// Completion of a fallback one-shot recv (`OpTag::RecvFallback`).
-    ///
-    /// The payload carries the fallback pool slot; the recorded
-    /// `(conn_index, generation)` owner is validated before any connection
-    /// state is touched — slots recycle and stale CQEs are normal. The
-    /// pool slot is released here and only here, so the kernel's write
-    /// target stays valid for exactly the life of the operation.
-    fn handle_recv_fallback(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        let slot = ud.payload() as u16;
-
-        let pool_ok = self
-            .driver
-            .fallback_recv_pool
-            .as_ref()
-            .is_some_and(|p| p.in_use(slot));
-        if !pool_ok {
-            return;
-        }
-        let (owner_conn, owner_gen) = self.driver.fallback_slot_owner[slot as usize];
-        let stale = owner_conn != conn_index
-            || self.driver.connections.generation(conn_index) != owner_gen
-            || self.driver.connections.get(conn_index).is_none();
-        if stale {
-            // The connection this recv was submitted for is gone; the data
-            // (if any) belongs to a closed socket. Release the slot only.
-            self.driver
-                .fallback_recv_pool
-                .as_mut()
-                .expect("checked in_use above")
-                .release(slot);
-            return;
-        }
-
-        self.driver.recv_fallback_inflight[conn_index as usize] = false;
-
-        if result < 0 {
-            self.driver
-                .fallback_recv_pool
-                .as_mut()
-                .expect("checked in_use above")
-                .release(slot);
-            if -result == libc::ECANCELED {
-                // Cancelled with the connection still open: re-park so a
-                // later flush re-arms the multishot (or retries the
-                // fallback); otherwise no recv is armed and the connection
-                // hangs. A close's `CancelAll` lead also cancels it (#586);
-                // that connection is closing and is not re-parked, or the
-                // park would outlive the close and arm a recv on the slot's
-                // next occupant.
-                let open = self
-                    .driver
-                    .connections
-                    .get(conn_index)
-                    .is_some_and(|c| matches!(c.lifecycle, Lifecycle::Open));
-                if open {
-                    self.driver.recv_starved.push(conn_index);
-                }
-                return;
-            }
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.read = ReadHalf::Error;
-            }
-            self.executor
-                .fail_recv(conn_index, owner_gen, io::Error::from_raw_os_error(-result));
-            self.driver.close_connection(conn_index);
-            return;
-        }
-
-        if result == 0 {
-            // TCP FIN mid-message (fallback only runs with a partial
-            // message accumulated): same truncation semantics as the
-            // multishot path for plaintext connections.
-            self.driver
-                .fallback_recv_pool
-                .as_mut()
-                .expect("checked in_use above")
-                .release(slot);
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.note_eof(false);
-            }
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-            return;
-        }
-
-        // Withdraw before the append and before `recv_fallback_inflight`
-        // clears: that flag was the only term holding the park off, so
-        // delivering here would otherwise take the connection from blocked to
-        // "parkable with a half-received request" in one step.
-        self.withdraw_park_offer(conn_index);
-
-        let bytes_received = result as u32;
-        metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
-        metrics::BYTES.add(metrics::bytes::FALLBACK_RECEIVED, bytes_received as u64);
-        self.driver
-            .record_arrival(conn_index, bytes_received as usize);
-
-        let pool = self
-            .driver
-            .fallback_recv_pool
-            .as_mut()
-            .expect("checked in_use above");
-        let (ptr, _) = pool.current_ptr_remaining(slot);
-        let data = unsafe { std::slice::from_raw_parts(ptr, bytes_received as usize) };
-        let appended = self.driver.accumulators.append(conn_index, data);
-        self.driver
-            .fallback_recv_pool
-            .as_mut()
-            .expect("checked in_use above")
-            .release(slot);
-        if !appended {
-            // Streamed past recv_accumulator_max — close rather than OOM,
-            // matching the multishot overflow path.
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-            return;
-        }
-
-        self.executor.wake_recv(conn_index);
-        // Re-park: the multishot is still dead. The next flush either
-        // re-arms it (replenish arrived) or continues the fallback chain
-        // (parse still incomplete, ring still dry). If the parse completed,
-        // the connection waits parked until bids return — exactly the
-        // pre-fallback steady state.
-        self.driver.recv_starved.push(conn_index);
+        self.executor.ready_queue.is_empty() && !shutting_down
     }
 
     /// Completion of a direct receive (`OpTag::RecvDirect`).
@@ -1292,8 +976,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// goes back into the accumulator with the received bytes behind its
     /// contents, including on EOF and errors, so the bytes received before
     /// stay readable. The arrival is recorded before the bytes are placed,
-    /// while `recv_direct_held` still counts the bytes the buffer held, as
-    /// the multishot path records it before appending.
+    /// while `recv_direct_held` still counts the bytes the buffer held.
     fn handle_recv_direct(&mut self, ud: UserData, result: i32) {
         let slot = ud.payload() as usize;
         let Some(entry) = self
@@ -1830,8 +1513,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         match tag {
             OpTag::AcceptMulti => self.handle_accept_multi(ud, result, flags),
             OpTag::ParkInstall => self.handle_park_install(ud, result),
-            OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
-            OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
             OpTag::RecvDirect => self.handle_recv_direct(ud, result),
             OpTag::HangupPoll => self.handle_hangup_poll(ud, result),
             OpTag::HangupPeek => self.handle_hangup_peek(ud, result),
@@ -1869,315 +1550,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::DirectIo => self.handle_direct_io(ud, result),
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
-            OpTag::SendRecvBuf => self.handle_send_recv_buf(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             // A drain send's result is a partial write of the same entry.
             OpTag::SendMsgCoalescedDrain => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
-        }
-    }
-
-    fn handle_recv_multi(&mut self, ud: UserData, result: i32, flags: u32) {
-        let conn_index = ud.conn_index();
-        let has_more = cqueue::more(flags);
-
-        // Identity check, before anything touches connection state. The slot
-        // must still be occupied AND by the same connection this recv was armed
-        // for: a multishot can outlive its fixed-file `Close` (the cancel in
-        // `try_finalize_close` is best-effort and is dropped when the SQ is
-        // full), so its terminal `-ECONNRESET` can land after the index has been
-        // handed to a new connection. `recv_multishot_armed` cannot tell the two
-        // apart — it is per-slot, and `arm_recv` sets it again for the new
-        // occupant. The arm-time generation, carried whole in the payload, can.
-        // See `docs/recv-multi-identity-design.md`.
-        if self.driver.connections.get(conn_index).is_none()
-            || self.driver.connections.generation(conn_index) != ud.payload()
-        {
-            // Connection already released, or the slot has been reused — but if
-            // result > 0, the kernel consumed a provided buffer that must be
-            // replenished. Exactly once: this early return is the only branch
-            // that can see this bid.
-            if result > 0
-                && let Some(bid) = cqueue::buffer_select(flags)
-            {
-                self.driver
-                    .provided_bufs
-                    .complete(bid, result as u32, cqueue::buf_more(flags));
-                self.driver.pending_replenish.push(bid);
-            }
-            return;
-        }
-
-        if result > 0 {
-            self.withdraw_park_offer(conn_index);
-        }
-
-        // A completion without `IORING_CQE_F_MORE` means the kernel terminated
-        // this multishot recv. Record that the recv is no longer armed so the
-        // close path knows it need not cancel it (a re-arm below sets it back).
-        if !has_more && let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
-
-        if result <= 0 {
-            if result == 0 {
-                // TCP FIN. For a TLS connection this is only a clean EOF if
-                // the peer's close_notify was processed first — otherwise
-                // it's a truncation (possibly an attacker-injected FIN) and
-                // recv futures must surface UnexpectedEof, not clean EOF.
-                let close_notify_seen = self
-                    .driver
-                    .tls_table
-                    .as_mut()
-                    .and_then(|t| t.get_mut(conn_index))
-                    .map(|tc| tc.peer_sent_close_notify);
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.note_eof(close_notify_seen == Some(false));
-                }
-                // Wake recv waiter before closing so the owning task can
-                // detect EOF (with_data will see `recv_finished()` and return 0).
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
-                return;
-            }
-            let errno = -result;
-            if errno == libc::ENOBUFS {
-                metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
-                // Park until buffers return to the provided ring (see
-                // flush_replenish_and_rearm). Re-arming immediately
-                // completed with ENOBUFS again while data was pending and
-                // the ring was empty — submit_and_wait(1) never blocked and
-                // the worker spun at 100% CPU until a task freed a bid.
-                if !has_more && self.driver.recv_starved.push(conn_index) {
-                    self.driver.recv_park_count += 1;
-                    metrics::POOL.increment(metrics::pool::RECV_PARKED);
-                }
-            } else if errno == libc::ECANCELED {
-                // A cancel terminated the multishot. Whatever was armed is gone
-                // now, `IORING_CQE_F_MORE` or not: a cancel posts `-ECANCELED`
-                // only for a request it actually found live, and at most one
-                // multishot recv per (connection, generation) is ever live, so
-                // this CQE belongs to the current arming even when the flag
-                // says the request continues. Trusting the flag left the
-                // connection marked armed against a multishot the kernel had
-                // already killed — no data ever arrived again, and every
-                // re-arm path declined because it looked armed.
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.recv_multishot_armed = false;
-                }
-                // A park cancelled this recv on purpose and wants it to stay
-                // cancelled: that is the whole point of the cancel, and the
-                // re-arms below would undo it, letting fresh data arrive during
-                // the install round trip and withdraw the handler's offer. Both
-                // re-arms are skipped, and `handle_park_install` re-arms on
-                // every path that stops the park.
-                if self
-                    .driver
-                    .park_drain
-                    .get(conn_index as usize)
-                    .and_then(|d| *d)
-                    .is_some()
-                {
-                    metrics::PARK_DIAG.increment(metrics::park_diag::REARM_SUPPRESSED);
-                    return;
-                }
-                // If this connection was throttled by the hold cap, this is the
-                // ECANCELED for that throttle-cancel: re-arm now if the hold
-                // has already drained below the cap (otherwise a later send
-                // completion will).
-                self.maybe_rearm_throttled_recv(conn_index);
-                // The cancel may also have landed on a *different* multishot
-                // than the one it was aimed at: it matches by user_data, and a
-                // throttled recv that terminated on its own (`!has_more`) is
-                // re-armed with that same user_data as soon as the hold drains,
-                // before the kernel gets to the queued cancel. The
-                // connection is no longer throttled by then, so neither this
-                // branch's re-arm nor the one at the end of the handler (which
-                // this `return` skips) would fire, and the connection sat
-                // `Open`/`Multi` with no recv armed and its bytes piling up in
-                // the accumulator, forever.
-                self.rearm_multishot_if_idle(conn_index);
-                return;
-            } else if !has_more {
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.read = ReadHalf::Error;
-                }
-                let generation = self.driver.connections.generation(conn_index);
-                self.executor.fail_recv(
-                    conn_index,
-                    generation,
-                    io::Error::from_raw_os_error(errno),
-                );
-                self.driver.close_connection(conn_index);
-            }
-            return;
-        }
-
-        let bid = match cqueue::buffer_select(flags) {
-            Some(bid) => bid,
-            None => {
-                // No buffer selected despite result > 0 — should not happen.
-                // Close the connection to prevent a silent hang (no recv armed).
-                if !has_more {
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                }
-                return;
-            }
-        };
-
-        let bytes_received = result as u32;
-        let buf_off =
-            self.driver
-                .provided_bufs
-                .complete(bid, bytes_received, cqueue::buf_more(flags));
-        metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
-        let buf_ptr = self.driver.provided_bufs.data_ptr(bid, buf_off);
-        let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
-
-        // NOTE: bid is NOT unconditionally pushed to pending_replenish here.
-        // The zero-copy recv path defers replenishment until the task consumes
-        // the data. Each branch below is responsible for either pushing the bid
-        // to pending_replenish or storing it in a pending_recv_bufs slot.
-
-        // TLS path
-        let is_tls_conn = self
-            .driver
-            .tls_table
-            .as_ref()
-            .is_some_and(|t| t.has(conn_index));
-
-        // Every plaintext delivery is recorded before the bytes are lent or
-        // go to the accumulator.
-        if !is_tls_conn {
-            self.driver
-                .record_arrival(conn_index, bytes_received as usize);
-        }
-
-        if is_tls_conn {
-            // A TLS connection receives directly (`handle_tls_recv_direct`),
-            // and `submit_tcp_recv` asserts that none is armed on the ring.
-            debug_assert!(false, "ring receive completed on a TLS connection");
-            self.driver.pending_replenish.push(bid);
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-            return;
-        } else {
-            // Zero-copy fast path: if no pending buffer AND accumulator is
-            // empty, hold the kernel buffer in-place instead of copying.
-            // NOTE: must be the non-merging `is_empty` — `data()` here
-            // would merge a held frozen remainder on every recv CQE,
-            // a full-remainder copy per chunk while a large response
-            // streams in (O(N·K)).
-            let acc_empty = self.driver.accumulators.is_empty(conn_index);
-            let lend = acc_empty
-                && self.driver.pending_recv_bufs[conn_index as usize].is_none()
-                && self.driver.may_lend();
-            let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
-
-            if lend {
-                *slot = Some(crate::backend::PendingRecvBuf {
-                    bid,
-                    len: bytes_received,
-                    ptr: buf_ptr,
-                });
-            } else {
-                // Flush any existing pending buffer to accumulator first.
-                let mut accumulator_overflowed = false;
-                if let Some(pending) = slot.take() {
-                    let pending_data =
-                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                    if !self.driver.accumulators.append(conn_index, pending_data) {
-                        accumulator_overflowed = true;
-                    }
-                    self.driver.pending_replenish.push(pending.bid);
-                }
-                if !accumulator_overflowed && !self.driver.accumulators.append(conn_index, data) {
-                    accumulator_overflowed = true;
-                }
-                self.driver.pending_replenish.push(bid);
-                if accumulator_overflowed {
-                    // Handler kept returning NeedMore while the peer
-                    // streamed past `recv_accumulator_max`. Close the
-                    // connection rather than OOM the worker.
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                    return;
-                }
-            }
-            // A lent buffer (`pending_recv_bufs`) that the handler forwards
-            // with `forward_recv_buf` becomes a `SendRecvBuf` counted in
-            // `send_held_recv`. The check runs before the task forwards the
-            // buffer lent by this completion, so it lags by one send.
-            // Forwards of accumulator-backed data are not counted (#638).
-            if self.driver.send_held_recv[conn_index as usize] != 0 {
-                self.throttle_if_held(conn_index);
-            }
-            self.executor.wake_recv(conn_index);
-        }
-
-        // A receive that ends with data (`F_MORE` clear: every one-shot
-        // completion, or a multishot on a full completion queue) is re-armed
-        // here, or by
-        // `rearm_throttled_recvs` once a throttled connection drains below
-        // its cap. Neither runs while a park of the connection is pending.
-        if !has_more
-            && !self.driver.forward_hold_throttled[conn_index as usize]
-            && !self.driver.park_pending(conn_index)
-            && self.driver.rearms_after_completion(conn_index)
-            && let Some(conn) = self.driver.connections.get(conn_index)
-            && matches!(conn.lifecycle, Lifecycle::Open)
-            && matches!(conn.recv_arm, RecvArm::Multi)
-        {
-            let generation = self.driver.connections.generation(conn_index);
-            if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
-                // A failed push is backpressure (the submit that makes SQ
-                // room returned `EBUSY` or `EINTR`), and with one-shot
-                // receives this runs on every completion: retry on the next
-                // pass rather than closing the connection.
-                metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-                self.driver
-                    .recv_rearm_retries
-                    .push((conn_index, generation));
-            } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.recv_multishot_armed = true;
-            }
-        }
-    }
-
-    /// Re-arm the recvs `handle_recv_multi` could not push. A connection that
-    /// closed, was reused, was throttled, has a park pending or was armed
-    /// since is dropped from the list; one whose push fails again stays.
-    fn drain_recv_rearm_retries(&mut self) {
-        if self.driver.recv_rearm_retries.is_empty() {
-            return;
-        }
-        let retries = std::mem::take(&mut self.driver.recv_rearm_retries);
-        for &(conn_index, generation) in &retries {
-            // A connection parked in `recv_starved` is armed by the starved
-            // pass; arming it here too would put two receives with one
-            // user_data in flight.
-            let ready = self.driver.connections.generation(conn_index) == generation
-                && !self.driver.forward_hold_throttled[conn_index as usize]
-                && !self.driver.recv_starved.contains(conn_index)
-                && !self.driver.park_pending(conn_index)
-                && self.driver.connections.get(conn_index).is_some_and(|c| {
-                    matches!(c.lifecycle, Lifecycle::Open)
-                        && matches!(c.recv_arm, RecvArm::Multi)
-                        && !c.recv_multishot_armed
-                });
-            if !ready {
-                continue;
-            }
-            if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
-                self.driver
-                    .recv_rearm_retries
-                    .push((conn_index, generation));
-            } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.recv_multishot_armed = true;
-            }
         }
     }
 
@@ -2220,8 +1598,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Adopt connections other workers parked onto this one.
     ///
     /// The parking worker installed the fd only once nothing was armed on the
-    /// socket there: its receive (a ring connection's multishot, or a direct
-    /// connection's receive and hangup poll) had ended (`drive_park_drains`).
+    /// socket there: its receive and hangup poll had ended
+    /// (`drive_park_drains`).
     /// That is what makes it safe to arm here: no other worker is still
     /// reading this socket.
     fn drain_adopted(&mut self) {
@@ -2262,7 +1640,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// **Every path that delivers bytes to a connection must call this**.
     /// `park_blocker` also returns `ParkBlocker::DataPending` while bytes are
     /// unconsumed, so a path that misses this call cannot park the connection
-    /// while those bytes sit in the accumulator or a held or lent receive
+    /// while those bytes sit in the accumulator or a direct receive's
     /// buffer.
     fn withdraw_park_offer(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
@@ -2320,12 +1698,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // condition the install needs. The install goes out only with no
             // receive armed, so it also waits for this park's cancel to end
             // the receive.
-            let armed = self.driver.connections.get(conn_index).is_some_and(|c| {
-                c.recv_multishot_armed
-                    || c.recv_direct_armed
-                    || c.hangup_poll_armed
-                    || c.hangup_peek_armed
-            });
+            let armed =
+                self.driver.connections.get(conn_index).is_some_and(|c| {
+                    c.recv_direct_armed || c.hangup_poll_armed || c.hangup_peek_armed
+                });
             if !armed && self.driver.park_blocker(conn_index).is_none() {
                 if self
                     .driver
@@ -2465,24 +1841,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Cancel what is armed on the socket before the install. A receive
         // left armed here would keep reading a socket that now belongs to
-        // another worker. A ring connection has its multishot receive. A
-        // direct connection has the direct receive of a parked read, if one
-        // is in flight, and its hangup poll.
+        // another worker. A connection has the direct receive of a parked
+        // read, if one is in flight, and its hangup poll.
         let mut cancel_targets = [0u64; 2];
         let mut cancel_count = 0;
         if let Some(c) = self.driver.connections.get(conn_index) {
             use crate::completion::{OpTag, UserData};
-            if c.recv_multishot_armed {
-                cancel_targets[cancel_count] =
-                    UserData::encode(OpTag::RecvMulti, conn_index, generation).raw();
-                cancel_count += 1;
-            }
             if c.recv_direct_armed {
                 cancel_targets[cancel_count] =
                     UserData::encode(OpTag::RecvDirect, conn_index, c.recv_direct_slot).raw();
                 cancel_count += 1;
             }
-            if c.hangup_poll_armed && cancel_count < cancel_targets.len() {
+            if c.hangup_poll_armed {
                 cancel_targets[cancel_count] =
                     UserData::encode(OpTag::HangupPoll, conn_index, generation).raw();
                 cancel_count += 1;
@@ -2569,7 +1939,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.set_park_drain(conn_index, None);
-        self.rearm_multishot_if_idle(conn_index);
+        self.rearm_direct_after_park(conn_index);
     }
 
     fn handle_park_install(&mut self, ud: crate::completion::UserData, result: i32) {
@@ -2590,12 +1960,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // try again later.
         if result < 0 {
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::INSTALL_FAILED);
-            // Re-arm the receive, unless the slot now holds another
-            // connection: that connection's own re-arm paths own its receive,
-            // and an arm here could overlap one of them (the starved pass arms
-            // without checking `recv_multishot_armed`).
+            // Re-arm the hangup poll and wake the reader, unless the slot now
+            // holds another connection, whose own paths arm its receive and
+            // poll.
             if self.driver.connections.generation(conn_index) == ud.payload() {
-                self.rearm_multishot_if_idle(conn_index);
+                self.rearm_direct_after_park(conn_index);
             }
             return;
         }
@@ -2626,21 +1995,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // a matter of inference rather than measurement.
         if let Some(blocker) = self.driver.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
-            self.rearm_multishot_if_idle(conn_index);
+            self.rearm_direct_after_park(conn_index);
             return; // `fd` drops.
         }
         // The install went out with nothing armed, and arms are refused while
         // the park is pending. One armed now would read on this worker after
         // the socket moved, so the park is abandoned instead.
-        if self.driver.connections.get(conn_index).is_some_and(|c| {
-            c.recv_multishot_armed
-                || c.recv_direct_armed
-                || c.hangup_poll_armed
-                || c.hangup_peek_armed
-        }) {
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_direct_armed || c.hangup_poll_armed || c.hangup_peek_armed)
+        {
             debug_assert!(false, "a receive was armed while the park was pending");
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::RECEIVE_ARMED);
-            self.rearm_multishot_if_idle(conn_index);
+            self.rearm_direct_after_park(conn_index);
             return; // `fd` drops.
         }
 
@@ -2716,7 +2085,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// that arrived before the connection got here — the unconsumed remainder
     /// carried by a park (tier 3, #443).
     ///
-    /// Seeded before any receive is armed (`arm_recv` for a TLS listener, the
+    /// Seeded before any receive is armed (at install for a TLS listener, the
     /// first parked read for a plaintext one), so a handler polled on this
     /// worker sees the carried bytes ahead of anything the new receive
     /// delivers. Appending after would put freshly received bytes in front of
@@ -2772,12 +2141,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             libc::close(raw_fd);
         }
 
-        if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-            self.driver.pending_replenish.push(pending.bid);
-        }
         self.driver.accumulators.reset(conn_index);
         self.driver.arrival[conn_index as usize].clear();
-        self.driver.reset_recv_throttle(conn_index);
         self.driver.reset_send_state(conn_index);
         // A slot is recycled by generation, so without this a new occupant
         // would inherit the previous one's park offer — and its state.
@@ -2835,7 +2200,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Its receive is armed by its first parked read, and its hangup
             // poll below, once it is open.
             cs.recv_direct = true;
-            cs.recv_arm = RecvArm::Idle;
         }
 
         // TLS path: defer accept until handshake completes.
@@ -3419,8 +2783,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// occupant of `conn_index`. False means the CQE outlived its connection
     /// slot (closed with the send in flight, index possibly reused) — the
     /// caller must release the entry's resources and touch no per-connection
-    /// state. Mirrors the generation checks in `handle_send` /
-    /// `handle_recv_fallback`.
+    /// state. Mirrors the generation check in `handle_send`.
     fn slab_identity_ok(&self, conn_index: u32, slab_idx: u16) -> bool {
         self.driver.send_slab.conn_index(slab_idx) == conn_index
             && self.driver.send_slab.generation(slab_idx)
@@ -3699,57 +3062,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Re-arm a connection's multishot recv if it should be receiving and
-    /// nothing is armed.
-    ///
-    /// The backstop for a cancel that outlived its target. `submit_async_cancel`
-    /// matches a request by `user_data`, and a connection's multishot recv
-    /// re-uses one user_data for the life of the slot (generation included), so
-    /// a cancel queued against one arming can be applied by the kernel to the
-    /// next one. Whoever cancelled has by then moved on, so no other path
-    /// re-arms; without this the connection goes quiet for good.
-    ///
-    /// Deliberately does nothing for a connection that is closing, is not in
-    /// multishot mode, or is throttled by the hold cap — that last one
-    /// owns its own re-arm and must not have a second multishot armed under it.
-    /// A direct or TLS connection gets `rearm_direct_after_park` instead.
-    fn rearm_multishot_if_idle(&mut self, conn_index: u32) {
-        let tls = self
-            .driver
-            .tls_table
-            .as_ref()
-            .is_some_and(|t| t.has(conn_index));
-        if tls
-            || self
-                .driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_direct)
-        {
-            self.rearm_direct_after_park(conn_index);
-            return;
-        }
-        if self.driver.forward_hold_throttled[conn_index as usize] {
-            return;
-        }
-        let should_arm = self.driver.connections.get(conn_index).is_some_and(|c| {
-            !c.recv_multishot_armed
-                && matches!(c.lifecycle, Lifecycle::Open)
-                && matches!(c.recv_arm, RecvArm::Multi)
-        });
-        if !should_arm {
-            return;
-        }
-        let generation = self.driver.connections.generation(conn_index);
-        if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
-            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-    }
-
     /// Give a direct or TLS connection back what a park cancelled or held off: its
     /// hangup poll, and a wake for a reader that parked during the drain,
     /// whose receive was refused then and is armed when it polls again. A
@@ -3765,222 +3077,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.arm_hangup_poll(conn_index);
         }
         self.executor.wake_recv(conn_index);
-    }
-
-    /// Throttle a connection that holds as many lent receive buffers as it
-    /// may (`at_hold_cap`): a connection whose `forward_recv_buf` sends are
-    /// not completing would otherwise hold ring buffers until the ring is
-    /// empty, stalling every connection on the worker. Cancel its multishot
-    /// recv so its TCP
-    /// receive window closes and only its peer stops sending. The event loop
-    /// re-arms it once the hold drains below the cap
-    /// (`rearm_throttled_recvs`).
-    fn throttle_if_held(&mut self, conn_index: u32) {
-        let ci = conn_index as usize;
-        if self.driver.forward_hold_throttled[ci] || !self.at_hold_cap(conn_index) {
-            return;
-        }
-        self.driver.forward_hold_throttled[ci] = true;
-        metrics::POOL.increment(metrics::pool::FORWARD_THROTTLED);
-        // A close clears the flag without leaving the list, so the
-        // connection may still be in it.
-        if !self.driver.throttled_recvs.contains(&conn_index) {
-            self.driver.throttled_recvs.push(conn_index);
-        }
-        // Only cancel a still-armed multishot. If this CQE terminated the
-        // multishot (`!has_more` cleared `recv_multishot_armed` at the top of
-        // the handler), there is nothing to cancel — the re-arm gate in the
-        // handler (`!has_more`) already skips re-arming a throttled conn.
-        let armed = self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed);
-        if armed {
-            // Cancel by the RecvMulti user_data (targets the request, not the
-            // fd — immune to reordering). `recv_multishot_armed` stays set
-            // until the ECANCELED CQE clears it (top of the handler), which
-            // gates re-arm so two multishots with the same user_data never
-            // overlap. The payload must reproduce the arm-time generation or
-            // the cancel matches nothing.
-            let recv_ud = UserData::encode(
-                OpTag::RecvMulti,
-                conn_index,
-                self.driver.connections.generation(conn_index),
-            );
-            let _ = self
-                .driver
-                .ring
-                .submit_async_cancel(recv_ud.raw(), conn_index);
-        }
-    }
-
-    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers.
-    fn quarter_ring_cap(&self) -> usize {
-        self.driver.quarter_ring_cap()
-    }
-
-    /// Whether a connection holds as many lent receive buffers as it may
-    /// before its receive is throttled: the buffers held by its
-    /// `forward_recv_buf` sends (`SendRecvBuf`), counted in `send_held_recv`,
-    /// reach a quarter of the ring. They stay held until the send completes
-    /// or fails (#638).
-    fn at_hold_cap(&self, conn_index: u32) -> bool {
-        let sending = self.driver.send_held_recv[conn_index as usize] as usize;
-        sending >= self.quarter_ring_cap()
-    }
-
-    /// Re-arm every throttled connection whose hold has drained below the
-    /// cap. A hold can drain from task code, which has no completion to
-    /// re-arm from, so the event loop checks the throttled connections on
-    /// each pass.
-    fn rearm_throttled_recvs(&mut self) {
-        if self.driver.throttled_recvs.is_empty() {
-            return;
-        }
-        let throttled = std::mem::take(&mut self.driver.throttled_recvs);
-        for &conn_index in &throttled {
-            self.maybe_rearm_throttled_recv(conn_index);
-        }
-        // The re-arms dispatch no completion, so nothing was throttled while
-        // they ran and the list holds each connection once.
-        debug_assert!(self.driver.throttled_recvs.is_empty());
-        let mut throttled = throttled;
-        throttled.retain(|&c| self.driver.forward_hold_throttled[c as usize]);
-        self.driver.throttled_recvs = throttled;
-    }
-
-    /// Re-arm a throttled connection's multishot recv once its hold has
-    /// drained below the cap. Called from `rearm_throttled_recvs` and from
-    /// the ECANCELED branch (the throttle-cancel's own completion). The
-    /// `!armed` guard waits for the cancelled multishot to terminate (its
-    /// ECANCELED clears `recv_multishot_armed` at the top of
-    /// `handle_recv_multi`), so two multishots with the same `RecvMulti`
-    /// user_data never overlap.
-    fn maybe_rearm_throttled_recv(&mut self, conn_index: u32) {
-        let ci = conn_index as usize;
-        if !self.driver.forward_hold_throttled[ci] {
-            return;
-        }
-        // Keep the connection throttled while a park is pending. If the park
-        // ends on this worker, `rearm_throttled_recvs` re-arms it on a later
-        // pass.
-        if self.driver.park_pending(conn_index) {
-            return;
-        }
-        // Wait for the cancelled multishot to terminate before arming a fresh one.
-        let armed = self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed);
-        if armed {
-            return;
-        }
-        // Only re-arm once the hold has drained below the cap.
-        if self.at_hold_cap(conn_index) {
-            return;
-        }
-        // Connection must still be open in multishot recv mode.
-        let open = self.driver.connections.get(conn_index).is_some_and(|c| {
-            matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
-        });
-        if !open {
-            self.driver.forward_hold_throttled[ci] = false;
-            return;
-        }
-        // If the cancelled multishot happened to ENOBUFS-terminate (rather than
-        // ECANCELED) it may have parked in `recv_starved`; take it back so the
-        // starved-rearm path and this throttle re-arm cannot both fire.
-        self.driver.recv_starved.remove(conn_index);
-        self.driver.forward_hold_throttled[ci] = false;
-        let generation = self.driver.connections.generation(conn_index);
-        if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
-            // A failed push is backpressure: retry on the next pass.
-            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.driver
-                .recv_rearm_retries
-                .push((conn_index, generation));
-        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-    }
-
-    /// Handle completion of a send from a recv buffer (zero-copy forward).
-    ///
-    /// Payload: the bid in the low 16 bits, plus `SEND_RECV_BUF_REMAINDER` when
-    /// this send is the rest of a partial send. The remaining byte count is in
-    /// `send_recv_buf_remaining`.
-    /// On partial send, resubmits from offset. On completion, replenishes the bid.
-    fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
-        // No liveness/identity guard and no close_submitted guard,
-        // deliberately: these sends are in_flight-tracked, so the deferred
-        // close waits for this CQE, and the only in_flight-bypassing close
-        // (force_finalize_close) is armed exclusively on TLS connections
-        // while SendRecvBuf is plaintext-only. If a non-TLS force-close
-        // path is ever added, this handler needs the same generation and
-        // close_submitted checks as its siblings.
-        let conn_index = ud.conn_index();
-        let payload = ud.payload();
-        // The low 16 bits of the payload are the bid; the remaining byte count
-        // is in `send_recv_buf_remaining`, so buffers larger than `u16::MAX` work.
-        let bid = payload as u16;
-        let remaining_before = self.driver.send_recv_buf_remaining[conn_index as usize];
-
-        if result > 0 {
-            let bytes_sent = result as u32;
-
-            if bytes_sent < remaining_before {
-                // Partial send — resubmit the remainder.
-                let new_remaining = remaining_before - bytes_sent;
-                self.driver.send_recv_buf_remaining[conn_index as usize] = new_remaining;
-                let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
-                let offset = self.driver.send_recv_buf_offs[conn_index as usize] + original_len
-                    - new_remaining;
-                let new_ptr = self.driver.provided_bufs.data_ptr(bid, offset);
-                let new_payload = bid as u32 | crate::completion::SEND_RECV_BUF_REMAINDER;
-                let new_ud = UserData::encode(
-                    crate::completion::OpTag::SendRecvBuf,
-                    conn_index,
-                    new_payload,
-                );
-                let entry = crate::backend::uring::sqe::Sqe::stream_send(
-                    conn_index,
-                    new_ptr,
-                    new_remaining,
-                    new_ud.raw(),
-                );
-
-                if unsafe { self.driver.ring.push_sqe(&entry) }.is_err() {
-                    // SQ full: park the remainder at the queue head and keep
-                    // the buffer; `drain_send_retries` pushes it, or gives up
-                    // and closes the connection (#613).
-                    self.driver.park_at_queue_head(
-                        conn_index,
-                        crate::handler::BuiltSend {
-                            entry,
-                            pool_slot: u16::MAX,
-                            slab_idx: u16::MAX,
-                            total_len: new_remaining,
-                        },
-                    );
-                }
-                return;
-            }
-
-            // Full send complete.
-            metrics::BYTES.add(metrics::bytes::SENT, remaining_before as u64);
-            self.driver.pending_replenish.push(bid);
-            self.driver.release_send_held(conn_index, 1);
-            self.driver.submit_next_queued(conn_index);
-            return;
-        }
-
-        // Error or zero-length send. A `SendRecvBuf` (`forward_recv_buf`) is
-        // never awaited, so there is nothing to settle.
-        self.driver.pending_replenish.push(bid);
-        self.driver.release_send_held(conn_index, 1);
-        self.driver.submit_next_queued(conn_index);
     }
 
     fn handle_send_msg_zc(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -4287,9 +3383,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // "established" would leak it until the peer closes (which may be
         // never). Close it now instead.
         if !self.executor.connect_waiters[conn_index as usize] {
-            if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-                self.driver.pending_replenish.push(pending.bid);
-            }
             self.driver.accumulators.reset(conn_index);
             if let Some(ref mut tls_table) = self.driver.tls_table {
                 tls_table.remove(conn_index);
@@ -4298,11 +3391,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-            self.driver.pending_replenish.push(pending.bid);
-        }
         self.driver.accumulators.reset(conn_index);
-        self.driver.reset_recv_throttle(conn_index);
         self.driver.reset_send_state(conn_index);
         // A slot is recycled by generation, so without this a new occupant
         // would inherit the previous one's park offer — and its state.
@@ -4351,18 +3440,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             cs.established = true;
             cs.mark_connected();
         }
-        // A direct connection's receive is armed by its first parked read,
-        // and its hangup poll now.
-        if self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_direct)
-        {
-            self.driver.arm_hangup_poll(conn_index);
-        } else {
-            self.arm_recv(conn_index);
-        }
+        // The connection receives directly: its receive is armed by its first
+        // parked read, and its hangup poll now.
+        debug_assert!(
+            self.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_direct),
+            "a plaintext connect is marked direct when it is submitted"
+        );
+        self.driver.arm_hangup_poll(conn_index);
 
         self.executor.wake_connect(conn_index, Ok(()));
     }
@@ -4407,15 +3494,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
-
-        // A parked entry must not outlive the connection: the next occupant
-        // of the index would be re-armed by the next flush.
-        self.driver.recv_starved.remove(conn_index);
-
-        // Replenish any held zero-copy recv buffer.
-        if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-            self.driver.pending_replenish.push(pending.bid);
-        }
 
         let was_established = self
             .driver
@@ -5057,22 +4135,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_pidfd(seq, result);
     }
 
-    /// Arm the recv for a connection. `Driver::submit_tcp_recv` arms a
-    /// one-shot or multishot recv.
-    fn arm_recv(&mut self, conn_index: u32) {
-        // Carried in the completion's payload so a CQE that outlives this
-        // connection is rejected instead of being applied to the next occupant
-        // of the slot. Valid even for an inactive slot.
-        let generation = self.driver.connections.generation(conn_index);
-        if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
-            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-    }
-
     /// Spawn an async task for a newly accepted connection.
     ///
     /// The handler's `on_accept` future *constructor* (everything before
@@ -5686,12 +4748,6 @@ mod tests {
             .workers(1)
             .pin_to_core(false)
             .sq_entries(32)
-            .recv_buffer(16, 4096)
-            // Multishot: most of these tests drive multishot completions
-            // (`F_MORE`, `ENOBUFS` parking). The one-shot default is covered
-            // by tests that build their own config and by the integration
-            // tests.
-            .recv_multishot(true)
             .max_connections(16)
             .send_pool(16, 16384)
             .send_slab_slots(8)
@@ -5818,11 +4874,12 @@ mod tests {
     fn accept_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
         let conn_index = el.driver.connections.allocate().expect("no free slots");
         el.driver.accumulators.reset(conn_index);
-        // arm_recv needs to submit an SQE — skip in test since we inject CQEs directly.
-        // Just set lifecycle = Open / recv_arm = Multi so the handlers work correctly.
+        // As `install_accepted_with_pending` leaves a plaintext connection:
+        // open and direct, with no receive armed. Its hangup poll is not
+        // armed; tests that need it arm it.
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.lifecycle = Lifecycle::Open;
-            cs.recv_arm = RecvArm::Multi;
+            cs.recv_direct = true;
             cs.established = true;
             // The real install records the listener; without it every test
             // connection looks outbound, which park now refuses.
@@ -5842,7 +4899,6 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_direct = true;
-            cs.recv_arm = RecvArm::Idle;
             cs.recv_direct_armed = true;
         }
         let ud = UserData::encode(OpTag::HangupPoll, conn_index, generation);
@@ -5967,32 +5023,6 @@ mod tests {
         );
     }
 
-    /// A lent receive buffer is unconsumed data, so the quiescent point the
-    /// handler offered at has passed. The handler re-offers at its next idle
-    /// point.
-    #[test]
-    fn a_lent_buffer_blocks_the_park_as_unconsumed_data() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
-        assert_eq!(
-            el.driver.park_blocker(conn_index),
-            None,
-            "precondition: parkable before the buffer is lent"
-        );
-        el.driver.pending_recv_bufs[conn_index as usize] =
-            Some(crate::backend::uring::driver::PendingRecvBuf {
-                bid: 3,
-                len: 5,
-                ptr: std::ptr::null(),
-            });
-        assert_eq!(
-            el.driver.park_blocker(conn_index),
-            Some(ParkBlocker::DataPending),
-            "unconsumed data means the offer is stale"
-        );
-    }
-
     // ── Park wiring, end to end within a worker (tier 3, #443) ─────
 
     /// The claim #469 makes and nothing tested: that the policy actually
@@ -6065,99 +5095,6 @@ mod tests {
         );
     }
 
-    /// A draining park must never leave the connection without a recv.
-    ///
-    /// The `ECANCELED` branch skips its re-arms while `park_drain` is set, so
-    /// every path that stops the park owes the connection a re-arm. Missing one
-    /// leaves it `Open` with nothing armed and its bytes piling up forever —
-    /// which is the exact failure the unconditional re-arm was added to prevent,
-    /// so this is the regression worth guarding.
-    #[test]
-    fn abandoning_a_draining_park_puts_the_recv_back() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        // As begin_park leaves it: recv cancelled, draining, nothing armed.
-        el.driver.set_park_drain(
-            conn_index,
-            Some(crate::backend::uring::driver::ParkDrain {
-                target: 1,
-                generation: el.driver.connections.generation(conn_index),
-                ticks_left: PARK_DRAIN_TICKS,
-                started: std::time::Instant::now(),
-            }),
-        );
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
-
-        el.abandon_park_drain(conn_index);
-
-        assert!(
-            el.driver.park_drain[conn_index as usize].is_none(),
-            "the draining flag must be cleared"
-        );
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_multishot_armed),
-            "the connection must have a recv armed again"
-        );
-    }
-
-    /// A receive that ends with data while a park drains (for example on a
-    /// full completion queue) is not re-armed: the drain installs only with
-    /// no receive armed, and a receive armed here would read bytes on this
-    /// worker after the install moved the socket.
-    #[test]
-    fn an_arm_ending_with_data_during_a_park_drain_is_not_rearmed() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.set_park_drain(
-            conn_index,
-            Some(crate::backend::uring::driver::ParkDrain {
-                target: 1,
-                generation: el.driver.connections.generation(conn_index),
-                ticks_left: PARK_DRAIN_TICKS,
-                started: std::time::Instant::now(),
-            }),
-        );
-        // IORING_CQE_F_BUFFER with bid 0, and no IORING_CQE_F_MORE.
-        let flags = 1u32;
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), 5, flags);
-        assert!(
-            !el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_multishot_armed),
-            "a receive was armed while the park drains"
-        );
-        el.abandon_park_drain(conn_index);
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_multishot_armed),
-            "abandoning the park must re-arm"
-        );
-    }
-
-    /// An accepted direct connection as `install_accepted_with_pending`
-    /// leaves it: open, direct, no ring receive.
-    fn accept_direct_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
-        let conn_index = accept_connection(el);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_direct = true;
-            cs.recv_arm = RecvArm::Idle;
-        }
-        conn_index
-    }
-
     fn direct_flags(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> (bool, bool) {
         let c = el.driver.connections.get(conn_index).unwrap();
         (c.recv_direct_armed, c.hangup_poll_armed)
@@ -6174,9 +5111,9 @@ mod tests {
         }
         // Another connection's receive takes `direct_recvs` slot 0, so this
         // connection's slot differs from its generation.
-        let other = accept_direct_connection(&mut el);
+        let other = accept_connection(&mut el);
         assert!(!el.driver.arm_direct_recv_or_close(other, None));
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.arm_hangup_poll(conn_index);
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
@@ -6239,7 +5176,7 @@ mod tests {
     #[test]
     fn abandoning_a_direct_park_rearms_the_poll_and_allows_a_receive() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         el.driver
             .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
@@ -6255,14 +5192,6 @@ mod tests {
         let (recv, poll) = direct_flags(&el, conn_index);
         assert!(poll, "the hangup poll is armed again");
         assert!(!recv, "the abandon itself arms no receive");
-        assert!(
-            !el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "a direct connection is never marked as having a multishot receive"
-        );
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
         assert_eq!(
             direct_flags(&el, conn_index),
@@ -6272,8 +5201,7 @@ mod tests {
     }
 
     /// A connection installed on a plaintext listener is direct, with no
-    /// ring receive and `RecvArm::Idle`, so the re-arm paths gated on
-    /// `RecvArm::Multi` skip it, and its hangup poll is armed.
+    /// receive armed, and its hangup poll is armed.
     #[test]
     fn an_accepted_plaintext_connection_is_installed_direct() {
         let mut el = make_test_loop();
@@ -6289,8 +5217,7 @@ mod tests {
             .expect("installed");
         let c = el.driver.connections.get(conn_index).unwrap();
         assert!(c.recv_direct, "direct");
-        assert_eq!(c.recv_arm, RecvArm::Idle);
-        assert!(!c.recv_multishot_armed, "no ring receive");
+        assert!(!c.recv_direct_armed, "no receive armed");
         assert!(c.hangup_poll_armed, "the hangup poll is armed");
     }
 
@@ -6302,7 +5229,7 @@ mod tests {
         if !el.driver.ring.supports_park() {
             return;
         }
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.park_offered[conn_index as usize] = true;
         assert!(el.driver.submit_hangup_peek(conn_index));
@@ -6330,7 +5257,7 @@ mod tests {
     #[test]
     fn a_hangup_during_a_park_drain_pushes_no_peek() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.arm_hangup_poll(conn_index);
         el.driver
@@ -6347,7 +5274,7 @@ mod tests {
     #[test]
     fn abandoning_a_direct_park_wakes_the_reader() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         el.driver
             .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
         el.executor.recv_waiters[conn_index as usize] = true;
@@ -6363,7 +5290,7 @@ mod tests {
     #[test]
     fn a_connection_holding_a_hangup_error_is_not_parkable() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         el.driver.park_offered[conn_index as usize] = true;
         assert!(el.driver.park_blocker(conn_index).is_none(), "precondition");
         el.driver
@@ -6382,7 +5309,7 @@ mod tests {
     #[test]
     fn a_hangup_poll_that_cannot_be_submitted_is_retried() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.ring.force_push_failures(1);
         el.driver.arm_hangup_poll(conn_index);
@@ -6408,7 +5335,7 @@ mod tests {
     #[test]
     fn a_failed_poll_retry_keeps_one_entry() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.ring.force_push_failures(4);
         el.driver.arm_hangup_poll(conn_index);
@@ -6435,7 +5362,7 @@ mod tests {
     #[test]
     fn a_hangup_poll_retry_waits_for_a_pending_park() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.ring.force_push_failures(1);
         el.driver.arm_hangup_poll(conn_index);
@@ -6463,7 +5390,7 @@ mod tests {
     #[test]
     fn a_hangup_peek_that_cannot_be_submitted_is_retried() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.arm_hangup_poll(conn_index);
         el.driver.ring.force_push_failures(1);
@@ -6479,36 +5406,11 @@ mod tests {
         assert!(!c.hangup_recheck_due);
     }
 
-    /// A throttled connection whose re-arm push fails once its hold drains is
-    /// queued for a retry, not closed: a failed push is backpressure.
-    #[test]
-    fn a_throttle_rearm_that_cannot_be_pushed_is_retried() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.forward_hold_throttled[conn_index as usize] = true;
-        el.driver.ring.force_push_failures(1);
-        el.maybe_rearm_throttled_recv(conn_index);
-        let c = el.driver.connections.get(conn_index).unwrap();
-        assert!(matches!(c.lifecycle, Lifecycle::Open), "not closed");
-        assert!(!c.recv_multishot_armed, "the push failed");
-        assert_eq!(el.driver.recv_rearm_retries, vec![(conn_index, generation)]);
-        el.drain_recv_rearm_retries();
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "the retry armed the receive"
-        );
-    }
-
     /// No recheck peek is pushed while a park of the connection is pending.
     #[test]
     fn a_recheck_waits_for_a_pending_park() {
         let mut el = make_test_loop();
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         {
             let c = el.driver.connections.get_mut(conn_index).unwrap();
@@ -6537,7 +5439,7 @@ mod tests {
         if !el.driver.ring.supports_park() {
             return;
         }
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         el.driver.park_offered[conn_index as usize] = true;
         assert!(el.begin_park(conn_index, 1));
         assert!(el.driver.park_drain[conn_index as usize].is_none());
@@ -6556,49 +5458,21 @@ mod tests {
         }
     }
 
-    fn recv_armed(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> bool {
+    fn poll_armed(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> bool {
         el.driver
             .connections
             .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed)
-    }
-
-    /// A throttled connection is not re-armed when its hold drains while a
-    /// park drain is pending, and the install goes out with no receive armed.
-    #[test]
-    fn a_throttled_rearm_waits_for_a_pending_park() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver
-            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
-        el.driver.forward_hold_throttled[conn_index as usize] = true;
-        el.driver.throttled_recvs.push(conn_index);
-        el.rearm_throttled_recvs();
-        assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
-        el.driver.park_offered[conn_index as usize] = true;
-        el.drive_park_drains();
-        assert!(
-            el.driver.park_in_flight[conn_index as usize].is_some(),
-            "the install did not go out"
-        );
-        el.rearm_throttled_recvs();
-        assert!(
-            !recv_armed(&el, conn_index),
-            "re-armed with the install in flight"
-        );
+            .is_some_and(|c| c.hangup_poll_armed)
     }
 
     /// An install that fails after the drain gives the connection its
-    /// receive back.
+    /// hangup poll back.
     #[test]
-    fn a_failed_install_rearms_the_receive() {
+    fn a_failed_install_rearms_the_hangup_poll() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         el.driver
             .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
         el.driver.park_offered[conn_index as usize] = true;
         el.drive_park_drains();
         assert!(el.driver.park_in_flight[conn_index as usize].is_some());
@@ -6608,34 +5482,17 @@ mod tests {
             el.driver.connections.generation(conn_index),
         );
         el.handle_park_install(ud, -libc::EBADF);
-        assert!(recv_armed(&el, conn_index), "no receive after the failure");
-    }
-
-    /// An arm that ends with `ENOBUFS` during a park drain leaves the
-    /// starved list without a re-arm.
-    #[test]
-    fn a_starved_connection_is_not_rearmed_during_a_park_drain() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver
-            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
+        assert!(
+            poll_armed(&el, conn_index),
+            "no hangup poll after the failure"
         );
-        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert!(el.driver.recv_starved.contains(conn_index));
-        el.flush_replenish_and_rearm();
-        assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
-        assert!(!el.driver.recv_starved.contains(conn_index));
     }
 
     /// A park install still in flight for a slot's previous occupant does
-    /// not hold back the new occupant's re-arm, and its stale completion
-    /// leaves the new occupant's receive armed.
+    /// not refuse the new occupant's receive, and its stale completion
+    /// leaves that receive armed.
     #[test]
-    fn a_stale_install_does_not_block_the_next_occupants_rearm() {
+    fn a_stale_install_does_not_block_the_next_occupants_receive() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
@@ -6645,31 +5502,32 @@ mod tests {
                 target: 1,
                 generation: stale,
             });
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        // IORING_CQE_F_BUFFER with bid 0, and no IORING_CQE_F_MORE.
-        el.test_dispatch_cqe(ud.raw(), 5, 1);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
         assert!(
-            recv_armed(&el, conn_index),
-            "re-arm held back by a stale park"
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_direct_armed),
+            "receive refused because of a stale park"
         );
         let probe = FdProbe::new();
         el.handle_park_install(park_install_ud(conn_index, stale), probe.installed);
-        assert!(recv_armed(&el, conn_index));
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_direct_armed)
+        );
     }
 
     /// A failed install for a slot's previous occupant does not arm the new
-    /// occupant's receive: a starved connection is re-armed by the starved
-    /// pass, and a second arm under the same user_data would overlap it.
+    /// occupant's hangup poll.
     #[test]
     fn a_stale_failed_install_does_not_rearm_the_next_occupant() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let stale = generation.wrapping_sub(1);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
-        el.driver.recv_starved.push(conn_index);
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 1,
@@ -6677,21 +5535,18 @@ mod tests {
             });
         el.handle_park_install(park_install_ud(conn_index, stale), -libc::EBADF);
         assert!(
-            !recv_armed(&el, conn_index),
-            "armed the new occupant while it is on the starved list"
+            !poll_armed(&el, conn_index),
+            "armed the new occupant's hangup poll"
         );
     }
 
     /// An install that finds the connection no longer parkable closes the
-    /// installed fd and gives the connection its receive back.
+    /// installed fd and gives the connection its hangup poll back.
     #[test]
-    fn a_blocked_install_rearms_the_receive() {
+    fn a_blocked_install_rearms_the_hangup_poll() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 1,
@@ -6703,57 +5558,23 @@ mod tests {
         el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
         assert!(probe.was_closed(), "the installed fd was kept");
         assert!(
-            recv_armed(&el, conn_index),
-            "no receive after the blocked install"
+            poll_armed(&el, conn_index),
+            "no hangup poll after the blocked install"
         );
-    }
-
-    /// The install waits for the park's own cancel to end the receive.
-    #[test]
-    fn the_install_waits_for_the_receive_to_end() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        // As `begin_park` leaves it: the cancel queued, the receive still
-        // armed until its `ECANCELED` arrives.
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-        el.driver
-            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
-        el.driver.park_offered[conn_index as usize] = true;
-        el.drive_park_drains();
-        assert!(
-            el.driver.park_in_flight[conn_index as usize].is_none(),
-            "installed with a receive armed"
-        );
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
-        el.drive_park_drains();
-        assert!(el.driver.park_in_flight[conn_index as usize].is_some());
     }
 
     /// Abandoning when no park is draining is a no-op, so a stray install CQE
-    /// cannot re-arm a connection that never had its recv cancelled.
+    /// cannot re-arm a connection whose poll was never cancelled.
     #[test]
     fn abandoning_without_a_draining_park_changes_nothing() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         el.driver.set_park_drain(conn_index, None);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
 
         el.abandon_park_drain(conn_index);
 
         assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| !c.recv_multishot_armed),
+            !poll_armed(&el, conn_index),
             "no park was draining, so nothing was owed"
         );
     }
@@ -6913,25 +5734,14 @@ mod tests {
     fn arriving_data_withdraws_the_park_offer() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
         el.driver.park_offered[conn_index as usize] = true;
         el.driver
             .park_carry
             .insert(conn_index, ParkState::new(7u32));
 
-        // Drive the real completion path — the withdrawal has to live on the
-        // recv handler, not in a test-only helper. Same synthetic CQE shape
-        // `deliver_segment` uses: F_BUFFER | F_MORE with the bid in the high
-        // bits.
-        let data = b"GET x";
-        let bid: u16 = 0;
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
-        }
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
+        // Drive the real completion path: the withdrawal has to live on the
+        // receive handler, not in a test-only helper.
+        deliver_direct(&mut el, conn_index, b"GET x");
 
         assert!(
             !el.driver.park_offered[conn_index as usize],
@@ -6943,138 +5753,61 @@ mod tests {
         );
     }
 
-    /// Bytes lent before the handler offers are unread when the offer is
-    /// made, so the arrival's withdrawal does not cover them. `park_blocker`
-    /// must refuse: `take_pending_for_park` does not carry a lent buffer, and
-    /// the close on this worker would replenish it.
-    #[test]
-    fn bytes_lent_before_the_offer_block_the_park() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-
-        let data = b"GET x";
-        let bid: u16 = 0;
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
-        }
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
-        assert!(
-            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
-            "precondition: the bytes are lent, not copied"
-        );
-
-        // Set the flag directly: `offer_park` declines here. This checks
-        // `DataPending` as the backstop for a delivery path that does not call
-        // `withdraw_park_offer`.
-        el.driver.park_offered[conn_index as usize] = true;
-
-        assert_eq!(
-            el.driver.park_blocker(conn_index),
-            Some(ParkBlocker::DataPending),
-            "a lent buffer is unread data"
-        );
-    }
-
     /// #669: an offer made while the next request is buffered must not stand
     /// once the handler reads that request. The handler is mid-request then,
     /// and a park would drop its future without a reply.
     #[test]
     fn an_offer_made_with_a_request_buffered_does_not_survive_the_read() {
-        for lent in [true, false] {
-            let mut el = make_test_loop();
-            let conn_index = accept_connection(&mut el);
-            let idx = conn_index as usize;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
 
-            if lent {
-                // Request 2 arrives while the handler is busy and is lent.
-                let generation = el.driver.connections.generation(conn_index);
-                let data = b"GET y";
-                let bid: u16 = 0;
-                let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
-                }
-                let flags = 1u32 | 2u32 | ((bid as u32) << 16);
-                let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-                el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
-                assert!(el.driver.pending_recv_bufs[idx].is_some(), "precondition");
-            } else {
-                el.driver.accumulators.append(conn_index, b"GET y");
-            }
+        // Request 2 arrives while the handler is busy.
+        el.driver.accumulators.append(conn_index, b"GET y");
 
-            // Set a standing offer directly, so the assertions below need
-            // `offer_for_park` to clear it.
-            el.driver.park_offered[idx] = true;
-            el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
+        // Set a standing offer directly, so the assertions below need
+        // `offer_for_park` to clear it.
+        el.driver.park_offered[idx] = true;
+        el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
 
-            // The handler finishes response 1 and offers, through the public
-            // handle.
-            let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-            with_driver_state(&mut el, || ctx.offer_for_park(Some(ParkState::new(1u8))));
+        // The handler finishes response 1 and offers, through the public
+        // handle.
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        with_driver_state(&mut el, || ctx.offer_for_park(Some(ParkState::new(1u8))));
 
-            // The handler reads request 2.
-            if lent {
-                let pending = el.driver.pending_recv_bufs[idx].take().expect("lent");
-                el.driver.pending_replenish.push(pending.bid);
-            } else {
-                el.driver.accumulators.consume(conn_index, 5);
-            }
+        // The handler reads request 2.
+        el.driver.accumulators.consume(conn_index, 5);
 
-            assert_eq!(
-                el.driver.park_blocker(conn_index),
-                Some(ParkBlocker::NotOffered),
-                "lent={lent}: the handler is mid-request; the offer must not stand"
-            );
-            assert!(
-                !el.driver.park_carry.contains_key(&conn_index),
-                "lent={lent}: a declined offer must not leave state to ship"
-            );
-        }
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::NotOffered),
+            "the handler is mid-request; the offer must not stand"
+        );
+        assert!(
+            !el.driver.park_carry.contains_key(&conn_index),
+            "a declined offer must not leave state to ship"
+        );
     }
 
     /// An offer made from inside a `with_data`, `with_bytes` or
-    /// `try_with_data` callback is declined, with the request lent or
-    /// accumulated. `with_bytes`, and a `forward_recv_buf` of the whole lent
-    /// buffer or accumulator, take the bytes out of the driver before the
-    /// offer, so only the callback guard catches those cases; the plain
-    /// `with_data` and `try_with_data` cases are also caught by
-    /// `holds_unread` (#669).
+    /// `try_with_data` callback is declined. `with_bytes`, and a
+    /// `forward_recv_buf` of the whole accumulator, take the bytes out of the
+    /// driver before the offer, so only the callback guard catches those
+    /// cases; the plain `with_data` and `try_with_data` cases are also caught
+    /// by `holds_unread` (#669).
     #[test]
     fn an_offer_from_inside_a_reader_callback_is_declined() {
-        for (reader, lent) in [
-            ("with_data", false),
-            ("with_data", true),
-            ("with_data_forward", true),
-            ("with_data_forward", false),
-            ("with_bytes", false),
-            ("with_bytes", true),
-            ("try_with_data", false),
-            ("try_with_data_forward", false),
+        for reader in [
+            "with_data",
+            "with_data_forward",
+            "with_bytes",
+            "try_with_data",
+            "try_with_data_forward",
         ] {
             let mut el = make_test_loop();
             let conn_index = accept_connection(&mut el);
             let generation = el.driver.connections.generation(conn_index);
-            let data = b"GET z";
-            if lent {
-                let bid: u16 = 0;
-                let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
-                }
-                let flags = 1u32 | 2u32 | ((bid as u32) << 16);
-                let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-                el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
-                assert!(
-                    el.driver.pending_recv_bufs[conn_index as usize].is_some(),
-                    "{reader}: precondition"
-                );
-            } else {
-                el.driver.accumulators.append(conn_index, data);
-            }
+            el.driver.accumulators.append(conn_index, b"GET z");
 
             // A standing offer that only `offer_for_park` reaching
             // `offer_park` clears.
@@ -7095,9 +5828,8 @@ mod tests {
                     })
                 }
                 "with_data_forward" => {
-                    // Forwarding the whole lent buffer or accumulator takes it
-                    // out of `pending_recv_bufs` or the accumulator, so only
-                    // the callback guard declines the offer.
+                    // Forwarding the whole accumulator takes it out of the
+                    // driver, so only the callback guard declines the offer.
                     let mut fut = std::pin::pin!(ctx.with_data(|d| {
                         ctx.forward_recv_buf(d).expect("forward");
                         ctx.offer_for_park(Some(ParkState::new(3u8)));
@@ -7138,16 +5870,16 @@ mod tests {
             };
             assert!(
                 matches!(consumed, std::task::Poll::Ready(5)),
-                "{reader} lent={lent}: the read resolves with the request"
+                "{reader}: the read resolves with the request"
             );
             assert_eq!(
                 el.driver.park_blocker(conn_index),
                 Some(ParkBlocker::NotOffered),
-                "{reader} lent={lent}: an offer from inside the callback must not stand"
+                "{reader}: an offer from inside the callback must not stand"
             );
             assert!(
                 !el.driver.park_carry.contains_key(&conn_index),
-                "{reader} lent={lent}: and must not leave state to ship"
+                "{reader}: and must not leave state to ship"
             );
         }
     }
@@ -8195,7 +6927,6 @@ mod tests {
                 entry: entry1,
                 pool_slot: slot1,
                 slab_idx: u16::MAX,
-                total_len: chunk1.len() as u32,
             });
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
@@ -8329,7 +7060,14 @@ mod tests {
 
         let state = &el.driver.send_queues[conn_index as usize];
         assert_eq!(state.queue.len(), 4, "one queued entry per chunk");
-        let lens: Vec<u32> = state.queue.iter().map(|b| b.total_len).collect();
+        let lens: Vec<u32> = state
+            .queue
+            .iter()
+            .map(|b| match b.entry.op {
+                crate::backend::uring::sqe::Op::Send { len, .. } => len,
+                op => panic!("expected a send, got {op:?}"),
+            })
+            .collect();
         assert_eq!(lens, vec![64, 64, 64, 8], "chunks queued in order");
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
@@ -8364,7 +7102,6 @@ mod tests {
             entry,
             pool_slot: slot,
             slab_idx: u16::MAX,
-            total_len: data.len() as u32,
         }
     }
 
@@ -8844,40 +7581,6 @@ mod tests {
         assert!(el.driver.pending_send_retries.is_empty());
     }
 
-    /// A queued recv-buffer forward owns a provided buffer, not a pool slot.
-    /// Releasing the queue (give-up, force-finalize, slot reuse) must hand
-    /// its bid back to the ring instead of leaking it.
-    #[test]
-    fn releasing_a_queued_recv_buf_forward_replenishes_its_bid() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let bid: u16 = 7;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-        let entry =
-            crate::backend::uring::sqe::Sqe::stream_send(conn_index, std::ptr::null(), 0, ud.raw());
-        el.driver.send_queues[conn_index as usize]
-            .queue
-            .push_back(crate::handler::BuiltSend {
-                entry,
-                pool_slot: u16::MAX,
-                slab_idx: u16::MAX,
-                total_len: 0,
-            });
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        let before = el.driver.pending_replenish.len();
-
-        el.driver.drain_conn_send_queue(conn_index);
-
-        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
-        assert_eq!(
-            &el.driver.pending_replenish[before..],
-            &[bid],
-            "the queued forward's bid must be replenished on release"
-        );
-    }
-
     #[test]
     fn queue_built_sends_parks_under_sq_pressure() {
         let mut el = make_test_loop_with_config(
@@ -8958,7 +7661,6 @@ mod tests {
                 entry: crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw()),
                 pool_slot: slot,
                 slab_idx: u16::MAX,
-                total_len: data.len() as u32,
             }
         };
         let first = tls_send(&mut el, b"record one");
@@ -9045,7 +7747,6 @@ mod tests {
                 entry: entry_b,
                 pool_slot: slot_b,
                 slab_idx: u16::MAX,
-                total_len: b.len() as u32,
             });
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
@@ -9692,60 +8393,6 @@ mod tests {
 
     // ── Recv path tests ────────────────────────────────────────────
 
-    #[test]
-    fn handle_recv_multi_eof_closes_connection() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Simulate EOF CQE (result == 0).
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), 0, 0);
-
-        // Connection should be marked as closing.
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "connection not closed after recv EOF"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_stale_connection_replenishes_buffer() {
-        let mut el = make_test_loop();
-
-        // Don't allocate a connection — simulate stale CQE for conn_index 0.
-        let replenish_before = el.driver.pending_replenish.len();
-
-        // Simulate recv CQE with result > 0 and a buffer ID in flags.
-        // IORING_CQE_F_BUFFER = 1 << 0, buffer ID in upper 16 bits of flags.
-        let bid: u16 = 5;
-        let flags = (1u32) | ((bid as u32) << 16); // CQE_F_BUFFER | bid
-        let ud = UserData::encode(OpTag::RecvMulti, 0, 0);
-        el.test_dispatch_cqe(ud.raw(), 100, flags);
-
-        // Buffer should be replenished despite stale connection.
-        assert_eq!(
-            el.driver.pending_replenish.len(),
-            replenish_before + 1,
-            "buffer not replenished on stale connection CQE"
-        );
-        assert_eq!(el.driver.pending_replenish[0], bid);
-    }
-
-    // ── RecvMulti completion identity (generation) ─────────────────
-    //
-    // A multishot recv can outlive its connection: `try_finalize_close`
-    // cancels it best-effort and drops the cancel when the SQ is full, so the
-    // kernel's terminal completion can land after the `Close` CQE released the
-    // slot and a new connection took the index. The arm-time generation in the
-    // payload is what tells the two apart — `recv_multishot_armed` cannot, since
-    // it is per-slot and `arm_recv` sets it again for the new occupant.
-    // See `docs/recv-multi-identity-design.md`.
-
     /// Close `conn_index` through its `Close` CQE (which releases the slot and
     /// bumps its generation), then re-accept it. The free list is LIFO, so the
     /// released index comes straight back — the reuse a stale completion races.
@@ -9758,7 +8405,6 @@ mod tests {
             "the Close CQE must release the slot"
         );
         // What the real accept path does before handing a reused slot out.
-        el.driver.reset_recv_throttle(conn_index);
         el.driver.reset_send_state(conn_index);
         let reused = accept_connection(el);
         assert_eq!(
@@ -9845,7 +8491,6 @@ mod tests {
     #[test]
     fn a_direct_connection_at_the_accumulator_cap_closes() {
         let config = ConfigBuilder::new()
-            .recv_buffer(16, 1024)
             .recv_accumulator_max(4096)
             .recv_direct_region(1024)
             .build()
@@ -9885,257 +8530,6 @@ mod tests {
             4096,
             "the default recv_accumulator_capacity"
         );
-    }
-
-    #[test]
-    fn handle_recv_multi_stale_generation_error_does_not_touch_new_occupant() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let stale_generation = el.driver.connections.generation(conn_index);
-
-        recycle_connection(&mut el, conn_index);
-        assert_ne!(
-            el.driver.connections.generation(conn_index),
-            stale_generation,
-            "slot reuse must bump the generation"
-        );
-
-        // The new occupant has a task parked on recv and no recorded error.
-        el.executor.recv_waiters[conn_index as usize] = true;
-        el.executor.recv_errors[conn_index as usize] = None;
-
-        // The previous occupant's uncancelled multishot finally reports: a
-        // terminal error completion (no `F_MORE`).
-        let stale_ud = UserData::encode(OpTag::RecvMulti, conn_index, stale_generation);
-        el.test_dispatch_cqe(stale_ud.raw(), -libc::ECONNRESET, 0);
-
-        let conn = el
-            .driver
-            .connections
-            .get(conn_index)
-            .expect("the new occupant must still hold the slot");
-        assert!(
-            !conn.close_requested(),
-            "stale completion closed the new occupant"
-        );
-        assert!(
-            matches!(conn.read, ReadHalf::Open),
-            "stale completion poisoned the new occupant's read half"
-        );
-        assert!(
-            el.executor.recv_errors[conn_index as usize].is_none(),
-            "stale completion recorded a recv error on the new occupant"
-        );
-        assert!(
-            el.executor.recv_waiters[conn_index as usize],
-            "stale completion woke the new occupant's recv waiter"
-        );
-    }
-
-    /// On an incremental ring a completion's data starts at the bytes the
-    /// buffer already holds, not at its base: two completions into one
-    /// buffer reach the connection as consecutive bytes, and the buffer is
-    /// released once per completion.
-    #[test]
-    fn handle_recv_multi_reads_each_completion_at_its_offset() {
-        let mut el = make_test_loop();
-        el.driver.provided_bufs.set_incremental();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let bid: u16 = 2;
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe { std::ptr::copy_nonoverlapping(b"abcdefg".as_ptr(), buf_ptr as *mut u8, 7) };
-        // F_BUFFER | F_MORE | F_BUF_MORE, bid.
-        let flags = 1u32 | 2 | 0x10 | ((bid as u32) << 16);
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        el.test_dispatch_cqe(ud.raw(), 3, flags);
-        el.test_dispatch_cqe(ud.raw(), 4, flags);
-
-        let mut got = el.driver.accumulators.data(conn_index).to_vec();
-        if let Some(p) = el.driver.pending_recv_bufs[conn_index as usize] {
-            got.extend_from_slice(unsafe { std::slice::from_raw_parts(p.ptr, p.len as usize) });
-        }
-        assert_eq!(got, b"abcdefg");
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            el.driver.provided_bufs.ring_entries(),
-            "a partly used buffer stays in the ring"
-        );
-        // Both completions' bytes are in the accumulator, and each released
-        // its hold once.
-        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_none());
-        assert_eq!(el.driver.pending_replenish, [bid, bid]);
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&r);
-    }
-
-    /// A partial `SendRecvBuf` send resumes from the original data's offset in
-    /// its buffer plus the bytes sent, not from the buffer's base. The
-    /// remainder is parked by a forced push failure so its SQE can be read.
-    #[test]
-    fn handle_send_recv_buf_resumes_at_the_data_offset() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let ci = conn_index as usize;
-        let bid: u16 = 0;
-        el.driver.send_recv_buf_offs[ci] = 7;
-        el.driver.send_recv_buf_original_lens[ci] = 100;
-        el.driver.send_recv_buf_remaining[ci] = 100;
-        el.driver.send_queues[ci].in_flight = true;
-        el.driver.ring.force_push_failures(1);
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
-        let crate::backend::uring::sqe::Op::Send { buf, len, .. } =
-            el.driver.send_queues[ci].queue[0].entry.op
-        else {
-            panic!("the parked remainder is a plain send");
-        };
-        assert_eq!(buf, el.driver.provided_bufs.data_ptr(bid, 67));
-        assert_eq!(len, 40);
-    }
-
-    /// Pushing a `SendRecvBuf` send records its data's offset in the buffer,
-    /// which a partial send resumes from.
-    #[test]
-    fn a_pushed_send_recv_buf_records_its_offset() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let bid: u16 = 1;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        let entry = crate::backend::uring::sqe::Sqe::stream_send(
-            conn_index,
-            el.driver.provided_bufs.data_ptr(bid, 5),
-            10,
-            ud.raw(),
-        );
-        el.driver.submit_or_queue_send(
-            conn_index,
-            crate::handler::BuiltSend {
-                entry,
-                pool_slot: u16::MAX,
-                slab_idx: u16::MAX,
-                total_len: 10,
-            },
-        );
-        assert_eq!(el.driver.send_recv_buf_offs[conn_index as usize], 5);
-        assert_eq!(
-            el.driver.send_recv_buf_original_lens[conn_index as usize],
-            10
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_stale_generation_replenishes_buffer_once() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let stale_generation = el.driver.connections.generation(conn_index);
-
-        recycle_connection(&mut el, conn_index);
-        el.driver.pending_replenish.clear();
-        let free_before = el.driver.provided_bufs.free();
-
-        // A data-bearing completion for the dead connection: the kernel did
-        // consume a provided buffer, so it must go back to the ring — but its
-        // bytes must not reach the new occupant.
-        let bid: u16 = 3;
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"stale".as_ptr(), buf_ptr as *mut u8, 5);
-        }
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid
-        let stale_ud = UserData::encode(OpTag::RecvMulti, conn_index, stale_generation);
-        el.test_dispatch_cqe(stale_ud.raw(), 5, flags);
-
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "the consumed provided buffer must be replenished exactly once"
-        );
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            free_before - 1,
-            "the handout must be accounted exactly once"
-        );
-        assert!(
-            el.driver.accumulators.data(conn_index).is_empty(),
-            "stale bytes leaked into the new occupant's accumulator"
-        );
-        assert!(
-            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
-            "stale buffer pinned in the new occupant's zero-copy slot"
-        );
-
-        // The accounting closes: replenishing restores the free count.
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&r);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            free_before,
-            "no leak, no double replenish"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_stale_generation_leaves_armed_flag_set() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let stale_generation = el.driver.connections.generation(conn_index);
-
-        recycle_connection(&mut el, conn_index);
-        el.driver
-            .connections
-            .get_mut(conn_index)
-            .unwrap()
-            .recv_multishot_armed = true;
-
-        // A terminal (`!has_more`) completion at the previous generation must
-        // not reach the prologue that clears `recv_multishot_armed` — otherwise
-        // the close path would skip cancelling a multishot that is really armed.
-        let stale_ud = UserData::encode(OpTag::RecvMulti, conn_index, stale_generation);
-        el.test_dispatch_cqe(stale_ud.raw(), -libc::ECONNRESET, 0);
-
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "stale completion disarmed the live occupant's multishot"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_current_generation_after_reuse_is_delivered() {
-        // The identity check must not over-reject: after the slot is reused, a
-        // completion bearing the *current* generation is delivered normally.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        recycle_connection(&mut el, conn_index);
-        let generation = el.driver.connections.generation(conn_index);
-        assert_ne!(generation, 0, "the recycle must have bumped the generation");
-
-        let bid: u16 = 0;
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
-        }
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        assert_eq!(
-            ud.payload(),
-            generation,
-            "the RecvMulti payload carries the whole generation, untruncated"
-        );
-        el.test_dispatch_cqe(ud.raw(), 5, flags);
-
-        let pending = el.driver.pending_recv_bufs[conn_index as usize]
-            .expect("the live occupant's completion must be delivered");
-        assert_eq!(pending.bid, bid);
-        assert_eq!(pending.len, 5);
     }
 
     // ── Close path tests ───────────────────────────────────────────
@@ -10227,8 +8621,7 @@ mod tests {
             ReadHalf::Eof { truncated: true },
             "cancel after close must not relabel a finished read half"
         );
-        assert_eq!(cs.recv_arm, RecvArm::Multi, "cancel after close is a no-op");
-        assert!(cs.close_requested());
+        assert!(cs.close_requested(), "cancel after close is a no-op");
         assert_eq!(el.driver.pending_finalize_closes.len(), before);
     }
 
@@ -10262,9 +8655,9 @@ mod tests {
         let mut el = make_test_loop();
         // Another connection's receive takes `direct_recvs` slot 0, so this
         // connection's slot differs from its generation.
-        let other = accept_direct_connection(&mut el);
+        let other = accept_connection(&mut el);
         assert!(!el.driver.arm_direct_recv_or_close(other, None));
-        let conn_index = accept_direct_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
         let slot = el
@@ -10311,93 +8704,6 @@ mod tests {
 
     // ── Recv data delivery tests ───────────────────────────────────
 
-    #[test]
-    fn handle_recv_multi_data_appends_to_accumulator() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // The provided buffer ring has real buffers. Get a valid buffer ID.
-        // We'll simulate a recv CQE that references buffer 0.
-        let bid: u16 = 0;
-        // IORING_CQE_F_BUFFER = 1, IORING_CQE_F_MORE = 2. bid in upper 16 bits.
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
-        let bytes_received = 5i32;
-
-        // Write test data into the buffer ring's backing memory so the
-        // handler reads it into the accumulator.
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
-        }
-
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), bytes_received, flags);
-
-        // With zero-copy recv, first completion should be held in pending
-        // buffer slot (not copied to accumulator). Accumulator should be empty.
-        let data = el.driver.accumulators.data(conn_index);
-        assert!(
-            data.is_empty(),
-            "data should NOT be in accumulator (zero-copy)"
-        );
-
-        let pending = el.driver.pending_recv_bufs[conn_index as usize];
-        assert!(pending.is_some(), "pending recv buf should be set");
-        let pending = pending.unwrap();
-        assert_eq!(pending.bid, bid);
-        assert_eq!(pending.len, bytes_received as u32);
-
-        // Buffer should NOT be queued for replenish yet (deferred).
-        assert!(
-            !el.driver.pending_replenish.contains(&bid),
-            "buffer should NOT be replenished yet (zero-copy deferred)"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_handout_decrements_free_then_replenish_restores() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let entries = el.driver.provided_bufs.ring_entries();
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "all buffers free before any recv"
-        );
-
-        let bid: u16 = 0;
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid=0
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hi".as_ptr(), buf_ptr as *mut u8, 2);
-        }
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), 2, flags);
-
-        // Handout accounted: exactly one fewer free.
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries - 1,
-            "recv handout must decrement free by one"
-        );
-
-        // The consume path releases the bid via release_batch; free is restored.
-        el.driver.provided_bufs.release_batch(&[bid]);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "replenish must restore free (balanced accounting)"
-        );
-    }
-
     // ── Test helpers for driving receive futures and ring delivery ──
 
     /// A minimal no-op waker for driving receive futures in tests. The
@@ -10429,542 +8735,23 @@ mod tests {
         f()
     }
 
-    /// Deliver `data` in ring buffer `bid` to `conn_index` via a synthetic
-    /// multishot-recv CQE.
-    fn deliver_ring_buffer(
-        el: &mut AsyncEventLoop<NoopHandler>,
-        conn_index: u32,
-        bid: u16,
-        data: &[u8],
-    ) {
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
-        }
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
-    }
-
-    /// Regression: a parked ring reader must resolve to end of stream when a
-    /// peer-FIN (`result == 0`) multishot completion arrives while it is
-    /// parked, and the provided-buffer accounting must stay balanced (no bid
-    /// leak). Guards against a reader hanging forever on a mid-stream peer
-    /// close.
-    #[test]
-    fn parked_ring_reader_resolves_on_fin_completion() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let entries = el.driver.provided_bufs.ring_entries();
-        // Model an armed multishot recv (accept_connection injects CQEs directly
-        // and does not arm one).
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-
-        // Park the reader: nothing buffered, connection open → Pending + recv
-        // waiter.
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut fut =
-            std::pin::pin!(conn.with_data(|d| crate::runtime::io::ParseResult::Consumed(d.len())));
-        let waker = noop_waker();
-        let p1 = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
+    /// Deliver `data` to `conn_index` through a direct receive: arm one into
+    /// the accumulator's spare capacity, write `data` where the kernel would,
+    /// and dispatch its completion.
+    fn deliver_direct(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32, data: &[u8]) {
         assert!(
-            matches!(p1, std::task::Poll::Pending),
-            "parks with nothing buffered"
+            !el.driver.arm_direct_recv_or_close(conn_index, None),
+            "the receive was refused"
         );
-        assert!(
-            el.executor.recv_waiters[conn_index as usize],
-            "parked reader registers a recv waiter"
-        );
-
-        // Deliver a peer FIN: multishot recv completion with result == 0 and no
-        // F_MORE. This must wake the parked reader and close the recv side.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), 0, 0);
-        assert!(
-            !el.executor.recv_waiters[conn_index as usize],
-            "FIN wakes the parked reader"
-        );
-
-        // Second poll now observes the closed recv side and resolves to EOF.
-        let done = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(0))
-        });
-        assert!(done, "FIN while parked yields 0, not a hang");
-
-        // No held buffers were leaked: the ring's free count is fully restored.
-        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&to_replenish);
-        assert_eq!(
-            el.driver.provided_bufs.free(),
-            entries,
-            "provided-buffer accounting balanced after FIN + close"
-        );
-
-        // The self-terminated multishot must be marked disarmed (a FIN
-        // completion carries no F_MORE), so the close path issues no needless
-        // recv-cancel.
-        let armed = el
+        let slot = el
             .driver
             .connections
             .get(conn_index)
-            .map(|c| c.recv_multishot_armed);
-        assert!(
-            armed != Some(true),
-            "a FIN completion clears the armed flag"
-        );
-    }
-
-    /// A *proactive* close (peer has NOT sent a FIN, so the multishot recv is
-    /// still armed) must clear the armed flag as part of finalizing the close —
-    /// the code path that cancels the still-armed recv so the kernel drops its
-    /// socket reference and actually FINs the peer.
-    #[test]
-    fn proactive_close_clears_armed_recv_flag() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = true;
-        }
-
-        // No queued sends (accept_connection leaves the send queue empty).
-        // close_connection registers the close; the event loop's
-        // end-of-iteration drain finalizes it (submits the recv-cancel +
-        // Close SQEs) — #371 moved that out of close_connection so the task
-        // gets its poll window first. Run the drain here as the loop would.
-        el.driver.close_connection(conn_index);
-        assert_eq!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .map(|c| c.recv_multishot_armed),
-            Some(true),
-            "requesting the close must not touch the armed recv before the drain"
-        );
-        let pending = std::mem::take(&mut el.driver.pending_finalize_closes);
-        for idx in pending {
-            el.driver.try_finalize_close(idx);
-        }
-
-        let armed = el
-            .driver
-            .connections
-            .get(conn_index)
-            .map(|c| c.recv_multishot_armed);
-        assert!(
-            armed != Some(true),
-            "finalizing a proactive close disarms (cancels) the still-armed recv"
-        );
-    }
-
-    /// Over the lend cap, a plaintext completion is copied into the
-    /// accumulator instead of being lent, and its bid is queued for release.
-    #[test]
-    fn over_the_lend_cap_a_completion_is_copied_not_lent() {
-        let mut el = make_test_loop();
-        let a = accept_connection(&mut el);
-        let b = accept_connection(&mut el);
-        el.driver.lend_cap = Some(1);
-        for (conn, bid, msg) in [(a, 0u16, &b"first"[..]), (b, 1, b"second")] {
-            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-            unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr as *mut u8, msg.len()) };
-            let ud = UserData::encode(
-                OpTag::RecvMulti,
-                conn,
-                el.driver.connections.generation(conn),
-            );
-            el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | 2 | ((bid as u32) << 16));
-        }
-        assert!(
-            el.driver.pending_recv_bufs[a as usize].is_some(),
-            "the first is lent"
-        );
-        assert!(
-            el.driver.pending_recv_bufs[b as usize].is_none(),
-            "the second is copied"
-        );
-        assert_eq!(el.driver.accumulators.data(b), b"second");
-        assert_eq!(el.driver.pending_replenish, [1]);
-    }
-
-    /// Deliver `msg` into buffer `bid` for `conn` as a multishot completion.
-    fn deliver(el: &mut AsyncEventLoop<NoopHandler>, conn: u32, bid: u16, msg: &[u8]) {
-        let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr as *mut u8, msg.len()) };
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn,
-            el.driver.connections.generation(conn),
-        );
-        el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | 2 | ((bid as u32) << 16));
-    }
-
-    /// A `forward_recv_buf` send of a lent buffer goes out as a `SendRecvBuf`,
-    /// counted in `send_held_recv` until it completes or fails.
-    #[test]
-    fn a_forward_recv_buf_send_is_counted_until_it_completes() {
-        for result in [5, -libc::ECONNRESET] {
-            let mut el = make_test_loop();
-            let conn = accept_connection(&mut el);
-            let (ptr, _) = el.driver.provided_bufs.get_buffer(4);
-            el.driver.pending_recv_bufs[conn as usize] = Some(crate::backend::PendingRecvBuf {
-                bid: 4,
-                len: 5,
-                ptr,
-            });
-            let ctx = ConnCtx::new(conn, el.driver.connections.generation(conn));
-            let data = unsafe { std::slice::from_raw_parts(ptr, 5) };
-            with_driver_state(&mut el, || ctx.forward_recv_buf(data)).expect("forwarded");
-            assert_eq!(el.driver.send_held_recv[conn as usize], 1);
-            let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
-            assert_eq!(ud.tag(), Some(OpTag::SendRecvBuf));
-            el.test_dispatch_cqe(ud.raw(), result, 0);
-            assert_eq!(
-                el.driver.send_held_recv[conn as usize], 0,
-                "result {result}"
-            );
-        }
-    }
-
-    /// A queued `forward_recv_buf` send is counted, and releasing the queue
-    /// releases its count.
-    #[test]
-    fn a_queued_forward_recv_buf_send_is_released_with_the_queue() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        let (ptr, _) = el.driver.provided_bufs.get_buffer(4);
-        el.driver.pending_recv_bufs[conn as usize] = Some(crate::backend::PendingRecvBuf {
-            bid: 4,
-            len: 5,
-            ptr,
-        });
-        el.driver.send_queues[conn as usize].in_flight = true;
-        let ctx = ConnCtx::new(conn, el.driver.connections.generation(conn));
-        let data = unsafe { std::slice::from_raw_parts(ptr, 5) };
-        with_driver_state(&mut el, || ctx.forward_recv_buf(data)).expect("forwarded");
-        assert_eq!(el.driver.send_queues[conn as usize].queue.len(), 1);
-        assert_eq!(el.driver.send_held_recv[conn as usize], 1);
-        el.driver.drain_conn_send_queue(conn);
-        assert_eq!(el.driver.send_held_recv[conn as usize], 0);
-        assert!(el.driver.pending_replenish.contains(&4));
-    }
-
-    /// A plain connection whose sends hold its cap is throttled on its next
-    /// completion, and re-armed once the sends release their buffers.
-    #[test]
-    fn a_plain_recv_is_throttled_while_its_sends_hold_the_cap() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        let ci = conn as usize;
-        el.driver
-            .connections
-            .get_mut(conn)
-            .unwrap()
-            .recv_multishot_armed = true;
-        el.driver.send_held_recv[ci] = el.quarter_ring_cap() as u32;
-        deliver(&mut el, conn, 2, b"x");
-        assert!(el.driver.forward_hold_throttled[ci]);
-        assert_eq!(el.driver.throttled_recvs, [conn]);
-
-        // The cancel lands; the sends still hold the cap.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn,
-            el.driver.connections.generation(conn),
-        );
-        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.forward_hold_throttled[ci], "held at the cap");
-
-        // The sends complete.
-        el.driver.send_held_recv[ci] = 0;
-        el.flush_replenish_and_rearm();
-        assert!(!el.driver.forward_hold_throttled[ci], "re-armed");
-        assert!(el.driver.throttled_recvs.is_empty());
-        assert!(
-            el.driver
-                .connections
-                .get(conn)
-                .unwrap()
-                .recv_multishot_armed
-        );
-    }
-
-    /// Deliver a one-shot recv completion: `IORING_CQE_F_BUFFER` without
-    /// `IORING_CQE_F_MORE`.
-    fn deliver_single(el: &mut AsyncEventLoop<NoopHandler>, conn: u32, bid: u16, msg: &[u8]) {
-        let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr as *mut u8, msg.len()) };
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn,
-            el.driver.connections.generation(conn),
-        );
-        el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | ((bid as u32) << 16));
-    }
-
-    /// A re-arm whose push fails is retried on the next pass; the
-    /// connection stays open.
-    #[test]
-    fn a_failed_rearm_is_retried_not_closed() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.ring.force_push_failures(1);
-        deliver_single(&mut el, conn, 2, b"x");
-        assert!(matches!(
-            el.driver.connections.get(conn).unwrap().lifecycle,
-            Lifecycle::Open
-        ));
-        assert!(
-            !el.driver
-                .connections
-                .get(conn)
-                .unwrap()
-                .recv_multishot_armed
-        );
-        assert_eq!(el.driver.recv_rearm_retries.len(), 1);
-        el.drain_recv_rearm_retries();
-        assert!(el.driver.recv_rearm_retries.is_empty());
-        assert!(
-            el.driver
-                .connections
-                .get(conn)
-                .unwrap()
-                .recv_multishot_armed
-        );
-        assert_eq!(
-            UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data).tag(),
-            Some(OpTag::RecvMulti)
-        );
-    }
-
-    /// A retry is dropped, not pushed, when the slot was reused by another
-    /// connection or the connection was armed again before the drain.
-    #[test]
-    fn a_stale_rearm_retry_is_dropped() {
-        for case in ["slot reused", "armed since"] {
-            let mut el = make_test_loop();
-            let conn = accept_connection(&mut el);
-            el.driver.ring.force_push_failures(1);
-            deliver_single(&mut el, conn, 2, b"x");
-            assert_eq!(el.driver.recv_rearm_retries.len(), 1, "{case}");
-            match case {
-                "slot reused" => {
-                    let generation = el.driver.connections.generation(conn);
-                    el.driver.connections.release(conn);
-                    assert_eq!(accept_connection(&mut el), conn, "{case}");
-                    assert_ne!(el.driver.connections.generation(conn), generation);
-                }
-                _ => {
-                    el.driver
-                        .connections
-                        .get_mut(conn)
-                        .unwrap()
-                        .recv_multishot_armed = true;
-                }
-            }
-            el.driver.ring.last_pushed = None;
-            el.drain_recv_rearm_retries();
-            assert!(el.driver.recv_rearm_retries.is_empty(), "{case}");
-            assert!(el.driver.ring.last_pushed.is_none(), "{case}: re-armed");
-        }
-    }
-
-    /// By default every TCP connection re-arms a one-shot recv.
-    #[test]
-    fn connections_re_arm_a_one_shot_recv_by_default() {
-        use crate::backend::uring::sqe::Op;
-        assert!(
-            !ConfigBuilder::new().build().unwrap().recv_multishot,
-            "one-shot is the default"
-        );
-        let mut config = test_config();
-        config.recv_multishot = false;
-        let mut el = make_test_loop_with_config(config);
-        let conn = accept_connection(&mut el);
-        deliver_single(&mut el, conn, 2, b"x");
-        let pushed = el.driver.ring.last_pushed.as_ref().expect("re-armed");
-        assert_eq!(UserData(pushed.user_data).tag(), Some(OpTag::RecvMulti));
-        assert!(
-            matches!(pushed.op, Op::RecvSelect { .. }),
-            "{:?}",
-            pushed.op
-        );
-    }
-
-    /// With `recv_multishot` set, a connection re-arms a multishot recv
-    /// carrying the `RecvMulti` user_data.
-    #[test]
-    fn with_recv_multishot_a_connection_re_arms_a_multishot_recv() {
-        use crate::backend::uring::sqe::Op;
-        let mut el = make_test_loop();
-        assert!(
-            el.driver.recv_multishot,
-            "precondition: test_config sets it"
-        );
-        let conn = accept_connection(&mut el);
-        deliver_single(&mut el, conn, 2, b"x");
-        let pushed = el.driver.ring.last_pushed.as_ref().expect("re-armed");
-        let ud = UserData(pushed.user_data);
-        assert_eq!(ud.tag(), Some(OpTag::RecvMulti));
-        assert_eq!(ud.payload(), el.driver.connections.generation(conn));
-        assert!(
-            !matches!(pushed.op, Op::RecvSelect { .. }),
-            "{:?}",
-            pushed.op
-        );
-        assert!(
-            el.driver
-                .connections
-                .get(conn)
-                .unwrap()
-                .recv_multishot_armed
-        );
-    }
-
-    /// Buffers held by sends count toward the hold cap.
-    #[test]
-    fn send_held_buffers_count_toward_the_hold_cap() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        let cap = el.quarter_ring_cap() as u32;
-        el.driver.send_held_recv[conn as usize] = cap - 1;
-        assert!(!el.at_hold_cap(conn));
-        el.driver.send_held_recv[conn as usize] = cap;
-        assert!(el.at_hold_cap(conn));
-        el.driver.send_held_recv[conn as usize] = 0;
-    }
-
-    /// A one-shot connection that reaches its hold cap is counted in
-    /// `forward_throttled`, although it has no multishot to cancel.
-    #[test]
-    fn a_one_shot_throttle_is_counted() {
-        use metriken::CounterGroupMetric;
-        let mut config = test_config();
-        config.recv_multishot = false;
-        let mut el = make_test_loop_with_config(config);
-        let conn = accept_connection(&mut el);
-        el.driver.send_held_recv[conn as usize] = el.quarter_ring_cap() as u32;
-        let count = || {
-            crate::metrics::POOL
-                .counter_value(crate::metrics::pool::FORWARD_THROTTLED)
-                .unwrap_or(0)
-        };
-        let before = count();
-        deliver_single(&mut el, conn, 2, b"x");
-        assert!(el.driver.forward_hold_throttled[conn as usize]);
-        assert_eq!(count(), before + 1);
-    }
-
-    /// Without a lend cap, a partial message still takes the fallback even
-    /// when the ring's free bytes exceed the chunk.
-    #[test]
-    fn without_a_lend_cap_a_partial_message_takes_the_fallback() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-    }
-
-    /// With a lend cap, free bytes equal to the chunk do not beat it, so the
-    /// fallback is taken.
-    #[test]
-    fn with_a_lend_cap_free_bytes_equal_to_the_chunk_take_the_fallback() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.driver.lend_cap = Some(8);
-        el.driver.fallback_chunk =
-            el.driver.provided_bufs.free() * el.driver.provided_bufs.buffer_size();
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-    }
-
-    /// Each re-arm on free space takes one chunk from the pass's free bytes:
-    /// with room for one chunk, one parked connection re-arms and the next
-    /// takes the fallback.
-    #[test]
-    fn with_a_lend_cap_a_pass_rearms_only_as_many_as_the_ring_can_feed() {
-        let mut el = make_test_loop();
-        let a = park_connection(&mut el);
-        let b = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(a, b"part"));
-        assert!(el.driver.accumulators.append(b, b"part"));
-        el.driver.lend_cap = Some(8);
-        // Room for one chunk, not two.
-        el.driver.fallback_chunk =
-            el.driver.provided_bufs.free() * el.driver.provided_bufs.buffer_size() * 2 / 3;
-        el.flush_replenish_and_rearm();
-        let fallbacks = [a, b]
-            .iter()
-            .filter(|&&c| el.driver.recv_fallback_inflight[c as usize])
-            .count();
-        assert_eq!(fallbacks, 1);
-    }
-
-    /// With a lend cap, buffers already promised to re-arms issued since the
-    /// wait do not count toward the ring beating a fallback chunk.
-    #[test]
-    fn with_a_lend_cap_rearms_since_the_wait_do_not_count_as_free_bytes() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.driver.lend_cap = Some(8);
-        el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
-        // Two free buffers would beat one chunk; one is already promised.
-        leave_free_buffers(&mut el, 2);
-        el.driver.rearms_since_wait = 1;
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-    }
-
-    /// `recv_incremental` sets the lend cap to half the TCP ring; without it
-    /// lends are uncapped.
-    #[test]
-    fn the_lend_cap_is_half_the_ring_with_recv_incremental() {
-        let el = make_test_loop();
-        assert_eq!(el.driver.lend_cap, None);
-        let inc = make_test_loop_with_config(
-            test_config_builder()
-                .recv_incremental(true)
-                .build()
-                .expect("valid config"),
-        );
-        assert_eq!(
-            inc.driver.lend_cap,
-            Some(inc.driver.provided_bufs.ring_entries() / 2)
-        );
-    }
-
-    /// With a lend cap (`recv_incremental`), a parked connection with a
-    /// partial message re-arms its multishot when the ring's free buffers
-    /// hold more than one fallback chunk, instead of taking the fallback.
-    #[test]
-    fn with_a_lend_cap_a_ring_larger_than_the_chunk_rearms() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.driver.lend_cap = Some(8);
-        el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
-        el.flush_replenish_and_rearm();
-        assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
-        assert!(!el.driver.recv_starved.contains(conn_index));
+            .expect("open")
+            .recv_direct_slot;
+        write_direct_landing(el, slot as usize, data);
+        let ud = UserData::encode(OpTag::RecvDirect, conn_index, slot);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
     }
 
     /// `take_recv` hands out the read side exactly once, and dropping it hands
@@ -11240,92 +9027,6 @@ mod tests {
         assert!(!marked(&el, src), "dropping the forward clears the mark");
     }
 
-    /// A stale handle's `forward_recv_buf` must not send the slot's new
-    /// occupant's pending recv buffer (#544).
-    #[test]
-    fn forward_recv_buf_refuses_a_stale_handle_on_the_pending_buffer() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        let bytes = [7u8; 32];
-        el.driver.pending_recv_bufs[conn_index as usize] =
-            Some(crate::backend::uring::driver::PendingRecvBuf {
-                bid: 0,
-                len: bytes.len() as u32,
-                ptr: bytes.as_ptr(),
-            });
-
-        let err = with_driver_state(&mut el, || stale.forward_recv_buf(&bytes))
-            .expect_err("a stale handle must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert!(
-            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
-            "a stale handle took the new occupant's pending recv buffer"
-        );
-        assert!(
-            !el.driver.send_queues[conn_index as usize].in_flight
-                && el.driver.send_queues[conn_index as usize].queue.is_empty(),
-            "a stale handle queued a send on the new occupant"
-        );
-        el.driver.pending_recv_bufs[conn_index as usize] = None;
-    }
-
-    /// A second `forward_recv_buf` queued behind one still in flight must
-    /// not change how the first one's completion is read: the first, sent in
-    /// full, returns its buffer and the second goes out next (#614).
-    #[test]
-    fn a_queued_forward_recv_buf_does_not_disturb_the_one_in_flight() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let ci = conn_index as usize;
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let forward = |el: &mut AsyncEventLoop<NoopHandler>, bid: u16, len: u32| {
-            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-            el.driver.pending_recv_bufs[ci] =
-                Some(crate::backend::uring::driver::PendingRecvBuf { bid, len, ptr });
-            let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-            with_driver_state(el, || ctx.forward_recv_buf(data)).expect("forward");
-        };
-
-        forward(&mut el, 0, 100);
-        assert!(el.driver.send_queues[ci].in_flight);
-        assert_eq!(el.driver.send_recv_buf_remaining[ci], 100);
-        forward(&mut el, 1, 4096);
-        assert_eq!(
-            el.driver.send_queues[ci].queue.len(),
-            1,
-            "the second queued"
-        );
-
-        // The first completes in full.
-        let first = UserData::encode(OpTag::SendRecvBuf, conn_index, 0);
-        el.test_dispatch_cqe(first.raw(), 100, 0);
-        assert!(
-            el.driver.pending_replenish.contains(&0),
-            "the first buffer was taken for a partial send"
-        );
-        let pushed = UserData(
-            el.driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .expect("an SQE was pushed")
-                .user_data,
-        );
-        assert_eq!(
-            pushed.payload() as u16,
-            1,
-            "the second send did not go next"
-        );
-        assert_eq!(el.driver.send_recv_buf_remaining[ci], 4096);
-
-        // The second completes in full too.
-        el.test_dispatch_cqe(pushed.raw(), 4096, 0);
-        assert!(el.driver.pending_replenish.contains(&1));
-        assert!(!el.driver.send_queues[ci].in_flight);
-    }
-
     /// A stale handle's `forward_recv_buf` must not detach the slot's new
     /// occupant's accumulator, which would drop its buffered bytes (#544).
     /// The current handle still forwards it.
@@ -11363,28 +9064,14 @@ mod tests {
     }
 
     /// Once the connection's Close is submitted, `forward_recv_buf` on the
-    /// current handle is refused without committing anything: the pending
-    /// recv buffer and the accumulator stay where they are.
+    /// current handle is refused without committing anything: the
+    /// accumulator keeps its bytes.
     #[test]
     fn forward_recv_buf_on_a_closing_connection_commits_nothing() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         el.driver.send_queues[conn_index as usize].close_submitted = true;
-
-        let bytes = [7u8; 32];
-        el.driver.pending_recv_bufs[conn_index as usize] =
-            Some(crate::backend::uring::driver::PendingRecvBuf {
-                bid: 0,
-                len: bytes.len() as u32,
-                ptr: bytes.as_ptr(),
-            });
-        assert!(with_driver_state(&mut el, || current.forward_recv_buf(&bytes)).is_err());
-        assert!(
-            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
-            "a refused forward took the pending recv buffer"
-        );
-        el.driver.pending_recv_bufs[conn_index as usize] = None;
 
         assert!(el.driver.accumulators.append(conn_index, b"buffered bytes"));
         let data = el.driver.accumulators.data(conn_index);
@@ -11631,245 +9318,6 @@ mod tests {
         );
     }
 
-    /// An ECANCELED that still carries `IORING_CQE_F_MORE` must not leave the
-    /// connection believing it is armed.
-    ///
-    /// `-ECANCELED` is posted only for a request the cancel found live, and a
-    /// connection has at most one live multishot recv per generation — so the
-    /// CQE belongs to the current arming whatever the flag says. Trusting the
-    /// flag left `recv_multishot_armed` set against a multishot the kernel had
-    /// already killed, and every re-arm path then declined because the
-    /// connection looked armed. Observed as a forward parked at 4096 of 8192
-    /// bytes, flagged armed, with no data ever arriving.
-    #[test]
-    fn ecanceled_with_more_flag_still_rearms() {
-        const IORING_CQE_F_MORE: u32 = 1 << 1;
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver
-            .connections
-            .get_mut(conn_index)
-            .unwrap()
-            .recv_multishot_armed = true;
-
-        let recv_ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, IORING_CQE_F_MORE);
-
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "the connection must end up armed again — by a fresh multishot, not \
-             by a stale flag"
-        );
-    }
-
-    /// A cancel that the kernel applies to a *later* multishot must not leave
-    /// the connection unarmed.
-    ///
-    /// The throttle-cancel matches by `user_data`, which a connection's
-    /// multishot recv re-uses for the life of the slot. If the throttled recv
-    /// terminates on its own (`!has_more`) and is re-armed once its hold
-    /// drains, the queued cancel lands on the new multishot. The connection
-    /// is no longer throttled by then, so the throttle re-arm declines, and
-    /// the ECANCELED branch has to re-arm the connection itself.
-    #[test]
-    fn ecanceled_for_a_superseded_multishot_rearms_the_connection() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let ci = conn_index as usize;
-
-        // The state the race leaves behind: armed cleared by the ECANCELED that
-        // is about to arrive, no throttle (the hold already drained), the
-        // connection otherwise healthy and expected to be reading.
-        el.driver
-            .connections
-            .get_mut(conn_index)
-            .unwrap()
-            .recv_multishot_armed = true;
-        assert!(!el.driver.forward_hold_throttled[ci]);
-
-        let recv_ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
-
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "an unthrottled Open/Multi connection must come back armed"
-        );
-        assert!(
-            matches!(
-                el.driver.connections.get(conn_index).unwrap().lifecycle,
-                Lifecycle::Open
-            ),
-            "and must not have been closed"
-        );
-    }
-
-    /// The same ECANCELED must NOT re-arm a connection that is closing — that
-    /// cancel is `close_connection` releasing the recv's reference on the fd so
-    /// the Close actually FINs, and re-arming would pin it again.
-    #[test]
-    fn ecanceled_during_close_does_not_rearm() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver
-            .connections
-            .get_mut(conn_index)
-            .unwrap()
-            .recv_multishot_armed = true;
-        el.driver.close_connection(conn_index);
-
-        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
-
-        assert!(
-            !el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_multishot_armed),
-            "a closing connection must stay unarmed"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_second_completion_flushes_to_accumulator() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let flags = 1u32 | 2u32; // IORING_CQE_F_BUFFER | IORING_CQE_F_MORE, bid=0
-
-        // First recv: bid=0, "hello"
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
-        }
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), 5, flags);
-
-        // Second recv: bid=1, " world"
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(b" world".as_ptr(), buf_ptr as *mut u8, 6);
-        }
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), 6, flags | (1u32 << 16));
-
-        // Both buffers should be replenished (first flushed, second appended directly).
-        assert!(
-            el.driver.pending_replenish.contains(&0),
-            "first buffer should be replenished"
-        );
-        assert!(
-            el.driver.pending_replenish.contains(&1),
-            "second buffer should be replenished"
-        );
-
-        // No pending buffer (second completion went through accumulator path).
-        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_none());
-
-        // Accumulator should contain both buffers' data concatenated.
-        let data = el.driver.accumulators.data(conn_index);
-        assert_eq!(data, b"hello world");
-    }
-
-    #[test]
-    fn handle_recv_multi_enobufs_does_not_close() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // ENOBUFS = -105. has_more = false (bit 1 not set).
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), -105, 0);
-
-        // Connection should still be alive (ENOBUFS is recoverable).
-        assert!(
-            el.driver.connections.get(conn_index).is_some(),
-            "connection closed on ENOBUFS"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_unknown_error_closes_when_no_more() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Unknown error, !has_more — should close.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), -99, 0); // -99 = unknown errno
-
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "connection not closed on unknown recv error"
-        );
-    }
-
-    #[test]
-    fn handle_recv_multi_ecanceled_does_nothing() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // ECANCELED = -125.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), -125, 0);
-
-        // Connection should still be alive.
-        assert!(
-            el.driver.connections.get(conn_index).is_some(),
-            "connection closed on ECANCELED"
-        );
-    }
-
-    // ── Fallback recv tests ────────────────────────────────────────
-
-    /// Park a connection via an ENOBUFS multishot CQE and return its index.
-    fn park_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
-        let conn_index = accept_connection(el);
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert!(el.driver.recv_starved.contains(conn_index));
-        conn_index
-    }
-
     // ── Receive arrival log ────────────────────────────────────────
 
     /// Parse one `\n`-terminated line.
@@ -11884,17 +9332,16 @@ mod tests {
         base + std::time::Duration::from_millis(ms)
     }
 
-    /// Deliver `data` in buffer `bid` as the first completion of a batch
-    /// whose time is `time`.
+    /// Deliver `data` as the first completion of a batch whose time is
+    /// `time`.
     fn deliver_in_batch(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
-        bid: u16,
         data: &[u8],
         time: Instant,
     ) {
         el.driver.recv_batch.begin_at(time);
-        deliver_ring_buffer(el, conn_index, bid, data);
+        deliver_direct(el, conn_index, data);
     }
 
     /// Read one line with `with_data` and return the bytes consumed and the
@@ -11928,18 +9375,17 @@ mod tests {
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         let base = Instant::now();
 
-        deliver_in_batch(&mut el, conn_index, 0, b"a\n", at(base, 1));
+        deliver_in_batch(&mut el, conn_index, b"a\n", at(base, 1));
         let (n, a) = read_line(&mut el, ctx);
         assert_eq!((n, times(a)), (2, Some((at(base, 1), at(base, 1)))));
 
-        deliver_in_batch(&mut el, conn_index, 1, b"b\n", at(base, 2));
+        deliver_in_batch(&mut el, conn_index, b"b\n", at(base, 2));
         let (n, a) = read_line(&mut el, ctx);
         assert_eq!((n, times(a)), (2, Some((at(base, 2), at(base, 2)))));
 
-        // Two completions in one batch: the first is lent, the second moves
-        // both into the accumulator.
-        deliver_in_batch(&mut el, conn_index, 2, b"c\n", at(base, 3));
-        deliver_ring_buffer(&mut el, conn_index, 3, b"d\n");
+        // Two completions in one batch.
+        deliver_in_batch(&mut el, conn_index, b"c\n", at(base, 3));
+        deliver_direct(&mut el, conn_index, b"d\n");
         let (_, a) = read_line(&mut el, ctx);
         assert_eq!(times(a), Some((at(base, 3), at(base, 3))));
         let (_, a) = read_line(&mut el, ctx);
@@ -11948,7 +9394,7 @@ mod tests {
 
     /// A line that arrives over two batches takes its first byte's time from
     /// the first and its last byte's from the second, although the read
-    /// polled in between and moved the first part to the accumulator.
+    /// polled in between.
     #[test]
     fn a_line_spanning_two_batches_reports_both_times() {
         let mut el = make_test_loop();
@@ -11958,14 +9404,14 @@ mod tests {
         let waker = noop_waker();
         let mut fut = std::pin::pin!(ctx.with_data(arrival_line));
 
-        deliver_in_batch(&mut el, conn_index, 0, b"hel", at(base, 1));
+        deliver_in_batch(&mut el, conn_index, b"hel", at(base, 1));
         let first = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
             fut.as_mut().poll(&mut cx)
         });
         assert!(first.is_pending(), "the line is not complete yet");
 
-        deliver_in_batch(&mut el, conn_index, 1, b"lo\n", at(base, 2));
+        deliver_in_batch(&mut el, conn_index, b"lo\n", at(base, 2));
         let (second, a) = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
             (fut.as_mut().poll(&mut cx), ctx.recv_arrival())
@@ -11982,8 +9428,8 @@ mod tests {
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         let base = Instant::now();
 
-        deliver_in_batch(&mut el, conn_index, 0, b"a\nbb", at(base, 1));
-        deliver_in_batch(&mut el, conn_index, 1, b"b\n", at(base, 2));
+        deliver_in_batch(&mut el, conn_index, b"a\nbb", at(base, 1));
+        deliver_in_batch(&mut el, conn_index, b"b\n", at(base, 2));
         let (_, a) = read_line(&mut el, ctx);
         assert_eq!(times(a), Some((at(base, 1), at(base, 1))));
         let (n, a) = read_line(&mut el, ctx);
@@ -12001,8 +9447,8 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         let base = Instant::now();
-        // 65 one-byte batches on the accumulator path, as `handle_recv_multi`
-        // records and appends them.
+        // 65 one-byte batches, recorded and appended as a receive completion
+        // does.
         for i in 0..65u64 {
             el.driver.recv_batch.begin_at(at(base, i));
             el.driver.record_arrival(conn_index, 1);
@@ -12010,7 +9456,7 @@ mod tests {
         }
         assert!(el.driver.arrival[conn_index as usize].trim_due());
 
-        deliver_in_batch(&mut el, conn_index, 0, b"\n", at(base, 100));
+        deliver_in_batch(&mut el, conn_index, b"\n", at(base, 100));
         let waker = noop_waker();
         let mut fut =
             std::pin::pin!(ctx.with_data(|_| crate::runtime::io::ParseResult::Consumed(1)));
@@ -12055,69 +9501,28 @@ mod tests {
         );
     }
 
-    /// A parser that reports more than it was shown is credited with the
-    /// bytes the read removed, on the accumulator and the lent-buffer paths,
-    /// and the next read still finds its own batch.
+    /// A `with_bytes` parser that reports more than it was shown is credited
+    /// with the bytes the read removed, and the next read still finds its own
+    /// batch.
     #[test]
     fn a_parser_claiming_more_than_it_was_shown_reports_what_was_removed() {
-        for reader in ["with_bytes", "with_data_lent"] {
-            let mut el = make_test_loop();
-            let conn_index = accept_connection(&mut el);
-            let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-            let base = Instant::now();
-            deliver_in_batch(&mut el, conn_index, 0, b"ab\n", at(base, 1));
-            let waker = noop_waker();
-            let a = if reader == "with_bytes" {
-                let mut fut = std::pin::pin!(
-                    ctx.with_bytes(|_| crate::runtime::io::ParseResult::Consumed(100))
-                );
-                with_driver_state(&mut el, || {
-                    let mut cx = std::task::Context::from_waker(&waker);
-                    assert!(fut.as_mut().poll(&mut cx).is_ready());
-                    ctx.recv_arrival()
-                })
-            } else {
-                assert!(el.driver.pending_recv_bufs[conn_index as usize].is_some());
-                let mut fut = std::pin::pin!(
-                    ctx.with_data(|_| crate::runtime::io::ParseResult::Consumed(100))
-                );
-                with_driver_state(&mut el, || {
-                    let mut cx = std::task::Context::from_waker(&waker);
-                    assert!(fut.as_mut().poll(&mut cx).is_ready());
-                    ctx.recv_arrival()
-                })
-            };
-            assert_eq!(times(a), Some((at(base, 1), at(base, 1))), "{reader}");
-            deliver_in_batch(&mut el, conn_index, 1, b"c\n", at(base, 2));
-            let (_, a) = read_line(&mut el, ctx);
-            assert_eq!(times(a), Some((at(base, 2), at(base, 2))), "{reader}");
-        }
-    }
-
-    /// Bytes from a fallback recv are recorded like a multishot's.
-    #[test]
-    fn a_fallback_recv_records_its_bytes() {
         let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         let base = Instant::now();
-        el.driver.recv_batch.begin_at(at(base, 1));
-        el.driver.record_arrival(conn_index, 5);
-        assert!(el.driver.accumulators.append(conn_index, b"part-"));
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-
-        let pool = el.driver.fallback_recv_pool.as_mut().expect("pool built");
-        let slot: u16 = 0;
-        let (ptr, _) = pool.current_ptr_remaining(slot);
-        unsafe { std::ptr::copy_nonoverlapping(b"chunk\n".as_ptr(), ptr as *mut u8, 6) };
-        el.driver.recv_batch.begin_at(at(base, 2));
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, slot as u32);
-        el.test_dispatch_cqe(ud.raw(), 6, 0);
-
-        let (n, a) = read_line(&mut el, ctx);
-        assert_eq!(n, 11);
-        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
+        deliver_in_batch(&mut el, conn_index, b"ab\n", at(base, 1));
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(ctx.with_bytes(|_| crate::runtime::io::ParseResult::Consumed(100)));
+        let a = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_ready());
+            ctx.recv_arrival()
+        });
+        assert_eq!(times(a), Some((at(base, 1), at(base, 1))));
+        deliver_in_batch(&mut el, conn_index, b"c\n", at(base, 2));
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
     }
 
     /// Bytes a park carried are recorded on the adopting worker into a
@@ -12155,7 +9560,7 @@ mod tests {
         let old = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         let base = Instant::now();
         // Leave an unread line behind.
-        deliver_in_batch(&mut el, conn_index, 0, b"a\nb\n", at(base, 1));
+        deliver_in_batch(&mut el, conn_index, b"a\nb\n", at(base, 1));
         let (_, a) = read_line(&mut el, old);
         assert!(a.is_some());
 
@@ -12175,7 +9580,7 @@ mod tests {
         });
 
         // Once the new connection has read, the old handle still reads None.
-        deliver_in_batch(&mut el, reused, 1, b"c\n", at(base, 2));
+        deliver_in_batch(&mut el, reused, b"c\n", at(base, 2));
         let (_, a) = read_line(&mut el, new);
         assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
         with_driver_state(&mut el, || {
@@ -12236,457 +9641,6 @@ mod tests {
         assert!(with_driver_state(&mut el, || ctx.recv_arrival()).is_none());
     }
 
-    #[test]
-    fn dry_flush_submits_fallback_for_partial_message() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"$16\r\npart"));
-
-        // No pending replenish: the ring is dry.
-        assert!(el.driver.pending_replenish.is_empty());
-        el.flush_replenish_and_rearm();
-
-        assert!(
-            el.driver.recv_fallback_inflight[conn_index as usize],
-            "fallback not submitted"
-        );
-        assert!(
-            !el.driver.recv_starved.contains(conn_index),
-            "connection still parked after fallback submit"
-        );
-        assert_eq!(el.driver.recv_fallback_count, 1);
-        let pool = el.driver.fallback_recv_pool.as_ref().expect("pool built");
-        assert!(pool.in_use(0), "first fallback should occupy slot 0");
-    }
-
-    #[test]
-    fn dry_flush_keeps_waiting_with_empty_accumulator() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-
-        el.flush_replenish_and_rearm();
-
-        assert!(
-            !el.driver.recv_fallback_inflight[conn_index as usize],
-            "fallback submitted with nothing half-delivered"
-        );
-        // Nothing is torn, so the connection does not degrade to a fallback —
-        // it goes back to an ordinary multishot, which this test's ring (never
-        // drained) can feed. The park is for a dry ring, and the wake
-        // condition is "the ring has buffers"; a replenish is just the usual
-        // way that becomes true.
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "an untorn connection re-arms once the ring can feed it"
-        );
-    }
-
-    /// A parked connection must come back when the ring has buffers, even if
-    /// this pass returned none.
-    ///
-    /// The re-arm used to be gated on a replenish happening in the same pass.
-    /// A connection re-parked *after* that pass — a fallback completion does
-    /// exactly this — then sat against a full ring with nothing left to
-    /// trigger another replenish: no recv armed, so no bid returned, so no
-    /// further pass with `replenished`.
-    #[test]
-    fn parked_connection_rearms_against_a_full_ring_without_a_replenish() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.pending_replenish.is_empty(), "nothing to return");
-        assert!(el.driver.provided_bufs.free() > 0, "the ring has buffers");
-
-        el.flush_replenish_and_rearm();
-
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_multishot_armed,
-            "a parked connection must re-arm while the ring can feed it"
-        );
-        assert!(!el.driver.recv_starved.contains(conn_index));
-    }
-
-    /// Hand out ring buffers until `free` are left, without returning any.
-    fn leave_free_buffers(el: &mut AsyncEventLoop<NoopHandler>, free: u32) {
-        let mut bid = 0;
-        while el.driver.provided_bufs.free() > free {
-            el.driver.provided_bufs.complete(bid, 1, false);
-            bid += 1;
-        }
-    }
-
-    fn parked_in_order(el: &AsyncEventLoop<NoopHandler>) -> Vec<u32> {
-        (0..el.driver.recv_starved.len())
-            .filter_map(|i| el.driver.recv_starved.get(i))
-            .collect()
-    }
-
-    #[test]
-    fn a_pass_rearms_one_connection_per_free_buffer_oldest_first() {
-        let mut el = make_test_loop();
-        let conns: Vec<u32> = (0..5).map(|_| park_connection(&mut el)).collect();
-        leave_free_buffers(&mut el, 2);
-
-        el.flush_replenish_and_rearm();
-        assert_eq!(parked_in_order(&el), conns[2..]);
-        assert!(el.driver.rearm_deferred, "parked connections were left");
-        assert!(
-            !el.may_block(),
-            "the loop must run another pass instead of blocking"
-        );
-
-        // Before the loop waits, a second pass re-arms nothing: the two
-        // passes share one budget.
-        el.flush_replenish_and_rearm();
-        assert_eq!(parked_in_order(&el), conns[2..]);
-        assert!(el.driver.rearm_deferred);
-        assert!(!el.may_block());
-
-        // The re-armed recvs had no data waiting and took no buffer, so after
-        // the wait the next pass takes the next two.
-        el.driver.rearms_since_wait = 0;
-        el.flush_replenish_and_rearm();
-        assert_eq!(parked_in_order(&el), conns[4..]);
-        assert!(el.driver.rearm_deferred);
-
-        el.driver.rearms_since_wait = 0;
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_starved.is_empty());
-        assert!(!el.driver.rearm_deferred);
-        assert!(el.may_block());
-        for c in conns {
-            assert!(el.driver.connections.get(c).unwrap().recv_multishot_armed);
-        }
-    }
-
-    #[test]
-    fn a_pass_with_no_free_buffer_rearms_nothing_and_does_not_defer() {
-        let mut el = make_test_loop();
-        let conns: Vec<u32> = (0..3).map(|_| park_connection(&mut el)).collect();
-        leave_free_buffers(&mut el, 0);
-
-        el.flush_replenish_and_rearm();
-        assert_eq!(parked_in_order(&el), conns);
-        assert!(
-            !el.driver.rearm_deferred,
-            "a dry ring must let the loop block until a bid returns"
-        );
-        assert!(el.may_block());
-    }
-
-    #[test]
-    fn closing_a_parked_connection_does_not_rearm_the_next_occupant() {
-        let mut el = make_test_loop();
-        let conn = park_connection(&mut el);
-        recycle_connection(&mut el, conn);
-        assert!(
-            !el.driver.recv_starved.contains(conn),
-            "the Close CQE must drop the old occupant's park entry"
-        );
-
-        // The new occupant already has its recv armed; a pass with free
-        // buffers must not arm a second one.
-        el.flush_replenish_and_rearm();
-        assert_eq!(el.driver.rearms_since_wait, 0);
-    }
-
-    #[test]
-    fn a_connection_parked_again_goes_behind_those_still_waiting() {
-        let mut el = make_test_loop();
-        let conns: Vec<u32> = (0..3).map(|_| park_connection(&mut el)).collect();
-        leave_free_buffers(&mut el, 1);
-
-        el.flush_replenish_and_rearm();
-        assert_eq!(parked_in_order(&el), conns[1..]);
-
-        // The re-armed recv finds the ring empty and parks again.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conns[0],
-            el.driver.connections.generation(conns[0]),
-        );
-        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert_eq!(parked_in_order(&el), [conns[1], conns[2], conns[0]]);
-    }
-
-    #[test]
-    fn partial_message_prefers_fallback_over_rearm() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-
-        // Buffers came back — but re-arming a connection with a partial
-        // message would only move one ring's worth before parking again
-        // (the churn cycle). The fallback must win the arbitration.
-        el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
-        el.driver.pending_replenish.push(0);
-        el.flush_replenish_and_rearm();
-
-        assert!(
-            el.driver.recv_fallback_inflight[conn_index as usize],
-            "partial-message connection must take the fallback path"
-        );
-        assert!(el.driver.recv_starved.is_empty());
-    }
-
-    #[test]
-    fn empty_accumulator_rearms_multishot_on_replenish() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-
-        el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
-        el.driver.pending_replenish.push(0);
-        el.flush_replenish_and_rearm();
-
-        assert!(
-            !el.driver.recv_fallback_inflight[conn_index as usize],
-            "nothing half-delivered — multishot re-arm expected"
-        );
-        assert!(el.driver.recv_starved.is_empty());
-    }
-
-    #[test]
-    fn replenish_does_not_rearm_while_fallback_inflight() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-        // Fallback submission takes the connection out of the park queue;
-        // its completion re-parks it.
-        assert!(!el.driver.recv_starved.contains(conn_index));
-
-        // A stale multishot ENOBUFS CQE re-parks the connection while the
-        // fallback is still in flight. When buffers come back, the
-        // replenish pass must NOT arm a multishot alongside the
-        // outstanding one-shot — the connection stays parked until the
-        // fallback CQE hands off.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert!(el.driver.recv_starved.contains(conn_index));
-
-        el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
-        el.driver.pending_replenish.push(0);
-        el.flush_replenish_and_rearm();
-
-        assert!(
-            el.driver.recv_starved.contains(conn_index),
-            "fallback-inflight connection must stay parked until its CQE"
-        );
-        assert!(
-            !el.driver.rearm_deferred,
-            "a fallback in flight must not keep the loop awake"
-        );
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-    }
-
-    #[test]
-    fn dry_flush_moves_held_buffer_to_accumulator_and_revives() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-
-        // Simulate a zero-copy held buffer with unconsumed partial data.
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(3);
-        unsafe { std::ptr::copy_nonoverlapping(b"held".as_ptr(), buf_ptr as *mut u8, 4) };
-        el.driver.provided_bufs.complete(3, 4, false); // bid 3 was handed out before being held
-        el.driver.pending_recv_bufs[conn_index as usize] = Some(crate::backend::PendingRecvBuf {
-            bid: 3,
-            len: 4,
-            ptr: buf_ptr,
-        });
-
-        el.flush_replenish_and_rearm();
-
-        assert_eq!(el.driver.accumulators.data(conn_index), b"held");
-        assert!(
-            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
-            "hold not flushed"
-        );
-        // The flushed hold is a partial message — the fallback continues
-        // draining it (its bid went back to the ring for other conns).
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-        assert!(el.driver.recv_starved.is_empty());
-    }
-
-    #[test]
-    fn fallback_completion_appends_wakes_and_reparks() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part-"));
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-
-        // Write payload into the pool slot the way the kernel would.
-        // (`alloc_raw` leaves `remaining` at 0 — only the base pointer is
-        // meaningful here, matching what the recv SQE was built from.)
-        let pool = el.driver.fallback_recv_pool.as_mut().expect("pool built");
-        let slot: u16 = 0;
-        assert!(pool.in_use(slot));
-        let (ptr, _) = pool.current_ptr_remaining(slot);
-        unsafe { std::ptr::copy_nonoverlapping(b"chunk".as_ptr(), ptr as *mut u8, 5) };
-
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, slot as u32);
-        el.test_dispatch_cqe(ud.raw(), 5, 0);
-
-        assert_eq!(el.driver.accumulators.data(conn_index), b"part-chunk");
-        assert!(
-            !el.driver.recv_fallback_inflight[conn_index as usize],
-            "inflight flag not cleared"
-        );
-        assert!(
-            !el.driver.fallback_recv_pool.as_ref().unwrap().in_use(slot),
-            "pool slot not released"
-        );
-        assert!(
-            el.driver.recv_starved.contains(conn_index),
-            "connection not re-parked after fallback completion"
-        );
-        assert!(el.driver.connections.get(conn_index).is_some());
-    }
-
-    #[test]
-    fn fallback_completion_eof_closes_connection() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.flush_replenish_and_rearm();
-
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
-        el.test_dispatch_cqe(ud.raw(), 0, 0);
-
-        assert!(
-            !el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0),
-            "pool slot not released on EOF"
-        );
-        let closed = el
-            .driver
-            .connections
-            .get(conn_index)
-            .is_none_or(|c| c.close_requested());
-        assert!(closed, "FIN mid-message must close the connection");
-    }
-
-    #[test]
-    fn fallback_completion_error_closes_connection() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.flush_replenish_and_rearm();
-
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
-        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
-
-        assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
-        let closed = el
-            .driver
-            .connections
-            .get(conn_index)
-            .is_none_or(|c| c.close_requested());
-        assert!(closed);
-    }
-
-    #[test]
-    fn fallback_completion_ecanceled_reparks_alive_connection() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.flush_replenish_and_rearm();
-
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
-        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
-
-        assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
-        assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
-        assert!(
-            el.driver.recv_starved.contains(conn_index),
-            "cancelled fallback must re-park, not strand the connection"
-        );
-    }
-
-    /// A fallback recv cancelled by a close (the `CancelAll` lead, #586) does
-    /// not re-park the closing connection. A re-park would outlive the close:
-    /// the next connection installed at the index would get a second
-    /// multishot recv from the next flush.
-    #[test]
-    fn fallback_completion_ecanceled_does_not_repark_a_closing_connection() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-
-        el.driver.close_connection(conn_index);
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
-        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
-        assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
-        assert!(
-            !el.driver.recv_starved.contains(conn_index),
-            "a closing connection must not be re-parked"
-        );
-
-        // The close completes and the index is reused; a flush must not arm
-        // a recv on the new occupant.
-        let close = UserData::encode(OpTag::Close, conn_index, 0);
-        el.test_dispatch_cqe(close.raw(), 0, 0);
-        let reused = accept_connection(&mut el);
-        assert_eq!(reused, conn_index, "the slot is reused");
-        let before = el.driver.ring.sq_len();
-        el.flush_replenish_and_rearm();
-        assert_eq!(
-            el.driver.ring.sq_len(),
-            before,
-            "the new connection got a recv it did not ask for"
-        );
-    }
-
-    #[test]
-    fn stale_fallback_completion_releases_slot_only() {
-        let mut el = make_test_loop();
-        let conn_index = park_connection(&mut el);
-        assert!(el.driver.accumulators.append(conn_index, b"part"));
-        el.flush_replenish_and_rearm();
-        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
-
-        // Close and release the slot; the generation bumps on release.
-        el.driver.close_connection(conn_index);
-        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
-        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
-        assert!(el.driver.connections.get(conn_index).is_none());
-
-        // Reuse the slot for a new occupant.
-        let new_index = accept_connection(&mut el);
-        assert_eq!(new_index, conn_index, "test expects slot reuse");
-        assert!(
-            !el.driver.recv_fallback_inflight[new_index as usize],
-            "close must clear the inflight flag for the next occupant"
-        );
-
-        // The stale fallback CQE for the old occupant arrives now.
-        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
-        el.test_dispatch_cqe(ud.raw(), 5, 0);
-
-        assert!(
-            !el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0),
-            "stale CQE must release the pool slot"
-        );
-        assert!(
-            el.driver.accumulators.data(new_index).is_empty(),
-            "stale CQE must not append into the new occupant's accumulator"
-        );
-        assert!(el.driver.connections.get(new_index).is_some());
-    }
-
     // ── Connect tests ──────────────────────────────────────────────
 
     #[test]
@@ -12699,6 +9653,12 @@ mod tests {
             .connections
             .allocate_outbound()
             .expect("no free slots");
+        // As the connect's submit leaves a plaintext connection.
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct = true;
         el.executor.connect_waiters[conn_index as usize] = true;
 
         // Simulate successful connect CQE (result == 0).
@@ -12714,13 +9674,15 @@ mod tests {
             el.executor.io_results[conn_index as usize].is_some(),
             "connect result not stored"
         );
-        // Connection should be established, open, with a multishot recv armed.
+        // Connection should be established and open, with its hangup poll
+        // armed.
         let conn = el.driver.connections.get(conn_index).unwrap();
         assert!(conn.established, "connection not marked established");
         assert!(
-            matches!(conn.lifecycle, Lifecycle::Open) && matches!(conn.recv_arm, RecvArm::Multi),
-            "connection not Open / recv_arm not Multi after connect"
+            matches!(conn.lifecycle, Lifecycle::Open),
+            "connection not Open after connect"
         );
+        assert!(conn.hangup_poll_armed, "no hangup poll after connect");
     }
 
     #[test]
@@ -13501,25 +10463,6 @@ mod tests {
     }
 
     #[test]
-    fn nop_inject_recv_eof_closes_connection() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.inject_and_dispatch(ud.raw(), 0);
-
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "connection not closed on injected recv EOF"
-        );
-    }
-
-    #[test]
     fn nop_inject_zc_send_error_no_slab_leak() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
@@ -13666,56 +10609,6 @@ mod tests {
     }
 
     #[test]
-    fn nop_inject_recv_enobufs() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // ENOBUFS = -105.
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.inject_and_dispatch(ud.raw(), -105);
-
-        assert!(
-            el.driver.connections.get(conn_index).is_some(),
-            "connection closed on ENOBUFS"
-        );
-    }
-
-    #[test]
-    fn nop_inject_recv_unknown_error_closes() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.inject_and_dispatch(ud.raw(), -99);
-
-        let conn = el.driver.connections.get(conn_index);
-        assert!(conn.is_none() || conn.unwrap().close_requested());
-    }
-
-    #[test]
-    fn nop_inject_recv_ecanceled() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
-        el.inject_and_dispatch(ud.raw(), -125); // ECANCELED
-
-        assert!(el.driver.connections.get(conn_index).is_some());
-    }
-
-    #[test]
     fn nop_inject_connect_success() {
         let mut el = make_test_loop();
         let conn_index = el
@@ -13723,6 +10616,11 @@ mod tests {
             .connections
             .allocate_outbound()
             .expect("no free slots");
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct = true;
         el.executor.connect_waiters[conn_index as usize] = true;
 
         let ud = UserData::encode(OpTag::Connect, conn_index, 0);
@@ -13732,9 +10630,7 @@ mod tests {
         assert!(el.executor.io_results[conn_index as usize].is_some());
         let conn = el.driver.connections.get(conn_index).unwrap();
         assert!(conn.established);
-        assert!(
-            matches!(conn.lifecycle, Lifecycle::Open) && matches!(conn.recv_arm, RecvArm::Multi)
-        );
+        assert!(matches!(conn.lifecycle, Lifecycle::Open));
     }
 
     #[test]
@@ -13840,11 +10736,14 @@ mod tests {
         let id = await_slot(&mut el, conn_index, slot, 4);
 
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
-        let recv_ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let recv_slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        let recv_ud = UserData::encode(OpTag::RecvDirect, conn_index, recv_slot);
 
         el.inject_batch_and_dispatch(&[
             (send_ud.raw(), -104), // send error
@@ -13872,11 +10771,14 @@ mod tests {
 
         // Recv EOF + stale send in the same batch.
         // The EOF handler calls close_connection internally.
-        let recv_ud = UserData::encode(
-            OpTag::RecvMulti,
-            conn_index,
-            el.driver.connections.generation(conn_index),
-        );
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let recv_slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        let recv_ud = UserData::encode(OpTag::RecvDirect, conn_index, recv_slot);
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
 
         el.inject_batch_and_dispatch(&[
@@ -14643,388 +11545,6 @@ mod tests {
         // is cleanly released.
     }
 
-    // ── SendRecvBuf (zero-copy forward) tests ──────────────────────
-
-    #[test]
-    fn handle_send_recv_buf_full_send_replenishes_without_settling() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Simulate a forward_recv_buf send: bid=3, data_len=100, with an
-        // awaited send queued behind it.
-        let bid: u16 = 3;
-        let data_len: u32 = 100;
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
-        let behind = built_copy_send(&mut el, conn_index, b"later");
-        let id = await_slot(&mut el, conn_index, behind.pool_slot, 5);
-        el.driver.send_queues[conn_index as usize]
-            .queue
-            .push_back(behind);
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        let payload = bid as u32;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-
-        // Full send: all 100 bytes sent.
-        el.test_dispatch_cqe(ud.raw(), 100, 0);
-
-        // Buffer should be replenished.
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not replenished after full send"
-        );
-        // Nothing awaits a SendRecvBuf: the awaited send behind it was
-        // submitted, not settled (#617).
-        assert!(
-            el.driver.send_queues[conn_index as usize].queue.is_empty(),
-            "the queued send was not submitted"
-        );
-        assert!(
-            send_result(&mut el, id).is_none(),
-            "a SendRecvBuf's completion settled the send behind it"
-        );
-    }
-
-    #[test]
-    fn handle_send_recv_buf_error_replenishes_buffer() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let bid: u16 = 5;
-        let data_len: u32 = 200;
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
-        let payload = bid as u32;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-
-        // Simulate ECONNRESET.
-        el.test_dispatch_cqe(ud.raw(), -104, 0);
-
-        // Buffer should be replenished even on error.
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not replenished after send error"
-        );
-    }
-
-    #[test]
-    fn handle_send_recv_buf_partial_send_computes_correct_offset() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Configure: buffer_size = 4096, but data is only 100 bytes.
-        // This is the common case — TCP segments are smaller than buffer capacity.
-        let bid: u16 = 0;
-        let data_len: u32 = 100;
-
-        // Write recognizable data into the provided buffer.
-        let (buf_ptr, buf_size) = el.driver.provided_bufs.get_buffer(bid);
-        assert!(
-            buf_size > data_len,
-            "test requires buffer_size > data_len to exercise the bug"
-        );
-        let test_data: Vec<u8> = (0..data_len as u8).collect();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                test_data.as_ptr(),
-                buf_ptr as *mut u8,
-                data_len as usize,
-            );
-        }
-
-        // Set up original length tracking (mirrors forward_recv_buf).
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
-        let payload = bid as u32;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-
-        // Partial send: only 60 of 100 bytes sent.
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
-
-        // Buffer should NOT be replenished yet (still in-flight).
-        assert!(
-            !el.driver.pending_replenish.contains(&bid),
-            "buffer replenished prematurely on partial send"
-        );
-
-        // The retry SQE should have been pushed to the ring. The handler updated
-        // send_recv_buf_remaining to 40; the retry CQE just needs bid in the payload.
-        assert_eq!(
-            el.driver.send_recv_buf_remaining[conn_index as usize], 40,
-            "remaining not updated after partial send"
-        );
-        let new_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-
-        // Complete the retry — all 40 remaining bytes sent.
-        el.test_dispatch_cqe(new_ud.raw(), 40, 0);
-
-        // Now the buffer should be replenished.
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not replenished after retry completed"
-        );
-    }
-
-    /// Set up a 100-byte `SendRecvBuf` in flight on a new connection and
-    /// complete it partially (60 bytes) while the SQ refuses the resubmit of
-    /// the remaining 40. Returns the connection and the bid.
-    fn partial_send_recv_buf_with_a_full_sq(el: &mut AsyncEventLoop<NoopHandler>) -> (u32, u16) {
-        let conn_index = accept_connection(el);
-        let bid: u16 = 3;
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = 100;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = 100;
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        el.driver.ring.force_push_failures(1);
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
-        (conn_index, bid)
-    }
-
-    /// A partial `SendRecvBuf` whose remainder cannot be pushed (SQ full)
-    /// parks the remainder at the head of the queue and keeps the buffer, as
-    /// any send does under SQ pressure; dropping it left a hole in the stream
-    /// (#613). The retry submits the remainder.
-    #[test]
-    fn a_send_recv_buf_remainder_is_parked_when_the_sq_is_full() {
-        let mut el = make_test_loop();
-        let (conn_index, bid) = partial_send_recv_buf_with_a_full_sq(&mut el);
-        let ci = conn_index as usize;
-        assert!(
-            !el.driver.pending_replenish.contains(&bid),
-            "the remainder's buffer went back to the ring unsent"
-        );
-        assert!(
-            el.driver.send_queues[ci].parked,
-            "the remainder was not parked"
-        );
-        assert!(el.driver.send_queues[ci].in_flight);
-        assert_eq!(el.driver.send_recv_buf_remaining[ci], 40);
-
-        el.drain_send_retries();
-        assert!(
-            !el.driver.send_queues[ci].parked,
-            "the retry did not submit"
-        );
-        // Pushing the remainder keeps its progress: 40 of the 100 bytes left,
-        // so a further partial resubmits from the right offset (#614).
-        assert_eq!(el.driver.send_recv_buf_original_lens[ci], 100);
-        assert_eq!(el.driver.send_recv_buf_remaining[ci], 40);
-        let ud = UserData(
-            el.driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .expect("an SQE was pushed")
-                .user_data,
-        );
-        assert_eq!(ud.tag(), Some(OpTag::SendRecvBuf));
-        assert_eq!(ud.payload() as u16, bid);
-
-        el.test_dispatch_cqe(ud.raw(), 40, 0);
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "the buffer was not returned after the remainder was sent"
-        );
-    }
-
-    /// A remainder the SQ keeps refusing is given up on as any parked send
-    /// is: its buffer goes back to the ring and the connection closes, so the
-    /// stream does not continue with a hole.
-    #[test]
-    fn a_send_recv_buf_remainder_the_sq_keeps_refusing_closes_the_connection() {
-        let mut el = make_test_loop();
-        let (conn_index, bid) = partial_send_recv_buf_with_a_full_sq(&mut el);
-        for _ in 0..3 {
-            el.driver.ring.force_push_failures(1);
-            el.drain_send_retries();
-        }
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "the buffer was not returned exactly once"
-        );
-        let ci = conn_index as usize;
-        assert!(el.driver.send_queues[ci].queue.is_empty());
-        assert!(!el.driver.send_queues[ci].in_flight);
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.close_requested()),
-            "the connection was left open with a hole in its stream"
-        );
-    }
-
-    /// The parked remainder is the next bytes of the stream, so it goes out
-    /// ahead of a send queued behind the in-flight `SendRecvBuf`.
-    #[test]
-    fn a_parked_send_recv_buf_remainder_goes_ahead_of_a_queued_send() {
-        let mut el = make_test_loop_with_config(
-            test_config_builder()
-                .send_pool(8, 64)
-                .build()
-                .expect("valid config"),
-        );
-        let conn_index = accept_connection(&mut el);
-        let ci = conn_index as usize;
-        let bid: u16 = 3;
-        el.driver.send_recv_buf_original_lens[ci] = 100;
-        el.driver.send_recv_buf_remaining[ci] = 100;
-        el.driver.send_queues[ci].in_flight = true;
-        let queued = built_copy_send(&mut el, conn_index, b"bbb");
-        el.driver.submit_or_queue_send(conn_index, queued);
-
-        el.driver.ring.force_push_failures(1);
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
-        el.drain_send_retries();
-        let pushed = UserData(
-            el.driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .expect("an SQE was pushed")
-                .user_data,
-        );
-        assert_eq!(
-            pushed.tag(),
-            Some(OpTag::SendRecvBuf),
-            "the queued send overtook the remainder"
-        );
-    }
-
-    #[test]
-    fn handle_send_recv_buf_double_partial_send_offset() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Data is 100 bytes in a 4096-byte buffer.
-        let bid: u16 = 2;
-        let data_len: u32 = 100;
-
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-        // Fill with pattern so we can verify offset correctness.
-        let test_data: Vec<u8> = (0u8..100).collect();
-        unsafe {
-            std::ptr::copy_nonoverlapping(test_data.as_ptr(), buf_ptr as *mut u8, 100);
-        }
-
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
-        let payload = bid as u32;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-
-        // First partial: 30 of 100 bytes sent. Remaining = 70. Offset should be 30.
-        el.test_dispatch_cqe(ud.raw(), 30, 0);
-        assert!(!el.driver.pending_replenish.contains(&bid));
-        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 70);
-
-        // Second partial: 20 of 70 bytes sent. Remaining = 50. Offset should be 50.
-        let ud2 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        el.test_dispatch_cqe(ud2.raw(), 20, 0);
-        assert!(!el.driver.pending_replenish.contains(&bid));
-        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 50);
-
-        // Final: 50 of 50 bytes sent. Should complete.
-        let ud3 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        el.test_dispatch_cqe(ud3.raw(), 50, 0);
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not replenished after final partial send"
-        );
-    }
-
-    #[test]
-    fn handle_send_recv_buf_partial_send_pointer_correctness() {
-        // Verify the fix: on partial send, the resubmitted SQE pointer must be
-        // buf_ptr + (original_len - new_remaining), NOT buf_ptr + (buf_size - new_remaining).
-        //
-        // We can't inspect the SQE directly, but we can verify the logic by checking
-        // that handle_send_recv_buf computes the offset from original_len rather than buf_size.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let bid: u16 = 1;
-        let data_len: u32 = 50;
-        let (_, _buf_size) = el.driver.provided_bufs.get_buffer(bid);
-
-        // The bug: offset = buf_size - new_remaining = 4096 - 25 = 4071 (WRONG)
-        // The fix: offset = original_len - new_remaining = 50 - 25 = 25 (CORRECT)
-        // With buf_size=4096 and data_len=50, the wrong offset points way past the data.
-
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
-        let payload = bid as u32;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-
-        // Partial send: 25 of 50 bytes.
-        el.test_dispatch_cqe(ud.raw(), 25, 0);
-
-        // If the offset was computed correctly (25, not 4071), the resubmitted SQE
-        // will have a valid pointer within the data. With the bug, the pointer
-        // would be past the buffer entirely (buf_ptr + 4071 vs buf_ptr + 25).
-        // Since we successfully pushed the SQE without crashing or panicking,
-        // and buf_size (4096) > buggy offset (4071), the SQE was "valid" but pointed
-        // to garbage. The fix ensures correct data is referenced.
-        //
-        // The real verification is that the resubmitted send completes successfully.
-        // Simulate that by completing the retry.
-        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 25);
-        let retry_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
-        el.test_dispatch_cqe(retry_ud.raw(), 25, 0);
-
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not replenished after partial send retry"
-        );
-        // Verify the original_len was preserved correctly across retries.
-        assert_eq!(
-            el.driver.send_recv_buf_original_lens[conn_index as usize], data_len,
-            "original_len should be preserved across partial send retries"
-        );
-    }
-
-    #[test]
-    fn handle_send_recv_buf_zero_result_replenishes() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let bid: u16 = 7;
-        let data_len: u32 = 50;
-        el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
-        let payload = bid as u32;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-
-        // Result == 0 (zero-length send).
-        el.test_dispatch_cqe(ud.raw(), 0, 0);
-
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not replenished on zero-length send"
-        );
-    }
-
     // ── Bounded-send settlement, teardown and identity ─────────────
     //
     // Series PR 7b (`docs/uring-bounded-send-design.md`). A bounded send
@@ -15196,6 +11716,11 @@ mod tests {
             TlsTestPeer { conn: client }
         };
         el.driver.tls_table = Some(table);
+        // A TLS connection receives into its TLS engine's buffer, not its
+        // accumulator.
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_direct = false;
+        }
         peer
     }
 
@@ -15965,7 +12490,6 @@ mod tests {
             entry,
             pool_slot: u16::MAX,
             slab_idx,
-            total_len: 100,
         });
         state.in_flight = true;
 
@@ -16661,7 +13185,6 @@ mod tests {
                     entry,
                     pool_slot: slot,
                     slab_idx: u16::MAX,
-                    total_len: len,
                 });
         }
         assert!(el.driver.submit_next_queued(conn_index));
@@ -16699,7 +13222,6 @@ mod tests {
                     entry,
                     pool_slot: slot,
                     slab_idx: u16::MAX,
-                    total_len: len,
                 });
         }
         assert!(el.driver.submit_next_queued(conn_index));
@@ -17196,7 +13718,7 @@ mod tests {
             .get_mut(conn_index)
             .expect("just allocated");
         cs.lifecycle = Lifecycle::Open;
-        cs.recv_arm = RecvArm::Multi;
+        cs.recv_direct = true;
         cs.established = true;
     }
 
@@ -17910,10 +14432,25 @@ mod tests {
             Eof,
             /// Error (unknown errno).
             Error,
-            /// ENOBUFS — buffer ring exhausted.
-            Enobufs,
+            /// Data.
+            Data,
             /// ECANCELED.
             Ecanceled,
+        }
+
+        /// Arm a direct receive on `ci` and return its completion's user_data.
+        fn armed_recv_ud(el: &mut AsyncEventLoop<NoopHandler>, ci: u32) -> UserData {
+            assert!(
+                !el.driver.arm_direct_recv_or_close(ci, None),
+                "receive refused"
+            );
+            let slot = el
+                .driver
+                .connections
+                .get(ci)
+                .expect("open")
+                .recv_direct_slot;
+            UserData::encode(OpTag::RecvDirect, ci, slot)
         }
 
         fn send_action_strategy() -> impl Strategy<Value = SendAction> {
@@ -17937,7 +14474,7 @@ mod tests {
             prop_oneof![
                 Just(RecvAction::Eof),
                 Just(RecvAction::Error),
-                Just(RecvAction::Enobufs),
+                Just(RecvAction::Data),
                 Just(RecvAction::Ecanceled),
             ]
         }
@@ -18060,13 +14597,16 @@ mod tests {
                         break;
                     }
 
-                    let ud = UserData::encode(OpTag::RecvMulti, conn_index, el.driver.connections.generation(conn_index));
                     let result = match action {
                         RecvAction::Eof => 0,
                         RecvAction::Error => -99,
-                        RecvAction::Enobufs => -105,
+                        RecvAction::Data => {
+                            deliver_direct(&mut el, conn_index, b"data");
+                            continue;
+                        }
                         RecvAction::Ecanceled => -125,
                     };
+                    let ud = armed_recv_ud(&mut el, conn_index);
                     el.test_dispatch_cqe(ud.raw(), result, 0);
                 }
 
@@ -18175,18 +14715,17 @@ mod tests {
                         // Recv EOF — closes the connection.
                         5 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
-                            let ud = UserData::encode(OpTag::RecvMulti, ci, el.driver.connections.generation(ci));
+                            let ud = armed_recv_ud(&mut el, ci);
                             el.test_dispatch_cqe(ud.raw(), 0, 0);
                             // Simulate Close CQE.
                             let close_ud = UserData::encode(OpTag::Close, ci, 0);
                             el.test_dispatch_cqe(close_ud.raw(), 0, 0);
                         }
 
-                        // Recv error.
+                        // Recv data.
                         6 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
-                            let ud = UserData::encode(OpTag::RecvMulti, ci, el.driver.connections.generation(ci));
-                            el.test_dispatch_cqe(ud.raw(), -105, 0); // ENOBUFS
+                            deliver_direct(&mut el, ci, b"data");
                         }
 
                         // Send + Recv EOF in same batch (the cross-CQE bug pattern).
@@ -18202,7 +14741,7 @@ mod tests {
                                         el.driver.connections.generation(ci),
                                     ),
                                 );
-                                let recv_ud = UserData::encode(OpTag::RecvMulti, ci, el.driver.connections.generation(ci));
+                                let recv_ud = armed_recv_ud(&mut el, ci);
                                 // EOF first, then stale send — the bug pattern.
                                 el.test_dispatch_cqe(recv_ud.raw(), 0, 0);
                                 el.test_dispatch_cqe(send_ud.raw(), 4, 0);

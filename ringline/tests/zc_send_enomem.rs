@@ -126,7 +126,6 @@ fn a_zero_copy_send_over_the_memlock_limit_is_sent_plain() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 4096)
         .max_connections(16)
         .send_pool(16, 16384)
         .build()

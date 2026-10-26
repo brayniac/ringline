@@ -27,7 +27,6 @@ fn direct_io_test_config_builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(64, 4096)
         .max_connections(8)
         .send_pool(8, 16384)
         .tick_timeout_us(1000)

@@ -895,7 +895,6 @@ fn build_pool_send(
         entry,
         pool_slot,
         slab_idx: u16::MAX,
-        total_len: len,
     }
 }
 

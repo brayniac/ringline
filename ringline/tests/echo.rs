@@ -118,7 +118,6 @@ fn test_config_builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(64, 4096)
         .max_connections(64)
         .send_pool(64, 16384)
 }
@@ -4990,66 +4989,6 @@ fn async_outbound_connect_receives_eof() {
     );
 }
 
-// ── Buffer ring exhaustion stress test ──────────────────────────────
-
-#[cfg(has_io_uring)]
-#[test]
-fn buffer_ring_exhaustion_recovers() {
-    // Use a tiny buffer ring (4 buffers) to force ENOBUFS under
-    // concurrent connection load, then verify all data echoes correctly.
-
-    let config = test_config_builder()
-        .recv_buffer(4, 4096)
-        .build()
-        .expect("valid config");
-    let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<AsyncEcho>()
-        .expect("launch failed");
-    let addr = shutdown.bound_addr().expect("bound address").to_string();
-    wait_for_server(&addr);
-
-    // Open 8 connections simultaneously and send data on all of them.
-    let mut threads = Vec::new();
-    for i in 0..8 {
-        let addr = addr.clone();
-        threads.push(std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(&addr).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-
-            // Send a message identifying this connection.
-            let msg = format!("connection-{i}-payload");
-            stream.write_all(msg.as_bytes()).unwrap();
-            stream.flush().unwrap();
-
-            // Read back the echo.
-            let mut buf = vec![0u8; msg.len()];
-            let mut total = 0;
-            while total < msg.len() {
-                match stream.read(&mut buf[total..]) {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => panic!("conn {i} read error: {e}"),
-                }
-            }
-            assert_eq!(&buf[..total], msg.as_bytes(), "conn {i} echo mismatch");
-        }));
-    }
-
-    for t in threads {
-        t.join().expect("connection thread panicked");
-    }
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
-}
-
 // ── Connect timeout test ────────────────────────────────────────────
 
 static TIMEOUT_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -6500,7 +6439,6 @@ fn forward_echo_small_message() {
 #[test]
 fn forward_echo_large_message() {
     let config = test_config_builder()
-        .recv_buffer(64, 32768)
         .send_pool(64, 32768)
         .build()
         .expect("valid config");
@@ -6524,8 +6462,7 @@ fn forward_echo_large_message() {
 }
 
 #[test]
-fn forward_echo_message_larger_than_buffer() {
-    // Buffer is 4KB but message is 8KB — forces the accumulator path, where
+fn forward_echo_sends_the_accumulator_under_a_guard() {
     // forward_recv_buf detaches the accumulator and sends it under a guard
     // rather than copying it into the send pool (#397).
     let (shutdown, handles) = RinglineBuilder::new(test_config())

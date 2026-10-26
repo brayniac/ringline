@@ -30,7 +30,6 @@ fn a_core_offset_beyond_the_affinity_mask_fails_launch() {
         .pin_to_core(true)
         .core_offset(100_000)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         .blocking_threads(0)

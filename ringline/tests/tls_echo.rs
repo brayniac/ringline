@@ -70,7 +70,6 @@ fn test_config_builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(64, 4096)
         .max_connections(64)
         // One whole TLS record per slot, which the unbuffered engine needs.
         .send_pool(64, 16448)
@@ -1879,14 +1878,6 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
 #[test]
 fn a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
-    tls_forward_to_stuck_sink(false);
-    // `recv_multishot` has no effect.
-    tls_forward_to_stuck_sink(true);
-}
-
-/// One run of `a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer`,
-/// with `recv_multishot` off or on.
-fn tls_forward_to_stuck_sink(multishot: bool) {
     const LIMIT: u64 = 64 << 20;
 
     // Accepts the forward's sink connection and never reads from it.
@@ -1898,7 +1889,6 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
         .forward_hold_cap(8)
-        .recv_multishot(multishot)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -1909,7 +1899,7 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     wait_for_server(&addr);
 
     let (sent, stalled) = tls_flood_after_ack(&addr, &certs, LIMIT);
-    eprintln!("multishot {multishot}: sent {sent} bytes, stalled {stalled}");
+    eprintln!("sent {sent} bytes, stalled {stalled}");
 
     // Close the sink's peer first: the forward's send to it holds worker exit
     // until the kernel releases the data it queued.
@@ -1920,7 +1910,7 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     }
     assert!(
         stalled && sent > 0 && sent < LIMIT,
-        "multishot {multishot}: the TLS forward_to_conn source accepted {sent} bytes without stalling"
+        "the TLS forward_to_conn source accepted {sent} bytes without stalling"
     );
 }
 

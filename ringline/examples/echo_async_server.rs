@@ -48,7 +48,6 @@ fn main() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(128)
-        .recv_buffer(128, 4096)
         .max_connections(1024)
         .build()
         .expect("valid config");

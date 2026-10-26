@@ -50,7 +50,6 @@ fn fin_arrives(lead: CloseLead) -> bool {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         .blocking_threads(0)
@@ -89,9 +88,9 @@ fn a_close_led_by_a_shutdown_sends_its_fin() {
     assert!(fin_arrives(CloseLead::Shutdown));
 }
 
-/// Passes without the lead: the close's own `RecvMulti` cancel ends the
-/// recv. `a_forced_close_led_by_a_cancel_releases_a_stuck_send` and its
-/// control in `event_loop.rs` guard the cancel.
+/// Without a lead no FIN arrives: the connection's hangup poll holds the
+/// socket. `a_forced_close_led_by_a_cancel_releases_a_stuck_send` and its
+/// control in `event_loop.rs` also guard the cancel.
 #[test]
 fn a_close_led_by_a_cancel_sends_its_fin() {
     assert!(fin_arrives(CloseLead::CancelAll));

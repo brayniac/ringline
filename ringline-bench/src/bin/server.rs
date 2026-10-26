@@ -17,12 +17,9 @@ struct ProxyCfg {
     workers: usize,
     msg_size: usize,
     backend: SocketAddr,
-    recv_buffer_bytes: u32,
-    recv_ring_size: u16,
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
-    recv_multishot: bool,
     api: ProxyApi,
     metrics_out: Option<std::path::PathBuf>,
 }
@@ -54,13 +51,10 @@ struct EchoCfg {
     workers: usize,
     msg_size: usize,
     metrics_out: Option<std::path::PathBuf>,
-    recv_buffer_bytes: u32,
-    recv_ring_size: u16,
     echo_mode: EchoMode,
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
-    recv_multishot: bool,
     iowq_max_workers: Option<u32>,
     accept_mode: AcceptModeArg,
     /// Offer every connection for park after each response.
@@ -313,11 +307,9 @@ struct Args {
     /// (ringline) Write ringline's runtime counters to this path as JSON when
     /// the server shuts down, and print the interesting ones to stderr.
     ///
-    /// `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
-    /// `forward_throttled` and friends are what separate "this arm was slower"
-    /// from "this arm starved its provided ring", which a throughput number
-    /// alone cannot say. A sweep over buffer geometry is guesswork without
-    /// them.
+    /// Counters such as `send_eagain`, `send_exhausted` and
+    /// `recv_arm_failures` say why an arm was slower, which a throughput
+    /// number alone cannot.
     #[arg(long)]
     metrics_out: Option<std::path::PathBuf>,
 
@@ -326,35 +318,17 @@ struct Args {
     #[arg(long, value_enum, default_value_t = ProxyApi::Conn)]
     proxy_api: ProxyApi,
 
-    /// (ringline) Provided recv buffer size in bytes. 0 (default) derives it
-    /// from `--msg-size`. On io_uring only TLS connections receive through the
-    /// provided-buffer ring.
-    #[arg(long, default_value_t = 0)]
-    recv_buffer_bytes: u32,
-
-    /// (ringline) Number of provided recv buffers. Total pinned memory is this
-    /// times `--recv-buffer-bytes`, so sweeping buffer size at a fixed count
-    /// also sweeps total memory — this makes the two separable.
-    #[arg(long, default_value_t = 256)]
-    recv_ring_size: u16,
-
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
     /// at low connection counts, keeping per-worker CQE density high for batching.
     #[arg(long, default_value_t = 1)]
     conn_chunk_size: usize,
 
-    /// (ringline) Touch every provided-recv-buffer and send-pool page at
-    /// startup so the minor faults are paid before traffic instead of on the
-    /// completion path. The knob under measurement in #419.
+    /// (ringline) Touch every send-pool page at startup so the minor faults
+    /// are paid before traffic instead of on the send path
+    /// (`ConfigBuilder::prefault_buffers`).
     #[arg(long, default_value_t = false)]
     prefault_buffers: bool,
-
-    /// (ringline) Sets `ConfigBuilder::recv_multishot`, which has no effect on
-    /// TCP connections: plaintext receives directly and TLS receives are
-    /// one-shot. The checked-in `BENCHMARKS.md` baseline predates both.
-    #[arg(long, default_value_t = false)]
-    recv_multishot: bool,
 
     /// (ringline echo) Cap each worker's bounded io-wq pool
     /// (`ConfigBuilder::iowq_max_workers`; 0 leaves the kernel default).
@@ -489,12 +463,9 @@ fn main() {
             workers,
             msg_size: args.msg_size,
             backend: args.proxy_backend.expect("checked"),
-            recv_buffer_bytes: args.recv_buffer_bytes,
-            recv_ring_size: args.recv_ring_size,
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             prefault_buffers: args.prefault_buffers,
-            recv_multishot: args.recv_multishot,
             api: args.proxy_api,
             metrics_out: args.metrics_out.clone(),
         }),
@@ -503,10 +474,7 @@ fn main() {
             workers,
             msg_size: args.msg_size,
             metrics_out: args.metrics_out.clone(),
-            recv_buffer_bytes: args.recv_buffer_bytes,
-            recv_ring_size: args.recv_ring_size,
             prefault_buffers: args.prefault_buffers,
-            recv_multishot: args.recv_multishot,
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: args.echo_mode.unwrap_or_else(|| {
                 // No default: a spec must name the loop it measures.
@@ -567,12 +535,9 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         workers,
         msg_size,
         backend,
-        recv_buffer_bytes,
-        recv_ring_size,
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
-        recv_multishot,
         api,
         metrics_out,
     } = cfg;
@@ -620,18 +585,11 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         }
     }
 
-    let recv_buf = if recv_buffer_bytes > 0 {
-        recv_buffer_bytes
-    } else {
-        msg_size.next_power_of_two().max(4096) as u32
-    };
     let config = ConfigBuilder::new()
         .workers(workers)
         .pin_to_core(pin_to_core)
         .sq_entries(256)
-        .recv_buffer(recv_ring_size, recv_buf)
         .prefault_buffers(prefault_buffers)
-        .recv_multishot(recv_multishot)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
@@ -647,8 +605,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         ProxyApi::Conn => "forward_to_conn",
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, proxy -> {backend}, api={api_name}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB)",
-        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
+        "bench-server: ready (backend={RINGLINE_BACKEND}, proxy -> {backend}, api={api_name})"
     );
     shutdown.wait_on_signal();
     dump_runtime_metrics(metrics_out.as_deref());
@@ -664,13 +621,10 @@ fn run_ringline(cfg: EchoCfg) {
         workers,
         msg_size,
         metrics_out,
-        recv_buffer_bytes,
-        recv_ring_size,
         echo_mode,
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
-        recv_multishot,
         iowq_max_workers,
         accept_mode,
         park,
@@ -762,11 +716,6 @@ fn run_ringline(cfg: EchoCfg) {
         }
     }
 
-    let recv_buf = if recv_buffer_bytes > 0 {
-        recv_buffer_bytes
-    } else {
-        msg_size.next_power_of_two().max(4096) as u32
-    };
     PARK_ENABLED.store(park, std::sync::atomic::Ordering::Relaxed);
     // Simulated work is charged per request, so the handler needs the request
     // size as well as the duration.
@@ -782,13 +731,7 @@ fn run_ringline(cfg: EchoCfg) {
         // workers within it; otherwise pin each worker to its own core (0..N).
         .pin_to_core(pin_to_core)
         .sq_entries(256)
-        // Honour the geometry flags, exactly as the proxy arm does. These
-        // used to be proxy-only and silently ignored here, so a
-        // buffer-geometry sweep over the echo path would have run every arm at
-        // the same derived size and could only ever have reported "no effect".
-        .recv_buffer(recv_ring_size, recv_buf)
         .prefault_buffers(prefault_buffers)
-        .recv_multishot(recv_multishot)
         .max_connections(16384)
         // With --tls the slot must hold one whole TLS record (16413 bytes at
         // the default fragment size), which the unbuffered engine requires.
@@ -865,8 +808,7 @@ fn run_ringline(cfg: EchoCfg) {
         EchoMode::Forward => "forward",
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, service_time={service_time_us}us/req, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
-        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
+        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, service_time={service_time_us}us/req)"
     );
 
     // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each

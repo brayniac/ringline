@@ -280,14 +280,6 @@ fn make_ringline_client_config(
         .workers(1)
         .pin_to_core(false)
         .sq_entries((num_clients * 8).next_power_of_two().max(512) as u32)
-        .recv_buffer((num_clients * 4).next_power_of_two().max(256) as u16, 65535)
-        // HTTP/2 default `max_frame_size` is 16 KiB and TLS records can
-        // be up to 16 KiB on top of that, so the recv buffer must be
-        // comfortably larger than the body to keep one full HTTP/2 DATA
-        // frame inside a single provided buffer. ringline caps
-        // `recv_buffer.buffer_size` at 65535 (the user_data encoding
-        // reserves 16 bits for the remaining-len field), so use that
-        // ceiling — comfortably above the bench's worst case.
         // The default send_copy_slot_size, 16448, holds one whole TLS
         // record, which the unbuffered TLS engine requires. ringline-http
         // can flush a request's HEADERS + DATA + WINDOW_UPDATE into one

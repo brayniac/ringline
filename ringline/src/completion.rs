@@ -13,7 +13,6 @@ pub(crate) const STREAM_SEND_FLAGS: i32 = libc::MSG_WAITALL;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpTag {
-    RecvMulti = 0,
     Send = 2,
     SendMsgZc = 3,
     Close = 4,
@@ -43,8 +42,6 @@ pub enum OpTag {
     Fs = 18,
     /// PollAdd on a pidfd for async child process exit notification.
     PidfdPoll = 19,
-    /// Send from a recv buffer (zero-copy forward). Payload = bid to replenish on completion.
-    SendRecvBuf = 20,
     /// PollAdd on a TCP fd waiting for POLLOUT after a previous Send
     /// returned `-EAGAIN` (the kernel send buffer was full). Payload =
     /// pool_slot to resubmit when the poll fires.
@@ -66,11 +63,6 @@ pub enum OpTag {
     /// (#603). Its result is a partial write of the same entry.
     /// Payload = InFlightSendSlab index.
     SendMsgCoalescedDrain = 25,
-    /// One-shot fallback recv into a fallback-pool slot, submitted when a
-    /// connection parked on ENOBUFS holds a partial message in its
-    /// accumulator (the provided ring is smaller than one response).
-    /// Payload = fallback pool slot to release on completion.
-    RecvFallback = 28,
     /// Multishot accept on a listener the worker owns (merged accept mode).
     /// The `conn_index` field carries the **listener index**, not a
     /// connection: no slot exists yet when the SQE is submitted. Payload
@@ -113,15 +105,9 @@ pub enum OpTag {
     HangupPeek = 38,
 }
 
-/// Set in an `OpTag::SendRecvBuf` payload, above the 16-bit bid, when the send
-/// continues a partial send of the same buffer. Its progress is already
-/// recorded and must not be reset when it is pushed (#614).
-pub(crate) const SEND_RECV_BUF_REMAINDER: u32 = 1 << 16;
-
 impl OpTag {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(OpTag::RecvMulti),
             2 => Some(OpTag::Send),
             3 => Some(OpTag::SendMsgZc),
             4 => Some(OpTag::Close),
@@ -139,13 +125,11 @@ impl OpTag {
             16 => Some(OpTag::DirectIo),
             18 => Some(OpTag::Fs),
             19 => Some(OpTag::PidfdPoll),
-            20 => Some(OpTag::SendRecvBuf),
             21 => Some(OpTag::SendPollOut),
             22 => Some(OpTag::RecvUdp),
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
             25 => Some(OpTag::SendMsgCoalescedDrain),
-            28 => Some(OpTag::RecvFallback),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
             33 => Some(OpTag::CloseShutdown),
@@ -167,7 +151,6 @@ impl OpTag {
     /// metric `op` labels.
     pub fn as_str(self) -> &'static str {
         match self {
-            OpTag::RecvMulti => "recv_multi",
             OpTag::Send => "send",
             OpTag::SendMsgZc => "send_msg_zc",
             OpTag::Close => "close",
@@ -185,13 +168,11 @@ impl OpTag {
             OpTag::DirectIo => "direct_io",
             OpTag::Fs => "fs",
             OpTag::PidfdPoll => "pidfd_poll",
-            OpTag::SendRecvBuf => "send_recv_buf",
             OpTag::SendPollOut => "send_poll_out",
             OpTag::RecvUdp => "recv_udp",
             OpTag::SendUdp => "send_udp",
             OpTag::SendMsgCoalesced => "send_msg_coalesced",
             OpTag::SendMsgCoalescedDrain => "send_msg_coalesced_drain",
-            OpTag::RecvFallback => "recv_fallback",
             OpTag::AcceptMulti => "accept_multi",
             OpTag::ParkInstall => "park_install",
             OpTag::CloseShutdown => "close_shutdown",
@@ -436,8 +417,8 @@ mod tests {
 
     #[test]
     fn zero_values() {
-        let ud = UserData::encode(OpTag::RecvMulti, 0, 0);
-        assert_eq!(ud.tag(), Some(OpTag::RecvMulti));
+        let ud = UserData::encode(OpTag::Send, 0, 0);
+        assert_eq!(ud.tag(), Some(OpTag::Send));
         assert_eq!(ud.conn_index(), 0);
         assert_eq!(ud.payload(), 0);
     }
@@ -445,7 +426,7 @@ mod tests {
     #[test]
     fn max_conn_index() {
         let max_conn = (1u32 << 24) - 1;
-        let ud = UserData::encode(OpTag::RecvMulti, max_conn, 0xFFFF_FFFF);
+        let ud = UserData::encode(OpTag::Send, max_conn, 0xFFFF_FFFF);
         assert_eq!(ud.conn_index(), max_conn);
         assert_eq!(ud.payload(), 0xFFFF_FFFF);
     }

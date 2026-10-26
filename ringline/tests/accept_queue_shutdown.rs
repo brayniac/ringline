@@ -96,7 +96,6 @@ fn test_config(workers: usize) -> ringline::Config {
         .workers(workers)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(64)
         .send_pool(16, 16384)
         // No pools: their threads would also hold fds open past shutdown.

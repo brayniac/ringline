@@ -4,6 +4,11 @@ Note (2026-10-25): `with_segments` and `recv_owned_segment` were removed.
 
 Note (2026-10-25): `forward_to` (Mode A) was removed.
 
+Note (2026-10-25): the TCP provided-buffer ring was removed, with
+`recv_buffer`, the fallback receive, `ConnectionState::recv_arm` and the
+`recv_parked`, `recv_fallback` and `forward_throttled` counters. The
+geometry this sweep measured no longer exists.
+
 **Status:** **Phase A complete — the default stands.** Phase 0 landed (#417);
 #415 merged as 282773b. Outcome below.
 

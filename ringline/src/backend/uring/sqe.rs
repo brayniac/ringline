@@ -41,12 +41,6 @@ pub(crate) enum Op {
         fd: Fd,
         buf_group: u16,
     },
-    /// One-shot recv selecting one buffer from provided-buffer group
-    /// `buf_group` (`IOSQE_BUFFER_SELECT`).
-    RecvSelect {
-        fd: Fd,
-        buf_group: u16,
-    },
     /// Multishot recvmsg selecting from `buf_group`, laid out by `msg`.
     RecvMsgMulti {
         fd: Fd,

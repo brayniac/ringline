@@ -1,7 +1,6 @@
 //! The kernel engine: an io_uring instance that executes each [`Sqe`]
 //! the driver pushes and reports its completions.
 
-use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
@@ -9,7 +8,7 @@ use io_uring::squeue::{Entry, Entry128, Flags};
 use io_uring::types::{self, CancelBuilder, DestinationSlot, Fixed, TimeoutFlags};
 use io_uring::{IoUring, cqueue, opcode, squeue};
 
-use super::{Engine, RingKind};
+use super::Engine;
 use crate::backend::ProvidedBufRing;
 use crate::backend::uring::ring::{CloseLead, close_lead_for};
 use crate::backend::uring::sqe::{Fd, Link, Op, Sqe};
@@ -17,10 +16,6 @@ use crate::buffer::fixed::FixedBufferRegistry;
 use crate::config::Config;
 use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
 use crate::memlock::KernelVersion;
-
-/// `IOU_PBUF_RING_INC`: the kernel consumes a provided buffer incrementally
-/// (Linux 6.12+).
-const IOU_PBUF_RING_INC: u16 = 2;
 
 /// Ubuntu's 6.8 kernels (from 6.8.0-139) invert the check on the reserved
 /// words of `IORING_REGISTER_PBUF_RING`: a registration with them zeroed, as
@@ -145,9 +140,6 @@ pub(crate) struct UringEngine {
     /// so later registrations use that form and unregistration tries it
     /// first. See [`retry_with_resv_set`].
     pbuf_resv_set: bool,
-    /// Whether the kernel registers an `IOU_PBUF_RING_INC` ring, probed on
-    /// the first successful call to [`Engine::incremental_buffers`].
-    incremental: Cell<Option<bool>>,
     /// Test-only: number of upcoming `push_sqe128`/`push_sqe_pair` calls that
     /// fail as if the SQ were still full after a submit. See
     /// [`Engine::force_push_failures`].
@@ -159,13 +151,7 @@ impl UringEngine {
     /// # Safety
     ///
     /// As [`pbuf_ring_register`].
-    unsafe fn register_pbuf_resv_set(
-        &self,
-        addr: u64,
-        entries: u32,
-        bgid: u16,
-        flags: u16,
-    ) -> io::Result<()> {
+    unsafe fn register_pbuf_resv_set(&self, addr: u64, entries: u32, bgid: u16) -> io::Result<()> {
         unsafe {
             pbuf_ring_register(
                 self.ring.as_raw_fd(),
@@ -173,68 +159,10 @@ impl UringEngine {
                 addr,
                 entries,
                 bgid,
-                flags,
-                1,
-            )
-        }
-    }
-
-    /// Whether the kernel registers an `IOU_PBUF_RING_INC` ring: register a
-    /// one-entry incremental ring under group id `u16::MAX` (which
-    /// `Config::validate` reserves) and unregister it. `EINVAL` means the
-    /// kernel lacks it; any other error is returned. It registers through
-    /// the `io-uring` crate without the `resv[0]` retry: the kernels that
-    /// need that retry are Ubuntu 6.8 kernels, and 6.8 predates
-    /// `IOU_PBUF_RING_INC`, so `EINVAL` there is still the right answer.
-    fn probe_incremental(&self) -> io::Result<bool> {
-        const PROBE_BGID: u16 = u16::MAX;
-        // Safety: sysconf has no preconditions.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        // Safety: an anonymous private mapping with no preconditions.
-        let mem = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                page,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
                 0,
-            )
-        };
-        if mem == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        // Safety: `mem` stays mapped across the registration. If the
-        // unregister below fails, the munmap leaves the group registered on
-        // pages the kernel has pinned, which is safe for the reason given at
-        // `register_buf_ring`; the group and its pinned page then stay until
-        // the io_uring instance is freed.
-        let registered = unsafe {
-            self.ring.submitter().register_buf_ring_with_flags(
-                mem as u64,
                 1,
-                PROBE_BGID,
-                IOU_PBUF_RING_INC,
             )
-        };
-        let result = match registered {
-            Ok(()) => {
-                let _ = self.ring.submitter().unregister_buf_ring(PROBE_BGID);
-                Ok(true)
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(false),
-            Err(e) => Err(e),
-        };
-        // Safety: `mem` was mapped above with length `page`.
-        unsafe { libc::munmap(mem, page) };
-        result
-    }
-
-    /// Test-only: whether the kernel holds completions on its overflow
-    /// list (`IORING_SQ_CQ_OVERFLOW`).
-    #[cfg(test)]
-    pub(crate) fn cq_overflowed(&mut self) -> bool {
-        self.ring.submission().cq_overflow()
+        }
     }
 
     /// Test-only: the ring's file descriptor, for raw registration calls.
@@ -454,7 +382,6 @@ impl Engine for UringEngine {
             fixed_fd_install,
             close_lead: Self::close_lead_from(config),
             pbuf_resv_set: false,
-            incremental: Cell::new(None),
             #[cfg(test)]
             forced_push_failures: 0,
         })
@@ -473,15 +400,6 @@ impl Engine for UringEngine {
     /// placement stays on the default and loses nothing.
     fn supports_park(&self) -> bool {
         self.fixed_fd_install
-    }
-
-    fn incremental_buffers(&self) -> io::Result<bool> {
-        if let Some(known) = self.incremental.get() {
-            return Ok(known);
-        }
-        let known = self.probe_incremental()?;
-        self.incremental.set(Some(known));
-        Ok(known)
     }
 
     /// What goes ahead of a connection's `Close` on the running kernel. See
@@ -606,20 +524,12 @@ impl Engine for UringEngine {
     /// On a 6.8 kernel that refuses the zeroed reserved words with `EINVAL`,
     /// retries once with `resv[0]` set; after that succeeds, later
     /// registrations use only that form (#626).
-    fn register_buf_ring(
-        &mut self,
-        provided: &ProvidedBufRing,
-        kind: RingKind,
-    ) -> Result<(), Error> {
+    fn register_buf_ring(&mut self, provided: &ProvidedBufRing) -> Result<(), Error> {
         let (addr, entries, bgid) = (
             provided.ring_addr(),
             provided.ring_entries(),
             provided.bgid(),
         );
-        let flags = match kind {
-            RingKind::Plain => 0,
-            RingKind::Incremental => IOU_PBUF_RING_INC,
-        };
         // Safety (every registration in this function): `addr` is
         // `provided`'s mmap'd ring, mapped at the call. The `io-uring`
         // crate's contract, which `pbuf_ring_register` repeats, asks for it
@@ -636,20 +546,17 @@ impl Engine for UringEngine {
         // allocation that the kernel writes through the user addresses in the
         // entries; this argument does not cover them.
         let first = if self.pbuf_resv_set {
-            unsafe { self.register_pbuf_resv_set(addr, entries, bgid, flags) }
+            unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
             unsafe {
-                self.ring.submitter().register_buf_ring_with_flags(
-                    addr,
-                    entries as u16,
-                    bgid,
-                    flags,
-                )
+                self.ring
+                    .submitter()
+                    .register_buf_ring_with_flags(addr, entries as u16, bgid, 0)
             }
         };
         let result = match first {
             Err(e) if !self.pbuf_resv_set && retry_with_resv_set(&e, KernelVersion::current()) => {
-                match unsafe { self.register_pbuf_resv_set(addr, entries, bgid, flags) } {
+                match unsafe { self.register_pbuf_resv_set(addr, entries, bgid) } {
                     Ok(()) => {
                         self.pbuf_resv_set = true;
                         Ok(())
@@ -827,12 +734,6 @@ impl Engine for UringEngine {
         self.forced_push_failures = count;
     }
 
-    /// The number of entries queued in the SQ and not yet submitted.
-    #[cfg(test)]
-    fn sq_len(&mut self) -> usize {
-        self.ring.submission().len()
-    }
-
     unsafe fn push(&mut self, sqe: &Sqe) -> io::Result<()> {
         unsafe { self.push_sqe128(sqe.encode()) }
     }
@@ -944,12 +845,6 @@ impl Sqe {
             Op::RecvMulti { fd, buf_group } => {
                 on!(fd, |t| opcode::RecvMulti::new(t, buf_group).build())
             }
-            Op::RecvSelect { fd, buf_group } => on!(fd, |t| {
-                opcode::Recv::new(t, std::ptr::null_mut(), 0)
-                    .buf_group(buf_group)
-                    .build()
-                    .flags(Flags::BUFFER_SELECT)
-            }),
             Op::RecvMsgMulti { fd, msg, buf_group } => {
                 on!(fd, |t| opcode::RecvMsgMulti::new(t, msg, buf_group).build())
             }
@@ -1101,19 +996,6 @@ mod encode_tests {
                     ud,
                 ),
                 e(opcode::RecvMulti::new(fx, 3).build()),
-            ),
-            (
-                Sqe::new(
-                    Op::RecvSelect {
-                        fd: Fd::Fixed(9),
-                        buf_group: 3,
-                    },
-                    ud,
-                ),
-                e(opcode::Recv::new(fx, std::ptr::null_mut(), 0)
-                    .buf_group(3)
-                    .build()
-                    .flags(Flags::BUFFER_SELECT)),
             ),
             (
                 Sqe::new(

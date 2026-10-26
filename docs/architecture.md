@@ -23,8 +23,8 @@ Within the core crate, the main boundaries are:
   slabs, timers, channels, futures, and wakers.
 - Shared connection and buffer state: `connection.rs`, `accumulator.rs`,
   `recv/`, `handler.rs`, `buffer/`, and `tls/`.
-- The io_uring backend: `backend/uring/`, with its ring wrapper, provided-buffer
-  rings, driver, and completion-driven event loop.
+- The io_uring backend: `backend/uring/`, with its ring wrapper, the UDP
+  provided-buffer ring, driver, and completion-driven event loop.
 - The Mio backend: `backend/mio/`, with its poll driver and readiness-driven
   event loop.
 - Optional services: resolver, process spawner, blocking pool, filesystem,
@@ -253,9 +253,10 @@ Backpressure is bounded and explicit at each layer:
 - Accepted descriptors use bounded per-worker channels. A full primary queue
   redirects to another worker; saturation of all workers drops the new
   connection.
-- Receive accumulation is bounded by configuration. io_uring provided-buffer
-  starvation (`ENOBUFS`) parks receive until returned buffers are replenished;
-  it is not retried in a busy loop.
+- Receive accumulation is bounded by configuration (`recv_accumulator_max`).
+  On io_uring a connection's receive is armed when a read parks (a TLS
+  connection's also during the handshake and after a hangup), so a task that
+  does not read stops its peer through the TCP window.
 - `ConnSendState` permits at most one in-flight send per connection and queues
   later sends in a `VecDeque`. This preserves stream and TLS order.
 - Send-copy-pool, zero-copy slab, task-slab, and timer-slot exhaustion surface

@@ -1,5 +1,7 @@
 # mio close lifecycle: unify with io_uring
 
+Note (2026-10-25): `ConnectionState::recv_arm` was removed.
+
 **Status:** approved design, 2026-09-10. Fixes ringline-rs/ringline#368.
 **Prerequisite for** the backpressured-sends series
 (`docs/backpressured-sends-series-design.md`), whose PR 3 (mio

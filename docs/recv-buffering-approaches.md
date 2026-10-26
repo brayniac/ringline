@@ -1,5 +1,9 @@
 # TCP receive buffering on io_uring: approaches
 
+Note (2026-10-25): the TCP provided-buffer ring and `recv_incremental` were
+removed. TCP connections on io_uring receive directly
+(`docs/recv-direct-design.md`).
+
 Status: reference. This document compares the ways an io_uring worker can
 get TCP bytes from the kernel, what memory each needs, and how each behaves
 when that memory runs short. The design chosen for ringline is

@@ -314,23 +314,19 @@ impl ringline::AsyncEventHandler for RinglineRedisBench {
     }
 }
 
-fn make_ringline_client_config_builder(num_clients: usize, msg_size: usize) -> ConfigBuilder {
+fn make_ringline_client_config_builder(num_clients: usize) -> ConfigBuilder {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
         .sq_entries((num_clients * 4).next_power_of_two().max(256) as u32)
-        .recv_buffer(
-            (num_clients * 2).next_power_of_two().max(64) as u16,
-            (msg_size + 64).next_power_of_two().max(4096) as u32,
-        )
         // Response is `$<len>\r\n<msg_size>\r\n` — a few extra bytes for the
         // length prefix, plus comfortable headroom.
         .send_pool(1024, 512)
         .standalone_task_capacity((num_clients + 1).next_power_of_two().max(64) as u32)
 }
 
-fn make_ringline_client_config(num_clients: usize, msg_size: usize) -> ringline::Config {
-    make_ringline_client_config_builder(num_clients, msg_size)
+fn make_ringline_client_config(num_clients: usize) -> ringline::Config {
+    make_ringline_client_config_builder(num_clients)
         .build()
         .expect("valid config")
 }
@@ -338,7 +334,7 @@ fn make_ringline_client_config(num_clients: usize, msg_size: usize) -> ringline:
 fn run_bench_ringline(
     addr: &str,
     num_clients: usize,
-    msg_size: usize,
+    _msg_size: usize,
     warmup: Duration,
     duration: Duration,
 ) -> BenchResult {
@@ -359,7 +355,7 @@ fn run_bench_ringline(
 
     wait_for_server(addr);
 
-    let config = make_ringline_client_config(num_clients, msg_size);
+    let config = make_ringline_client_config(num_clients);
     let (shutdown, handles) =
         match ringline::RinglineBuilder::new(config).launch::<RinglineRedisBench>() {
             Ok(r) => r,

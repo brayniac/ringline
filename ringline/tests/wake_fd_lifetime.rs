@@ -173,7 +173,6 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         .blocking_threads(1)
@@ -312,7 +311,6 @@ fn a_running_worker_keeps_its_wake_fd_open() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         // No pools: their threads would also hold the fds open. The disk-I/O
@@ -419,7 +417,6 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         // Only the disk-I/O pool, so its hold is the one under test.

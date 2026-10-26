@@ -285,7 +285,7 @@ primitives; their READMEs carry the full per-path tables. The shape:
 
 The two backends make opposite trades. The mio loop copies little but crosses
 the kernel boundary per event; the io_uring loop crosses per *batch* but pays
-for it in machinery — provided-buffer rings, send pools, in-flight slabs,
+for it in machinery — send pools, in-flight slabs, direct-receive buffers,
 generation-checked completions ([PRINCIPLES.md](principles/PRINCIPLES.md)
 covers why ringline accepts that complexity on Linux and not elsewhere). The
 sweep is one workload on one machine class, but it shows the mechanism doing

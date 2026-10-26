@@ -99,7 +99,6 @@ fn an_abandoned_reads_buffer_outlives_its_worker() {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
         .blocking_threads(0)

@@ -30,7 +30,6 @@ fn test_config() -> Config {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
-        .recv_buffer(128, 16384)
         .max_connections(64)
         .send_pool(64, 65536)
         .build()

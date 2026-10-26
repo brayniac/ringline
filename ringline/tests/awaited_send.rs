@@ -175,7 +175,6 @@ fn run(scenario: u8, expected_bytes: usize) -> Result<u32, String> {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 4096)
         .max_connections(16)
         .send_pool(16, 16384)
         .build()

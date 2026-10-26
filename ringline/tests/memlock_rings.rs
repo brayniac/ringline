@@ -32,8 +32,6 @@ const RING_64: u64 = 5 * PAGE;
 const RING_256: u64 = 17 * PAGE;
 /// A provided buffer ring of 512 16-byte entries.
 const PBUF_512: u64 = 2 * PAGE;
-/// A provided buffer ring of 16 entries, the size `builder()` configures.
-const PBUF_16: u64 = PAGE;
 
 struct Idle;
 
@@ -51,7 +49,6 @@ fn builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
 }
@@ -209,11 +206,11 @@ fn ring_memory_charged_to_memlock_matches_the_kernel() {
     );
     drop(held);
 
-    // A whole worker: its ring and its recv provided buffer ring, which is
-    // what the preflight computes for `builder()`.
+    // A whole worker without UDP: its ring, which is what the preflight
+    // computes for `builder()`.
     // Soft and hard both at the figure, so a preflight that overcounted by a
     // page would have no room to raise into and would refuse.
-    let worker = RING_64 + PBUF_16;
+    let worker = RING_64;
     set_memlock(worker, worker);
     within_limit("a one-worker launch", || {
         launch_and_stop().map_err(|e| match e {

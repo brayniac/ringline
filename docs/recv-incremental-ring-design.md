@@ -10,6 +10,14 @@ Note (2026-10-25): `forward_to` (Mode A), the segment hold
 Note (2026-10-25): TLS connections receive directly into their TLS engine's
 ciphertext buffer, so no TCP connection receives into the TCP ring.
 
+Note (2026-10-25): the TCP provided-buffer ring was removed, with
+`recv_buffer`, `recv_incremental`, `recv_buffer_bgid`, the incremental-ring
+preflight and its conformance tests, `OpTag::RecvMulti`,
+`OpTag::SendRecvBuf`, the fallback receive, the lend cap, the receive
+throttle, `ConnectionState::recv_arm`, and the `recv_parked`,
+`recv_fallback`, `forward_throttled` and `recv_preflight_failed` counters.
+Nothing this document designs remains in the code.
+
 Status: steps 0, 2 and 3 are implemented (#632, #633), and step 4 behind
 `recv_incremental` (#634–#636; 4b-2's recv-forward and direct-echo paths
 were removed in 0.7.0-alpha.5). Steps 1, 5, 6 and 7 are not. The receive

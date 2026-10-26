@@ -197,17 +197,16 @@ fn failure_report(
     want: usize,
     failed_at: Option<Duration>,
 ) -> String {
-    use ringline::metrics::{CONNECTIONS, POOL, RING, conn, pool, ring};
+    use ringline::metrics::{CONNECTIONS, RING, conn, ring};
     let counters = format!(
         "process counters: accepted {}, closed {}, dropped at accept (table full {}, \
-         register failed {}, acceptor backlog {}), recv parked {}; io_uring: SQE submit \
+         register failed {}, acceptor backlog {}); io_uring: SQE submit \
          failures {}, recv arm failures {}, close submit failures {}",
         CONNECTIONS.value(conn::ACCEPTED).unwrap_or(0),
         CONNECTIONS.value(conn::CLOSED).unwrap_or(0),
         CONNECTIONS.value(conn::ACCEPT_TABLE_FULL).unwrap_or(0),
         CONNECTIONS.value(conn::ACCEPT_REGISTER_FAILED).unwrap_or(0),
         CONNECTIONS.value(conn::ACCEPT_BACKLOG_DROPPED).unwrap_or(0),
-        POOL.value(pool::RECV_PARKED).unwrap_or(0),
         RING.value(ring::SQE_SUBMIT_FAILURES).unwrap_or(0),
         RING.value(ring::RECV_ARM_FAILURES).unwrap_or(0),
         RING.value(ring::CLOSE_SUBMIT_FAILURES).unwrap_or(0),
@@ -330,7 +329,6 @@ fn test_config_builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
-        .recv_buffer(64, 4096)
         .max_connections(64)
         .send_pool(64, 16384)
 }

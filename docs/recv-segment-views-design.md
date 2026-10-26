@@ -9,6 +9,9 @@ removed.
 Note (2026-10-25): `forward_to` and the segment hold (`segment_hold`) were
 removed.
 
+Note (2026-10-25): the TCP provided-buffer ring and `recv_incremental` were
+removed.
+
 Status: landing steps 1 (the view machinery), 2 (the reader) and 3
 (`recv_zc_threshold`) are implemented; steps 4 to 6 are a proposal.
 

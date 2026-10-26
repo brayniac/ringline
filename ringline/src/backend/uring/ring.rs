@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::memlock::KernelVersion;
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
 
-use super::engine::{ActiveEngine, Engine, RingKind};
+use super::engine::{ActiveEngine, Engine};
 use super::sqe::{self, Link, Op, Sqe};
 
 /// The first kernel that releases a socket removed from the fixed-file table
@@ -79,8 +79,6 @@ pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
 /// and pushes it to the engine.
 pub struct Ring {
     pub(crate) engine: ActiveEngine,
-    /// Recv buffer group ID for multishot recv.
-    bgid: u16,
     /// Test-only: the last operation pushed through `push_sqe`, so a test
     /// can check which operation a handler submitted.
     #[cfg(test)]
@@ -100,7 +98,6 @@ impl Ring {
     pub fn setup(config: &Config) -> Result<Self, Error> {
         Ok(Ring {
             engine: ActiveEngine::setup(config)?,
-            bgid: config.recv_buffer.bgid,
             #[cfg(test)]
             last_pushed: None,
             #[cfg(test)]
@@ -153,12 +150,8 @@ impl Ring {
     }
 
     /// See [`Engine::register_buf_ring`].
-    pub fn register_buf_ring(
-        &mut self,
-        provided: &ProvidedBufRing,
-        kind: RingKind,
-    ) -> Result<(), Error> {
-        self.engine.register_buf_ring(provided, kind)
+    pub fn register_buf_ring(&mut self, provided: &ProvidedBufRing) -> Result<(), Error> {
+        self.engine.register_buf_ring(provided)
     }
 
     /// See [`Engine::unregister_buf_ring`].
@@ -184,12 +177,6 @@ impl Ring {
     /// See [`Engine::reap`].
     pub(crate) fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
         self.engine.reap(out);
-    }
-
-    /// See [`Engine::sq_len`].
-    #[cfg(test)]
-    pub(crate) fn sq_len(&mut self) -> usize {
-        self.engine.sq_len()
     }
 
     /// See [`Engine::force_push_failures`].
@@ -228,34 +215,6 @@ impl Ring {
     #[cfg(all(test, uring_engine))]
     pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
         self.engine.iowq_max_workers()
-    }
-
-    /// Submit a one-shot fallback recv into fallback-pool memory for a
-    /// connection whose multishot recv is parked on ENOBUFS. The pool slot
-    /// is carried in the payload and released by `handle_recv_fallback`;
-    /// the pool owns `ptr` until that CQE arrives (SQE memory outlives the
-    /// operation even across close/slot-reuse).
-    pub fn submit_recv_fallback(
-        &mut self,
-        conn_index: u32,
-        ptr: *mut u8,
-        len: u32,
-        pool_slot: u16,
-    ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::RecvFallback, conn_index, pool_slot as u32);
-        let entry = Sqe::new(
-            Op::Recv {
-                fd: sqe::Fd::Fixed(conn_index),
-                buf: ptr,
-                len,
-                flags: 0,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
     }
 
     /// Submit a direct receive: a one-shot recv of `len` bytes into `ptr`,
@@ -322,51 +281,6 @@ impl Ring {
             },
             user_data.raw(),
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// Submit a multishot recv with provided buffer ring for a connection.
-    ///
-    /// `generation` is the connection's generation at arm time. It occupies the
-    /// whole 32-bit payload (an exact match, unlike the truncated send-family
-    /// generations), so `handle_recv_multi` can reject a completion that
-    /// outlived its connection slot: a multishot can survive the fixed-file
-    /// `Close` (its cancel is best-effort and is dropped when the SQ is full),
-    /// and without this the terminal `-ECONNRESET` would be misattributed to
-    /// whichever connection next occupies the index.
-    ///
-    /// Any cancel targeting this request must encode the same payload — a
-    /// cancel matches by `user_data`.
-    pub fn submit_multishot_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
-        self.submit_recv(conn_index, generation, false)
-    }
-
-    /// Submit a one-shot recv that selects one provided buffer, under the
-    /// same `RecvMulti` user_data as a multishot recv: its completion carries
-    /// no `IORING_CQE_F_MORE`, so `handle_recv_multi` treats it as a multishot
-    /// that ended after one completion and re-arms it.
-    pub fn submit_single_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
-        self.submit_recv(conn_index, generation, true)
-    }
-
-    fn submit_recv(&mut self, conn_index: u32, generation: u32, single: bool) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        let fd = sqe::Fd::Fixed(conn_index);
-        let op = if single {
-            Op::RecvSelect {
-                fd,
-                buf_group: self.bgid,
-            }
-        } else {
-            Op::RecvMulti {
-                fd,
-                buf_group: self.bgid,
-            }
-        };
-        let entry = Sqe::new(op, user_data.raw());
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1250,60 +1164,25 @@ mod tests {
     }
 
     /// Two provided buffer rings register and unregister on the running
-    /// kernel, as a worker with UDP does. On a kernel other than 6.8 the
-    /// standard form is used throughout.
+    /// kernel. On a kernel other than 6.8 the standard form is used
+    /// throughout.
     #[test]
     fn provided_rings_register_and_unregister() {
         // Declared before the ring, so they are unmapped after it drops.
-        let tcp = ProvidedBufRing::new(5, 8, 4096).expect("tcp ring");
-        let udp = ProvidedBufRing::new(6, 8, 4096).expect("udp ring");
+        let a = ProvidedBufRing::new(5, 8, 4096).expect("ring a");
+        let b = ProvidedBufRing::new(6, 8, 4096).expect("ring b");
         let mut ring = ring_with(None);
-        ring.register_buf_ring(&tcp, RingKind::Plain)
-            .expect("register tcp ring");
-        ring.register_buf_ring(&udp, RingKind::Plain)
-            .expect("register udp ring");
+        ring.register_buf_ring(&a).expect("register ring a");
+        ring.register_buf_ring(&b).expect("register ring b");
         if KernelVersion::current() != Some(PBUF_RESV_INVERTED_ON) {
             assert!(!ring.engine.pbuf_resv_set());
         }
-        ring.unregister_buf_ring(5).expect("unregister tcp ring");
-        ring.unregister_buf_ring(6).expect("unregister udp ring");
+        ring.unregister_buf_ring(5).expect("unregister ring a");
+        ring.unregister_buf_ring(6).expect("unregister ring b");
         // Unregistered, so the group can be registered again.
-        ring.register_buf_ring(&tcp, RingKind::Plain)
-            .expect("register tcp ring again");
+        ring.register_buf_ring(&a).expect("register ring a again");
         ring.unregister_buf_ring(5)
-            .expect("unregister tcp ring again");
-    }
-
-    /// `incremental_buffers` matches what registration does: an
-    /// incremental ring registers and unregisters when it reports true and
-    /// is refused with `EINVAL` when it reports false. Kernels from 6.12
-    /// support it.
-    #[test]
-    fn incremental_buffers_matches_registration() {
-        // Declared before the ring, so it is unmapped after it drops.
-        let provided = ProvidedBufRing::new(9, 8, 4096).expect("provided ring");
-        let mut ring = ring_with(None);
-        let supported = ring.engine.incremental_buffers().expect("probe");
-        // The answer is cached and stable.
-        assert_eq!(ring.engine.incremental_buffers().expect("probe"), supported);
-        if KernelVersion::current()
-            >= Some(KernelVersion {
-                major: 6,
-                minor: 12,
-            })
-        {
-            assert!(supported, "6.12+ supports IOU_PBUF_RING_INC");
-        }
-        match ring.register_buf_ring(&provided, RingKind::Incremental) {
-            Ok(()) => {
-                assert!(supported);
-                ring.unregister_buf_ring(9).expect("unregister");
-            }
-            Err(e) => {
-                assert!(!supported, "registration refused: {e}");
-                assert!(e.to_string().contains("EINVAL"), "{e}");
-            }
-        }
+            .expect("unregister ring a again");
     }
 
     /// The raw `io_uring_register` call behind the `resv[0]` retry (#626)

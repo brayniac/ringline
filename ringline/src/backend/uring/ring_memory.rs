@@ -1,4 +1,4 @@
-//! The memory behind the TCP receive ring's buffers.
+//! The memory behind the UDP receive ring's buffers.
 
 use std::io;
 use std::ptr::NonNull;
@@ -6,9 +6,7 @@ use std::ptr::NonNull;
 /// The memory behind a provided-buffer ring's buffers.
 ///
 /// The memory is freed when the ring drops. It is reached only through raw
-/// pointers: the kernel writes to buffers in the ring, and under
-/// `IOU_PBUF_RING_INC` to later bytes of a buffer while the driver reads
-/// earlier bytes of it.
+/// pointers, since the kernel writes to buffers in the ring.
 pub(crate) struct RingMemory {
     ptr: NonNull<u8>,
     len: usize,
@@ -16,8 +14,7 @@ pub(crate) struct RingMemory {
 
 impl RingMemory {
     /// Map `len` zeroed, page-aligned bytes. An anonymous mapping, so a page
-    /// is backed only once it is touched: the kernel's first write into a
-    /// buffer, or `prefault`.
+    /// is backed only once it is touched.
     pub(crate) fn new(len: usize) -> io::Result<Self> {
         let len = len.max(1);
         // Safety: an anonymous private mapping with no address hint.
@@ -42,12 +39,14 @@ impl RingMemory {
         self.ptr.as_ptr()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// The whole memory as a mutable slice. The caller must not have posted
     /// any buffer to a registered ring yet.
+    #[cfg(test)]
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // Safety: the mapping is `len()` bytes, zeroed by the kernel, and
         // `&mut self` excludes every other reference to it.

@@ -428,7 +428,7 @@ impl Driver {
             connections: ConnectionTable::new(config.max_connections),
             accumulators: AccumulatorTable::new_with_max(
                 config.max_connections,
-                config.recv_buffer.buffer_size as usize,
+                config.recv_accumulator_capacity,
                 config.recv_accumulator_max,
             ),
             arrival: (0..config.max_connections)
@@ -766,8 +766,7 @@ impl Driver {
     }
 
     /// Whether the sink's queue has reached the cap that stops the source
-    /// reading. Without this a slow sink grows the queue without bound: mio
-    /// cannot decline to read the way a depleted provided ring does.
+    /// reading. Without this a slow sink grows the queue without bound.
     pub(crate) fn forward_sink_full(&self, source: u32) -> bool {
         self.forward_conn[source as usize]
             .as_ref()
@@ -1862,10 +1861,10 @@ pub(crate) mod tests {
         driver.close_connection(conn_index);
         driver.finish_close(conn_index);
 
-        // mio allocates accumulators at the receive buffer size.
+        // Accumulators start at `recv_accumulator_capacity`.
         assert_eq!(
             driver.accumulators.capacity(conn_index),
-            config.recv_buffer.buffer_size as usize
+            config.recv_accumulator_capacity
         );
     }
 

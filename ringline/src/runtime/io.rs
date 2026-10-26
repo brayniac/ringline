@@ -1536,10 +1536,9 @@ impl ConnCtx {
             #[cfg_attr(not(has_io_uring), allow(unused_variables))]
             let conn_index = self.conn_index;
 
-            // Before either zero-copy branch: both act on the slot's pending
-            // recv buffer or accumulator, which belong to whichever
-            // connection holds the slot now. The same refusal as the copy
-            // path's `send` (#544).
+            // Before the zero-copy branch: it acts on the slot's accumulator,
+            // which belongs to whichever connection holds the slot now. The
+            // same refusal as the copy path's `send` (#544).
             if driver.connections.generation(conn_index) != self.generation {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -1547,59 +1546,10 @@ impl ConnCtx {
                 ));
             }
             // Once the Close is submitted, the copy path's `send` refuses
-            // without committing anything; the zero-copy branches would queue
+            // without committing anything; the zero-copy branch would queue
             // a send that is never driven.
             #[cfg(has_io_uring)]
             let closing = driver.send_queues[conn_index as usize].close_submitted;
-
-            #[cfg(has_io_uring)]
-            if !closing {
-                // Check for pending recv buffer.
-                if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
-                    // Verify the data pointer matches the pending buffer (sanity check).
-                    let pending_ptr = pending.ptr;
-                    let data_ptr = data.as_ptr();
-                    if data_ptr == pending_ptr && data.len() == pending.len as usize {
-                        // Submit send SQE from the recv buffer. The bid is replenished
-                        // on send completion via handle_send_recv_buf.
-                        // Payload: bid only (low 16 bits). The remaining byte count is
-                        // tracked in driver.send_recv_buf_remaining[conn_index] so that
-                        // buffer sizes > u16::MAX (e.g. 65536 B) are supported without
-                        // truncation in the CQE user_data payload.
-                        let payload = pending.bid as u32;
-                        let user_data = crate::completion::UserData::encode(
-                            crate::completion::OpTag::SendRecvBuf,
-                            conn_index,
-                            payload,
-                        );
-                        let entry = crate::backend::uring::sqe::Sqe::stream_send(
-                            conn_index,
-                            pending_ptr,
-                            pending.len,
-                            user_data.raw(),
-                        );
-
-                        let built = crate::handler::BuiltSend {
-                            entry,
-                            pool_slot: u16::MAX,
-                            #[cfg(has_io_uring)]
-                            slab_idx: u16::MAX,
-                            total_len: pending.len,
-                        };
-
-                        // Infallible: under SQ pressure the entry is parked in
-                        // the connection's queue and keeps its bid exactly as
-                        // a queued entry does; `handle_send_recv_buf`
-                        // replenishes it on completion.
-                        driver.send_held_recv[conn_index as usize] += 1;
-                        driver.submit_or_queue_send(conn_index, built);
-                        return Ok(());
-                    }
-
-                    // Pointer mismatch �� put it back and fall through to copy path.
-                    driver.pending_recv_bufs[conn_index as usize] = Some(pending);
-                }
-            }
 
             // The bytes are accumulator-backed: either they arrived across
             // several recv completions, or a previous parse left a remainder.
@@ -2578,76 +2528,6 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
     /// `poll` for a future whose generation matches the connection's.
     fn poll_current(&mut self, driver: &mut Driver, executor: &mut Executor) -> Poll<usize> {
-        // Zero-copy fast path: check pending recv buffer before accumulator.
-        // Only available on io_uring where kernel-provided buffers are used.
-        #[cfg(has_io_uring)]
-        if driver.pending_recv_bufs[self.conn_index as usize].is_some() {
-            // Non-merging emptiness check — `data()` would merge a held
-            // frozen remainder just to answer a boolean.
-            let acc_empty = driver.accumulators.is_empty(self.conn_index);
-            if acc_empty {
-                // Borrow the kernel buffer in-place — no copy.
-                let pending = driver.pending_recv_bufs[self.conn_index as usize].unwrap();
-                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                #[cfg(has_io_uring)]
-                let cb_conn = self.conn_index;
-                let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-                let result = {
-                    #[cfg(has_io_uring)]
-                    let _cb = ReaderCallback::enter(cb_conn);
-                    f(data)
-                };
-                match result {
-                    ParseResult::Consumed(consumed) if consumed > 0 => {
-                        // The closure may have called forward_recv_buf(), which
-                        // takes the pending slot. Only replenish if still present.
-                        if let Some(pending) =
-                            driver.pending_recv_bufs[self.conn_index as usize].take()
-                        {
-                            if consumed < pending.len as usize {
-                                // Partial consume: copy remainder to accumulator.
-                                let remainder = unsafe {
-                                    std::slice::from_raw_parts(
-                                        pending.ptr.add(consumed),
-                                        pending.len as usize - consumed,
-                                    )
-                                };
-                                driver.accumulators.append(self.conn_index, remainder);
-                            }
-                            driver.pending_replenish.push(pending.bid);
-                        }
-                        self.f.take();
-                        return Poll::Ready(consumed);
-                    }
-                    _ => {
-                        // NeedMore / Consumed(0): flush pending to accumulator
-                        // and fall through to the existing accumulator path.
-                        if let Some(pending) =
-                            driver.pending_recv_bufs[self.conn_index as usize].take()
-                        {
-                            let pending_data = unsafe {
-                                std::slice::from_raw_parts(pending.ptr, pending.len as usize)
-                            };
-                            driver.accumulators.append(self.conn_index, pending_data);
-                            driver.pending_replenish.push(pending.bid);
-                        }
-                        // Fall through to accumulator path below.
-                    }
-                }
-            } else {
-                // Accumulator has data AND there's a pending buffer.
-                // Flush pending to accumulator (prepend — it arrived first).
-                let pending = driver.pending_recv_bufs[self.conn_index as usize]
-                    .take()
-                    .unwrap();
-                let pending_data =
-                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                driver.accumulators.prepend(self.conn_index, pending_data);
-                driver.pending_replenish.push(pending.bid);
-                // Fall through to accumulator path below.
-            }
-        }
-
         let data = driver.accumulators.data(self.conn_index);
         if data.is_empty() {
             // Check if the connection has been closed — return 0 (EOF)
@@ -2827,16 +2707,6 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
         executor: &mut Executor,
         is_closed: bool,
     ) -> Poll<usize> {
-        // Flush any pending zero-copy recv buffer to accumulator so
-        // take_frozen() will include it (io_uring only).
-        #[cfg(has_io_uring)]
-        if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
-            let pending_data =
-                unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-            driver.accumulators.append(self.conn_index, pending_data);
-            driver.pending_replenish.push(pending.bid);
-        }
-
         let data = driver.accumulators.data(self.conn_index);
         if data.is_empty() {
             // No data yet — check closed state from the lookup above.
@@ -3430,12 +3300,10 @@ impl SendHalf {
     /// Send `data`, the bytes a `with_data` closure was handed, without
     /// copying them when possible.
     ///
-    /// On io_uring, if `data` is exactly the connection's pending recv buffer,
-    /// that buffer is sent as is and replenished when the send completes. If
-    /// `data` is exactly the connection's whole recv accumulator, the
-    /// accumulator is detached and sent under a guard (copied into the send
-    /// pool below `send_zc_threshold`). Otherwise `data` is copied as by
-    /// [`send_nowait`](Self::send_nowait).
+    /// On io_uring, if `data` is exactly the connection's whole recv
+    /// accumulator, the accumulator is detached and sent under a guard
+    /// (copied into the send pool below `send_zc_threshold`). Otherwise
+    /// `data` is copied as by [`send_nowait`](Self::send_nowait).
     ///
     /// On mio, `data` is always copied as by `send_nowait`. On a TLS
     /// connection it is always encrypted into the send pool; when `data` is

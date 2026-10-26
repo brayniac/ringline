@@ -1,5 +1,8 @@
 # Encoding sends directly into the send pool
 
+Note (2026-10-25): the lent receive buffer (`pending_recv_bufs`) was removed
+with the TCP provided-buffer ring.
+
 Status: proposal. Prototype and measurement pending (see "Measurement").
 
 ## Problem

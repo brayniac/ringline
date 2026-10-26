@@ -5,6 +5,9 @@ Note (2026-10-25): Modes A, B and C (`forward_to`, `segments`,
 `SinkFd` and `recv_segment_reserve` were removed; `forward_to_conn` remains
 and sends from the source's accumulator.
 
+Note (2026-10-25): the TCP provided-buffer ring and `recv_incremental` were
+removed.
+
 **Status:** Implemented in #286 (Modes A, B and C). On io_uring only a TLS
 connection enters the segmented domain. On io_uring a plaintext connection
 receives directly into its accumulator (`docs/recv-direct-design.md`): `segments`,

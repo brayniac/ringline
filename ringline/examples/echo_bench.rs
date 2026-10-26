@@ -212,7 +212,6 @@ fn make_config_builder(workers: usize, msg_size: usize) -> ConfigBuilder {
         .workers(workers)
         .pin_to_core(false)
         .sq_entries(256)
-        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
         .max_connections(4096)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
 }
