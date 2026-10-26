@@ -825,7 +825,7 @@ impl ConfigBuilder {
     /// Print per-worker event-loop diagnostics to stderr at shutdown.
     ///
     /// Each worker prints a `[ringline diag]` line (iteration mix: dead
-    /// iterations, CQEs and tasks per iteration, parks, fallbacks) and a
+    /// iterations, CQEs and tasks per iteration) and a
     /// `[ringline stall]` line (wait/work stall buckets). Recording the
     /// stall buckets costs ~4 clock reads per iteration, so this is off by
     /// default. io_uring backend only; the mio backend prints nothing.
@@ -948,11 +948,12 @@ impl ConfigBuilder {
     /// allocation once at startup, on the worker thread that owns it, so the
     /// pages stay local to that worker's NUMA node.
     ///
-    /// With it, RSS after startup equals RSS under load, and a pool the
-    /// machine cannot back fails at launch instead of during a burst. Without
-    /// it, the part of the pool no send touches stays virtual. A
-    /// `send_pool(1024, 16448)` pool is about 16 MiB per worker. Startup grows by
-    /// roughly one pass over the allocation.
+    /// With it, the pool's pages are resident from startup, so the pool adds
+    /// nothing to RSS under load, and a pool the machine cannot back fails at
+    /// launch instead of during a burst. Without it, the part of the pool no
+    /// send touches stays virtual. A `send_pool(1024, 16448)` pool is about
+    /// 16 MiB per worker. Startup grows by roughly one pass over the
+    /// allocation.
     ///
     /// **Default: false** while the trade is being measured (#416).
     pub fn prefault_buffers(mut self, enabled: bool) -> Self {

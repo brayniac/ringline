@@ -557,11 +557,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connections receive directly (see Changed and Added), and only UDP
   receives through a provided ring. A worker no longer allocates the TCP
   ring's buffers (4 MiB by default) or registers the ring, whose entry array
-  (one page by default) Linux 6.14+ charged to `RLIMIT_MEMLOCK`. With it go `ConfigBuilder::recv_buffer` and
-  `recv_buffer_bgid`; remove those calls. On mio, accumulators now start at
-  `recv_accumulator_capacity` (4 KiB by default) instead of the
-  `recv_buffer` size (16 KiB by default), and `recv_accumulator_max` must
-  be at least 1 instead of at least that size. Also removed: the fallback
+  (one page by default) Linux 6.14+ charged to `RLIMIT_MEMLOCK`. With it go
+  `ConfigBuilder::recv_buffer` and `recv_buffer_bgid`; remove those calls.
+  On io_uring a receive is up to `recv_direct_region` bytes. On mio,
+  accumulators now start at `recv_accumulator_capacity` (4 KiB by default)
+  instead of the `recv_buffer` size (16 KiB by default);
+  `recv_accumulator_capacity(16384)` restores 0.6's starting size.
+  `recv_accumulator_max` must be at least 1 instead of at least that size.
+  `pool::BUFFER_RING_EMPTY` counts only the UDP ring. Also removed: the fallback
   receive for messages larger than the ring, and the receive throttle for
   connections whose `forward_recv_buf` sends held ring buffers.
   `udp_recv_buffer_bgid(0)` with UDP configured, which 0.6 refused because
@@ -570,7 +573,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `forward_throttled` (`metrics::pool::RECV_PARKED`, `RECV_FALLBACK`,
   `FORWARD_THROTTLED`), and the `fallback_received` counter of
   `ringline/bytes` (`metrics::bytes::FALLBACK_RECEIVED`), which counted the
-  TCP ring.
+  TCP ring. The `[ringline diag]` line of `loop_diag` loses its `parks=` and
+  `fallbacks=` fields.
 
 - **Breaking:** `ConnCtx::forward_to` and `SinkFd` (io_uring only), which
   wrote a connection's received bytes to a socket or a buffered file, and
@@ -590,7 +594,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with `with_data`.
 - **Breaking:** `metrics::pool::SEGMENT_STRANDED_ADOPTED`, the
   `segment_stranded_adopted` op of `ringline/pool`, which counted bytes a
-  segment reader found in the accumulator. Slot 7 of the group is unused.
+  segment reader found in the accumulator.
 - **Breaking:** `enable_recv_forward`, `forward_held`, `run_direct_echo`
   (io_uring only, with `DirectEchoFuture`), `set_recv_sink` and
   `take_recv_sink`, wherever `ConnCtx`, `Connection` or `RecvHalf` had them,
@@ -725,10 +729,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection buffered, and `reset` keeps the allocation, so each slot kept
   that size until a new connection took it, and then for that connection's
   lifetime. After a 1 MiB forward echo at 512 connections on one io_uring
-  worker with `recv_incremental`, RSS once every connection had closed was
-  791 and 874 MiB in two runs without this change and 276 and 336 MiB with
-  it (measured on a development branch whose bench server has
-  `--recv-incremental`). Both backends.
+  worker with the incremental TCP receive ring (removed in this release),
+  RSS once every connection had closed was 791 and 874 MiB in two runs
+  without this change and 276 and 336 MiB with it. Both backends.
 - io_uring: the error text of a failed buffer registration names a failed
   page migration as a cause, and the `EFAULT` text names io_uring's 1 GiB
   per-buffer limit. A long-term pin migrates pages in `ZONE_MOVABLE` or in

@@ -110,8 +110,8 @@ pub mod conn {
 /// conflates causes.
 ///
 /// Slot index is the `OpTag` discriminant, so the array is sized to the largest
-/// one and the discriminants the enum skips are unused slots. That wastes a slot
-/// and keeps the increment a plain cast with no lookup table to fall out of step
+/// one and the discriminants the enum skips are unused slots. That wastes those
+/// slots and keeps the increment a plain cast with no lookup table to fall out of step
 /// with the enum.
 #[metric(
     name = "ringline/cqe_by_tag",
@@ -245,8 +245,7 @@ pub mod park_abandon {
     // Slots 10 and 11 have no blocker.
     /// The slot was recycled while the install was in flight.
     pub const SLOT_RECYCLED: usize = 12;
-    /// The `FixedFdInstall` failed, or the linked recv-cancel returned
-    /// `ECANCELED` because the recv had self-terminated.
+    /// The `FixedFdInstall` failed.
     pub const INSTALL_FAILED: usize = 13;
     /// A receive, a hangup poll or a hangup peek was armed when the install
     /// completed. Arms are refused while a park is pending, so this counts

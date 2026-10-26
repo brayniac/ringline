@@ -10,9 +10,9 @@
 //!
 //! - **Latency.** Faults stop appearing in the ramp, where they show up as p99
 //!   and p999 outliers rather than as a throughput number.
-//! - **Memory.** RSS after startup equals RSS under load, so a configuration
-//!   that asks for more memory than the machine has fails at launch instead
-//!   of during a traffic burst, as `launch()` already does for
+//! - **Memory.** The pool's pages are resident from startup, so the pool adds
+//!   nothing to RSS under load, and a pool the machine cannot back fails at
+//!   launch instead of during a traffic burst, as `launch()` already does for
 //!   `RLIMIT_NOFILE` and `RLIMIT_MEMLOCK`.
 //! - **NUMA.** First touch decides the node. Ringline builds each worker's
 //!   driver after `pin_to_core` (see `worker.rs`), so prefaulting from the
