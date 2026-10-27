@@ -53,31 +53,45 @@ which the vendored copy keeps.
 
 | Repository | Fork of | Published crate | Library name | Used by |
 |---|---|---|---|---|
-| `ringline-rs/rustls` | `rustls/rustls` | `ringline-tls` | `rustls` | ringline, `ringline-quic-proto` |
-| `ringline-rs/quinn` | `quinn-rs/quinn` | `ringline-quic-proto` | `quinn_proto` | `ringline-quic` |
+| `ringline-rs/rustls` | `rustls/rustls` | `ringline-tls` | `ringline_tls` | ringline, `ringline-quic-proto` |
+| `ringline-rs/quinn` | `quinn-rs/quinn` | `ringline-quic-proto` | `ringline_quic_proto` | `ringline-quic` |
 
 - Each is a GitHub fork. It keeps upstream's history and can open pull
   requests against upstream directly.
 - ringline's code lives on one branch per upstream line: `ringline/0.23` in
   the rustls fork and `ringline/0.11` in the quinn fork.
   - The branch starts at upstream's release tag.
-  - The first commit on it renames the package.
+  - The first commit on it renames the package and the library.
   - Each further commit is one ringline patch.
   - `git diff <upstream tag> ringline/0.23` is always exactly ringline's
     changes.
-- Only the package is renamed, not the library: `ringline-tls` builds a
-  library still called `rustls`.
-  - upstream's tests, examples, fuzz targets and BoGo runner build unchanged.
-    The fork's other workspace members point at it with
-    `rustls = { package = "ringline-tls", path = ... }`.
-  - A crate that depends on both `ringline-tls` and upstream `rustls` must
-    rename one of the two dependency keys. Without the rename, rustc stops
-    with `E0464` (multiple candidates for `rustls`). This was checked with
-    two toy packages, and renaming one key, for example
-    `upstream_rustls = { package = "rustls", ... }`, builds.
-  - ringline's own tests are such a crate, because they keep upstream rustls
-    as the peer.
-  - Callers who go through ringline's re-export never see the clash.
+- The library takes the package's name. A type error then names the crate
+  each type came from: `ringline_tls::ServerConfig` against
+  `rustls::ServerConfig`, not two types both shown as `rustls::ServerConfig`.
+  A crate can also depend on both the fork and upstream rustls without
+  renaming either dependency.
+- This is the convention among published forks. Each of these uses its
+  package name as its library name:
+  - `iroh-quinn-proto`
+  - `iroh-quinn`
+  - `noq-proto`
+  - `rustls-fork-shadow-tls`
+  - `tokio-rustls-fork-shadow-tls`
+  - `boring`
+  - `serde_json_lenient`
+- The rename touches the fork in three places:
+  - The fork's other workspace members (examples, benchmarks, fuzz targets,
+    BoGo runner) import it under a renamed key,
+    `rustls = { package = "ringline-tls", path = ... }`, so their `rustls::`
+    paths stay as they are.
+  - The integration tests and benches inside the rustls package each get one
+    alias line, `extern crate ringline_tls as rustls;`.
+  - Doctests that name `rustls::` get the same alias as a hidden line. 51
+    doc-comment lines in 7 files under `src/` name `rustls::`; links among
+    them need no change.
+- The names are checked against crates.io (2026-10-27). `ringline-tls` and
+  `ringline-quic-proto` are unclaimed. `quic-proto` belongs to an unrelated
+  crate.
 - The vendored quinn-proto depends on `rustls = { package = "ringline-tls" }`.
   Its `rustls::` paths stay as they are, and a binary has one TLS stack for
   TCP and QUIC.
