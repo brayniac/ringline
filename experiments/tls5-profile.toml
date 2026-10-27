@@ -1,0 +1,221 @@
+# TLS5 profile: how much of a TLS server's CPU per operation is copies, and
+# how much is the AEAD. Submitted once per value size (vlen 64, 4096 and
+# 65536). Bounds what removing copies (kTLS, a rustls fork, or an own record
+# layer) could save. Arms run in
+# sequence on the same VM pair; during each arm's measured window the server
+# records a system-wide perf profile (no call graphs) and /proc/stat deltas,
+# then an 8 s DWARF call-graph profile of the server process.
+#   arms: plain (no TLS) | tls (rustls, default unbuffered engine, ring
+#   provider, self-signed certificate)
+# Prediction, written before running: at v64 the copy share of the tls arm's
+# user CPU is small (under 5%) and the AEAD is not the largest cost either; at
+# v65536 copies (memcpy/memmove in user space plus copy_user in the kernel)
+# are at least as large as the AEAD. If v65536 shows copies well below the
+# AEAD, removing copies cannot pay for any of the TLS5 options.
+# Server bins: tls5-profile-build.toml at exp/tls5-profile. Client: the C8
+# cachecannon (client_bins, out/cachecannon-a); it runs TLS too, so client
+# CPU may limit throughput in the tls arm. The per-op server numbers do not
+# depend on that.
+name = "tls5 profile v{vlen} d{depth} c{conns} rep{rep}"
+
+[params]
+bins_artifact  = "REPLACE-WITH-ARTIFACT-ID"
+client_bins    = "01a159f3-e054-73af-bc3f-8b6ea08f60b1"
+# perf-bundle-build.toml's perf.tgz (out/perf/perf and its libraries)
+perf_artifact  = "01a128b3-b76b-7345-0ea5-165591a7fc64"
+image          = "debian-13-ci"
+rep            = "1"
+server_ip      = "172.31.0.1"
+client_ip      = "172.31.0.2"
+port           = "6379"
+arms           = "plain tls"
+vlen           = "4096"
+depth          = "16"
+conns          = "2048"
+keys           = "20000"
+client_threads = "16"
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "barrier"
+name = "vms-up"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/profile.tgz"]
+payload_timeout = 3600
+inputs = [
+  { artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" },
+  { artifact = "{perf_artifact}", name = "perf.tgz", dest = "/home/anvil" },
+]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && tar xzf perf.tgz && chmod +x out/resp-server
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728 kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+# The guest's hard nofile limit is below 1048576, so `ulimit -n` alone
+# leaves the soft limit at 1024; tokio does not raise it itself.
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "server-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+# perf is not in the base image; the bins artifact may carry a bundle
+# (out/perf/perf plus its shared libraries in out/perf/lib).
+if ! command -v perf >/dev/null && [ -x out/perf/perf ]; then
+  printf '#!/bin/sh\nLD_LIBRARY_PATH=/home/anvil/out/perf/lib exec /home/anvil/out/perf/perf "$@"\n' | sudo tee /usr/local/bin/perf >/dev/null
+  sudo chmod +x /usr/local/bin/perf
+fi
+command -v perf >/dev/null && echo "perf: $(perf --version)" || echo "perf: unavailable"
+mkdir -p prof
+nproc; uname -r
+conns() { ss -Htn state established "( sport = :{port} )" | wc -l; }
+for arm in {arms}; do
+  case $arm in
+    plain) args="--runtime ringline --send-slot 16448" ;;
+    tls)   args="--runtime ringline --send-slot 16448 --tls" ;;
+    *) echo "BAD ARM $arm"; exit 1 ;;
+  esac
+  ./out/resp-server $args --addr {server_ip}:{port} --workers 8 > prof/$arm.server.log 2>&1 &
+  pid=$!
+  for i in $(seq 1 600); do [ "$(conns)" -ge {conns} ] && break; sleep 0.5; done
+  # past the client's 10 s warmup
+  sleep 15
+  cat /proc/stat > prof/$arm.stat0
+  if command -v perf >/dev/null; then
+    sudo perf record -a -F 499 -o prof/$arm.perf.data -- sleep 20 2>prof/$arm.perf.err
+  else
+    sleep 20
+  fi
+  cat /proc/stat > prof/$arm.stat1
+  if command -v perf >/dev/null; then
+    sudo perf record -p $pid -F 199 --call-graph dwarf,8192 -o prof/$arm.cg.data -- sleep 8 2>prof/$arm.cg.err
+  fi
+  echo "== $arm conns=$(conns)"
+  for i in $(seq 1 600); do [ "$(conns)" -eq 0 ] && break; sleep 0.5; done
+  kill $pid; wait $pid 2>/dev/null
+  sleep 2
+done
+for arm in {arms}; do
+  if [ -f prof/$arm.perf.data ]; then
+    sudo perf report -i prof/$arm.perf.data --stdio --no-children --sort comm,dso --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > prof/$arm.dso.txt
+    sudo perf report -i prof/$arm.perf.data --stdio --no-children --sort sym --percent-limit 0.3 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120 > prof/$arm.sym.txt
+    sudo rm -f prof/$arm.perf.data
+    echo "-- $arm top dso"; head -15 prof/$arm.dso.txt
+    echo "-- $arm top symbols"; head -40 prof/$arm.sym.txt
+  fi
+  if [ -f prof/$arm.cg.data ]; then
+    # callers of each hot symbol, as raw text; libc addresses are resolved offline
+    sudo perf report -i prof/$arm.cg.data --stdio --no-children --sort sym -G --percent-limit 1.5 2>/dev/null | grep -v '^$' | head -1500 > prof/$arm.cg.txt
+    sudo rm -f prof/$arm.cg.data
+  fi
+done
+python3 - <<'PY'
+import os
+hz=os.sysconf("SC_CLK_TCK"); W=20.0
+for arm in "{arms}".split():
+    def stat(f):
+        for l in open(f"prof/{arm}.{f}"):
+            if l.startswith("cpu "): return list(map(int,l.split()[1:9]))
+    a,b=stat("stat0"),stat("stat1")
+    names=["user","nice","system","idle","iowait","irq","softirq","steal"]
+    d={n:(y-x)/hz/W for n,x,y in zip(names,a,b)}
+    print(f"== {arm}: cores " + " ".join(f"{n}={d[n]:.2f}" for n in names if n!="idle"))
+PY
+sudo chown -R anvil prof
+tar czf /home/anvil/profile.tgz prof
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "barrier"
+name = "vms-up"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 3600
+inputs = [{ artifact = "{client_bins}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535" >/dev/null
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+for arm in {arms}; do
+  tls=false; [ $arm = tls ] && tls=true
+  cat > cell-$arm.toml <<CFG
+[general]
+duration = "50s"
+warmup = "10s"
+threads = {client_threads}
+[target]
+endpoints = ["{server_ip}:{port}"]
+protocol = "resp"
+tls = $tls
+tls_verify = false
+tls_hostname = "localhost"
+[connection]
+connections = {conns}
+pipeline_depth = {depth}
+connect_timeout = "10s"
+request_timeout = "60s"
+[workload]
+backfill_on_miss = true
+[workload.keyspace]
+length = 16
+count = {keys}
+distribution = "uniform"
+[workload.commands]
+get = 80
+set = 20
+[workload.values]
+length = {vlen}
+[admin]
+format = "json"
+CFG
+done
+for arm in {arms}; do
+  for i in $(seq 1 300); do (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; break; }; sleep 1; done
+  ./out/cachecannon-a cell-$arm.toml > $arm.json 2> $arm.log
+  echo "== $arm"; grep '"type":"result"' $arm.json || { echo "NO RESULT"; tail -20 $arm.log; }
+  sleep 8
+done
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
