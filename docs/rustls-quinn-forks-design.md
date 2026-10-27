@@ -61,7 +61,7 @@ the fork keeps.
 
 | Repository | Fork of | Published crate | Library name | Used by |
 |---|---|---|---|---|
-| `ringline-rs/rustls` | `rustls/rustls` | `ringline-tls` | `ringline_tls` | ringline, `ringline-tls-config`, `ringline-quic-proto`, ringline-quic (version floor only, from step 5) |
+| `ringline-rs/rustls` | `rustls/rustls` | `ringline-tls` | `ringline_tls` | ringline, `ringline-tls-config`, `ringline-quic-proto` |
 | `ringline-rs/quinn` | `quinn-rs/quinn` | `ringline-quic-proto` | `ringline_quic_proto` | `ringline-quic` |
 
 - Each is a GitHub fork. It keeps upstream's history, and maintainers can
@@ -229,11 +229,12 @@ let client = TlsClientConfig::builder()
 
 - `client_auth_roots` requires a client certificate signed by the roots.
   `client_auth_roots_optional` accepts a connection without one.
-- The builders select the ring provider explicitly with
-  `builder_with_provider`. `ServerConfig::builder()` panics when a caller's
-  dependency tree enables both of rustls's `ring` and `aws_lc_rs` features
-  and no process default provider is installed (rustls
-  `src/crypto/mod.rs:241-286`). The builders must not panic.
+- `ServerConfig::builder()`, `ClientConfig::builder()`,
+  `WebPkiClientVerifier::builder` and `WebPkiServerVerifier::builder` panic
+  when no process default provider is installed and rustls's features do
+  not name exactly one provider: both `ring` and `aws_lc_rs`, or
+  `custom-provider` (rustls `src/crypto/mod.rs:241-286`). The builders use
+  the `builder_with_provider` form of each, with the ring provider.
 - The builders accept TLS 1.2 and 1.3 by default, as rustls does.
   `.versions(&[TlsVersion::Tls13])` restricts them. `ringline-tls-config`
   enables rustls's `tls12` feature for this. Today ringline enables rustls
@@ -250,8 +251,8 @@ let client = TlsClientConfig::builder()
   negotiates TLS 1.3 only and refuses a client that offers no TLS 1.3
   (`Tls13RequiredForQuic`, rustls `src/server/hs.rs:369-385`).
 - `TlsInfo` returns ringline enums, `TlsVersion` and `CipherSuite`, both
-  `#[non_exhaustive]`. A suite the enum does not name, from a `from_rustls`
-  provider for example, maps to `CipherSuite::Unknown(u16)`, and
+  `#[non_exhaustive]`. A suite the enum does not name, from the provider of
+  a `from_rustls` config for example, maps to `CipherSuite::Unknown(u16)`, and
   `CipherSuite::iana_code` returns the IANA code for every variant. The
   in-tree callers (`tls_echo.rs:612,616`) only check for `Some`.
 - A benchmark client that skips certificate verification uses
@@ -272,71 +273,89 @@ let client = TlsClientConfig::builder()
     `webpki_roots::TLS_SERVER_ROOTS`, which is
     `&[TrustAnchor<'static>]`; `trust_anchors` exists for them.
 - ringline-quic builds its quinn-proto configs from the same two types. A
-  caller can pass one value to ringline and ringline-quic.
-  - For a config built with the builders, ringline-quic clones the rustls
-    config from `TlsConfig::rustls_config` and sets the QUIC-only fields on
-    the clone: `max_early_data_size` on the server and `enable_early_data` on
-    the client. QUIC accepts only 0 or `u32::MAX` for the server value
-    (rustls `src/quic.rs:283`).
-  - A `from_rustls` config keeps its own `max_early_data_size`,
-    `enable_early_data` and ALPN. `QuicConfig::zero_rtt` and
-    `QuicConfig::alpn` do not change it.
-  - For builder configs, `QuicConfig::zero_rtt` defaults to what
-    quinn-proto's `with_single_cert` does today. A server accepts 0-RTT
-    (`max_early_data_size = u32::MAX`, `src/crypto/rustls.rs:487`, relied on
-    at `peer.rs:1065-1066`). A client sends none until `zero_rtt(true)` sets
-    `enable_early_data`. `zero_rtt(false)` on a server sets
-    `max_early_data_size` to 0.
+  caller can pass one builder config to ringline and ringline-quic. A caller
+  using `from_rustls` with different ALPN or 0-RTT settings for QUIC passes
+  a separate config to ringline-quic.
+- `QuicConfig` gets a builder, as `TlsConfig` does:
+
+  ```rust
+  let quic = QuicConfig::builder()
+      .server(tls)                      // TlsConfig; optional
+      .client(client)                   // TlsClientConfig; optional
+      .alpn(&[b"h3"])                   // optional
+      .zero_rtt(true)                   // optional
+      .max_concurrent_bidi_streams(1024)
+      .build()?;
+  ```
+
+  - Setting both `server` and `client` gives one endpoint that accepts and
+    connects, as `server_config` and `client_config` do today (tested at
+    `ringline-quic/src/config.rs:139`).
+  - The builder has the transport settings the in-tree callers use:
+    `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`,
+    `stream_receive_window`, `receive_window`, `max_idle_timeout`
+    (`peer.rs:574,593`), `initial_rtt`
+    (`ringline-benchmarks/src/protocols/http3.rs:316`) and server
+    `migration` (`peer.rs:1509`). They replace `QuicConfig::endpoint_config`
+    and the transport settings callers set on quinn-proto configs today.
+  - `send_queue_capacity`, `max_transmit_datagrams`, `allow_mtud` and
+    `rng_seed` stay `QuicConfig` methods. ringline-quic applies them itself
+    or passes them to quinn-proto's `Endpoint::new`, so they work on every
+    `QuicConfig`.
+- `build` assembles the quinn-proto configs and returns `Result`.
+  - It clones the rustls config from `TlsConfig::rustls_config` (and
+    `TlsClientConfig::rustls_config`) and sets the QUIC-only fields on the
+    clone: `alpn_protocols`, `max_early_data_size` on the server and
+    `enable_early_data` on the client. QUIC accepts only 0 or `u32::MAX` for
+    the server value (rustls `src/quic.rs:283`).
+  - `alpn` and `zero_rtt` apply to every `TlsConfig` when they are called.
+    When they are not called, a builder config gets the defaults below and a
+    `from_rustls` config keeps its own values.
+  - The default 0-RTT settings match quinn-proto's `with_single_cert` today.
+    A server accepts 0-RTT (`max_early_data_size = u32::MAX`,
+    `src/crypto/rustls.rs:487`, relied on at `peer.rs:1065-1066`). A client
+    sends none until `zero_rtt(true)` sets `enable_early_data`.
+    `zero_rtt(false)` on a server sets `max_early_data_size` to 0.
   - That default changes one in-tree server. The http3 benchmark server
     builds its config through `QuicServerConfig::try_from` from a plain
-    rustls config (`ringline-benchmarks/src/protocols/http3.rs:305-307`),
-    so it does not accept 0-RTT today and would after porting. quinn-proto's
-    `QuicClientConfig::new` and `with_root_certificates` set
-    `enable_early_data = true` (`src/crypto/rustls.rs:306,351`), which the
-    builder client default does not.
+    rustls config (`ringline-benchmarks/src/protocols/http3.rs:305-307`), so
+    it does not accept 0-RTT today and would after porting.
+  - quinn-proto's own client constructors,
+    `quinn_proto::ClientConfig::with_root_certificates`
+    (`src/config/mod.rs:639`, through `QuicClientConfig::new` and `inner`,
+    `src/crypto/rustls.rs:351`) and `try_with_platform_verifier` (`:306`),
+    set `enable_early_data = true`. The builder client default does not, and
+    no in-tree client uses those constructors.
   - The TCP config keeps `max_early_data_size` at 0, because ringline's TCP
     engine treats early data as an error
     (`ringline/src/tls/unbuffered/mod.rs:497-502`).
-  - `QuicConfig::alpn` overrides the ALPN list for QUIC, since H3 uses `h3`
-    where TCP uses `h2` or `http/1.1`. ALPN stays optional, as it is in
-    quinn-proto. Most of the QUIC and H3 tests set none.
-  - `QuicConfig::server`, `QuicConfig::client`, `QuicConfig::server_config`
-    and `QuicConfig::client_config` return `Result`, and each checks the
-    final config it stores (after the QUIC-only fields are set) for TLS
-    1.3. quinn-proto's conversion checks
-    only the provider's cipher suites (`NoInitialCipherSuite`,
-    `src/crypto/rustls.rs:567-580`), and a TLS 1.2-only config still carries
-    the TLS 1.3 suites, so the conversion succeeds. The first connection then
-    panics: quinn-proto unwraps rustls's per-connection check
-    (`src/crypto/rustls.rs:369-377, 525-526`; rustls `src/quic.rs:271`).
-  - For builder configs, ringline-quic reads the versions the builder
-    recorded, through a public `TlsConfig::versions` accessor (and the
-    `TlsClientConfig` one).
-  - rustls's `supports_version` is `pub(crate)`, so for a `from_rustls`
-    config ringline-quic constructs a throwaway
-    `rustls::quic::ServerConnection::new(config, quic::Version::V1,
-    Vec::new())` (rustls `src/quic.rs:266`) or `ClientConnection::new` with a
-    placeholder server name such as `example.invalid` (`src/quic.rs:163`),
-    and returns its error. A real server name would use up a stored session
-    ticket, because the client constructor starts the handshake
-    (`client/hs.rs:1120`). The server trial also rejects a
-    `max_early_data_size` other than 0 or `u32::MAX`.
-  - `QuicConfig::from_proto` cannot be checked: quinn-proto's
-    `ServerConfig` holds an opaque `Arc<dyn crypto::ServerConfig>`. A
-    TLS 1.2-only config passed that way panics on the first connection, as
-    it does today.
-  - Transport and endpoint settings get `QuicConfig` builder methods, as
-    `send_queue_capacity` and `allow_mtud` already are. The in-tree callers
-    need `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`,
-    `stream_receive_window`, `receive_window`, `max_idle_timeout`
-    (`peer.rs:574,593`), `initial_rtt`
-    (`ringline-benchmarks/src/protocols/http3.rs:316`), server `migration`
-    (`peer.rs:1509`) and 0-RTT.
-    `QuicConfig::endpoint_config` is replaced by methods for the endpoint
-    settings ringline-quic uses.
-  - `QuicConfig::server_config` and `QuicConfig::client_config` stay, taking
-    `TlsConfig` and `TlsClientConfig`, so one endpoint can both accept and
-    connect (tested at `ringline-quic/src/config.rs:139`).
+  - ALPN stays optional, as it is in quinn-proto. Most of the QUIC and H3
+    tests set none. H3 sets `h3` where TCP uses `h2` or `http/1.1`.
+- `build` checks that the assembled config enables TLS 1.3.
+  - quinn-proto's conversion checks only the provider's cipher suites
+    (`NoInitialCipherSuite`, `src/crypto/rustls.rs:567-580`). A TLS 1.2-only
+    config still carries the TLS 1.3 suites, so the conversion succeeds. The
+    first connection then panics: quinn-proto unwraps rustls's
+    per-connection check (`src/crypto/rustls.rs:369-377, 525-526`; rustls
+    `src/quic.rs:271`).
+  - rustls's `supports_version` is `pub(crate)`. `build` therefore
+    constructs a throwaway `rustls::quic::ServerConnection::new(config,
+    quic::Version::V1, Vec::new())` (rustls `src/quic.rs:266`), or
+    `ClientConnection::new` with a placeholder server name such as
+    `example.invalid` (`src/quic.rs:163`), and returns its error. A real
+    server name would use up a stored session ticket, because the client
+    constructor starts the handshake (`client/hs.rs:1120`).
+  - `build` then runs quinn-proto's `try_from` and returns its error. A
+    provider whose only TLS 1.3 suite is ChaCha20 passes the trial and fails
+    here with `NoInitialCipherSuite`.
+  - After step 5 a fork patch can make `supports_version` public and
+    replace the trial.
+- `QuicConfig::from_proto(endpoint, server, client)` takes complete
+  quinn-proto configs and returns a `QuicConfig`. The builder's TLS and
+  transport settings do not apply to it. It cannot be checked: quinn-proto's
+  `ServerConfig` holds an opaque `Arc<dyn crypto::ServerConfig>`. A TLS
+  1.2-only config passed that way panics on the first connection, as it
+  does today.
 - ringline-quic owns every quinn-proto type in the ringline-quic and
   ringline-h3 rows, except the config types, which `QuicConfig` replaces.
   - `StreamId`, `VarInt` and `Dir` become ringline-quic types.
@@ -516,10 +535,11 @@ With the forks, ringline is responsible for shipping fixes like these.
     `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to the
     fixed version, with the advisory in the comment, as the rustls and
     quinn-proto floors are recorded today. A patch release of each published
-    crate that declares the dependency (ringline, `ringline-tls-config`,
-    ringline-quic) carries the floor to downstream resolvers. ringline-quic
-    does not depend on ringline, so a QUIC-only user gets the floor only
-    from ringline-quic and `ringline-tls-config`.
+    crate that declares the dependency carries the floor to downstream
+    resolvers: ringline and `ringline-tls-config` for `ringline-tls`, and
+    ringline-quic for `ringline-quic-proto`. ringline-quic does not depend on
+    ringline, so a QUIC-only user gets the `ringline-tls` floor from
+    `ringline-tls-config`.
 - **Notice.** File a RustSec advisory against the affected `ringline-tls`
   versions, citing the upstream advisory, so downstream `cargo audit` runs
   report it.
@@ -655,10 +675,12 @@ Each step is a separate pull request in the repository it changes.
      (`ringline-quic/Cargo.toml:14`) to `[dev-dependencies]`. Otherwise every
      QUIC binary compiles upstream rustls next to the fork. Its unit tests
      under `src/` (`src/config.rs:121-135`) use the fork.
-   - ringline-quic adds `ringline-tls` to its `[dependencies]` as a
-     floor-only dependency, as it does `rustls-webpki` today
-     (`ringline-quic/Cargo.toml:15-16`), so a QUIC-only user gets the
-     `ringline-tls` floor from ringline-quic.
+   - ringline-quic names rustls types through `ringline_tls_config::rustls`
+     and has no direct `ringline-tls` dependency. A QUIC-only user gets the
+     `ringline-tls` floor from `ringline-tls-config`.
+   - `ringline-tls` 0.1.0 (step 3) raises its own `rustls-webpki`
+     requirement to 0.103.16, so step 5 drops the direct `rustls-webpki`
+     dependencies of ringline, ringline-quic and `ringline-tls-config`.
    - The workspace `Cargo.toml` floor comments move onto the
      `ringline-tls` and `ringline-quic-proto` requirements. Lines 75-77
      ("Every workspace crate that depends on rustls ... takes it from here")
