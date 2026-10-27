@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod output;
+pub mod resp;
 pub mod runtime_metrics;
 
 /// Re-export from ringline for use in bench binaries.
