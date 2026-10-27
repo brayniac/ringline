@@ -228,6 +228,14 @@ let client = TlsClientConfig::builder()
   `builder_with_provider`. `ServerConfig::builder()` panics when a caller's
   dependency tree enables both of rustls's `ring` and `aws_lc_rs` features
   (rustls `src/crypto/mod.rs:243-286`), and the builders must not.
+- The builders accept TLS 1.2 and 1.3 by default, as rustls does.
+  `.versions(&[TlsVersion::Tls13])` restricts them. `ringline-tls-config`
+  enables rustls's `tls12` feature for this. Today ringline enables rustls
+  without `tls12` (`ringline/Cargo.toml:41`), so a server negotiates TLS 1.2
+  only when another crate in the build enables the feature.
+- A config with TLS 1.2 enabled works for QUIC. On a QUIC connection rustls
+  negotiates TLS 1.3 only and refuses a client that offers no TLS 1.3
+  (`Tls13RequiredForQuic`, rustls `src/server/hs.rs:369-385`).
 - `TlsInfo` returns ringline enums, `TlsVersion` and `CipherSuite`, both
   `#[non_exhaustive]`.
 - A benchmark client that skips certificate verification uses
@@ -261,7 +269,8 @@ let client = TlsClientConfig::builder()
     where TCP uses `h2` or `http/1.1`. ALPN stays optional, as it is in
     quinn-proto. Most of the QUIC and H3 tests set none.
   - `QuicConfig::server` and `QuicConfig::client` become fallible: quinn-proto
-    refuses a rustls config without TLS 1.3 (`NoInitialCipherSuite`).
+    refuses a rustls config without TLS 1.3 (`NoInitialCipherSuite`), which
+    a config built with `.versions(&[TlsVersion::Tls12])` is.
   - Transport and endpoint settings get `QuicConfig` builder methods, as
     `send_queue_capacity` and `allow_mtud` already are. The in-tree tests need
     `max_idle_timeout`, `initial_mtu`, server `migration` (`peer.rs:1509`) and
@@ -603,3 +612,5 @@ Owner, 2026-10-27:
    The alternatives were for ringline-quic to depend on ringline, which brings
    the whole runtime into the protocol-only crate, or to duplicate the
    builders in ringline-quic, which gives TCP and QUIC different config types.
+8. TLS 1.2 is enabled by default on TCP, because it is still common on the
+   servers ringline's clients connect to.
