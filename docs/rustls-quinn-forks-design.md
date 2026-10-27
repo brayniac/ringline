@@ -34,8 +34,8 @@ copy-count test (see "Testing").
 
 | Direction | Copy 1 | Copy 2 | Bytes copied per plaintext byte, inside rustls |
 |---|---|---|---|
-| Send | `PrefixedPayload` (`crypto/ring/tls13.rs:210,214`) | record into the pool slot (`common_state.rs:718`) | 2.021 at 1 KiB, 2.001 at 16 KiB |
-| Receive | `into_vec` after in-place decrypt (`common_state.rs:557`, `msgs/base.rs:43`) | ringline's accumulator append (`unbuffered/mod.rs:436`) | 1.000 |
+| Send | `PrefixedPayload` (`src/crypto/ring/tls13.rs:210,214`) | record into the pool slot (`src/common_state.rs:718`) | 2.021 at 1 KiB, 2.001 at 16 KiB |
+| Receive | `into_vec` after in-place decrypt (`src/common_state.rs:557`, `src/msgs/base.rs:43`) | ringline's accumulator append (`unbuffered/mod.rs:436`) | 1.000 |
 
 Removing either rustls copy needs a change inside rustls.
 
@@ -160,7 +160,8 @@ the fork keeps.
   merges upstream 0.23.47. crates.io refuses a version that differs from a
   published one only in build metadata, so `0.23.46+ringline.2` cannot follow
   `0.23.46+ringline.1`.
-- Each release's notes name the upstream tag it contains.
+- Each release's notes contain a line `Upstream: <tag>` naming the upstream
+  tag it contains, which the quinn fork's update workflow parses.
 
 ### Unchanged
 
@@ -248,12 +249,12 @@ TCP, step 1:
   another crate in the build enables the feature.
 - A TLS 1.2 connection that sends 2^24 records with an AES-GCM suite is
   closed, because TLS 1.2 cannot rekey. ring's suites set
-  `confidentiality_limit` to `1 << 24` (rustls `crypto/ring/tls12.rs:53-95`),
-  rustls then sends close_notify and returns `EncryptExhausted`
-  (`common_state.rs:286-297`), and ringline treats that as fatal
-  (`ringline/src/tls/unbuffered/mod.rs:850-854`). At 100,000 records per
-  second that is about 168 s. The documentation of the version setting says
-  so.
+  `confidentiality_limit` to `1 << 24` (rustls
+  `src/crypto/ring/tls12.rs:53-95`), rustls then sends close_notify and
+  returns `EncryptExhausted` (`src/common_state.rs:286-297`), and ringline
+  treats that as fatal (`ringline/src/tls/unbuffered/mod.rs:850-854`). At
+  100,000 records per second that is about 168 s. The documentation of the
+  version setting says so.
 - `TlsInfo` returns `ringline-tls-config` enums (`TlsVersion`,
   `CipherSuite`) for the version and cipher suite, both `#[non_exhaustive]`.
   A caller can still get the IANA code of a suite the enum does not name,
@@ -293,7 +294,7 @@ QUIC, step 2:
   - rustls's `supports_version` is `pub(crate)`. A throwaway
     `rustls::quic::ServerConnection::new` or `ClientConnection::new` (rustls
     `src/quic.rs:266,163`) returns the error. The client constructor starts
-    the handshake (`client/hs.rs:1120`) and takes a stored session ticket
+    the handshake (`src/client/hs.rs:1120`) and takes a stored session ticket
     for the server name it is given, so the trial uses a placeholder name.
   - A provider whose only TLS 1.3 suite is ChaCha20 passes that trial and
     fails quinn-proto's `try_from` (`NoInitialCipherSuite`), so both run.
@@ -322,13 +323,19 @@ QUIC, step 2:
     `take_tls13_ticket` takes the newest (`src/client/handy.rs:189-197`).
     TCP and QUIC connections to one host would then take each other's
     tickets, and a QUIC connection holding a TCP ticket sends no 0-RTT.
-  - For a config built by the builders, ringline-quic gives the QUIC clone
-    its own client resumption store. A config from `from_rustls` keeps the
-    `resumption` the caller set, because rustls exposes no way to read it. A
-    caller that shares one such config between TCP and QUIC gives each its
-    own store. The `QuicConfig` documentation says so.
-  - One QUIC store per `TlsClientConfig`, created once and shared by every
-    `QuicConfig` built from it and by their clones.
+  - For a config built by the builders, ringline-quic gives its QUIC clones
+    a client resumption store separate from TCP's. There is one such store
+    per `TlsClientConfig`; every `QuicConfig` built from it, and every clone
+    of those, shares it.
+  - A config from `from_rustls` keeps the caller's `resumption`.
+    `Resumption`'s store and TLS 1.2 setting are private (rustls
+    `src/client/client_conn.rs:478-487`), so ringline-quic cannot tell
+    rustls's default store from a disabled or custom one, and replacing it
+    could turn on resumption the caller turned off.
+  - Such a config shares one store between TCP and QUIC. A caller who wants
+    them kept apart passes two rustls configs, each with its own
+    `Resumption`, to two `from_rustls` calls. The `QuicConfig` documentation
+    says so.
 - A caller can set the ALPN list for QUIC separately: HTTP/3 uses `h3`
   where TCP uses `h2` or `http/1.1`. ALPN stays optional, as it is in
   quinn-proto. Most of the QUIC and H3 tests set none.
@@ -379,6 +386,11 @@ QUIC, step 2:
   `TlsClientConfig::rustls_config`. It also provides conversions from
   rustls's `ProtocolVersion` and `SupportedCipherSuite` to its enums. These
   name rustls types, so they are part of the escape hatches below.
+- A `TlsClientConfig` built by the builders also holds the QUIC client
+  resumption store, created when it is built and shared by its clones.
+  ringline-quic reads it through an accessor that returns `None` for a
+  `from_rustls` config. The accessor names rustls's `Resumption`, so it is
+  part of the escape hatches.
 - It starts at 0.1.0 and has its own version, like the other satellite crates.
 - Because ringline-quic builds quinn-proto configs from it, its rustls and
   quinn-proto's rustls must be the same crate. It moves from upstream rustls
@@ -406,7 +418,9 @@ QUIC, step 2:
   Each such release takes a new `ringline-tls-config` minor version. The
   CHANGELOG entry for it names the upstream versions and the ringline
   patches.
-- Every other item follows the semver of the crate that defines it.
+- Every other item changes only in a breaking release of the crate that
+  defines it. A fork minor release changes the escape hatches only, though
+  the crates' minor versions move with it.
 
 Crates that implement upstream rustls traits do not plug into the fork.
 Examples are `rustls-platform-verifier`, alternative crypto providers, and a
@@ -465,7 +479,9 @@ A scheduled workflow on each fork's default branch runs daily:
    - It runs the fork's tests.
 3. It opens a pull request naming the upstream release and any advisories it
    fixes. If any other file conflicts, it opens an issue naming those files
-   instead.
+   instead. If the quinn root `rustls` line needs a `ringline-tls` release
+   that does not exist yet, it opens an issue instead. It opens no second
+   issue for an upstream release that already has one open.
 4. If the advisory check (see "Security process") reports an advisory against
    the last merged release, the workflow runs at once, and the pull request is
    labelled as a security fix.
@@ -589,9 +605,9 @@ For the default unbuffered engine on io_uring, on a TLS 1.3 connection:
 | After 3 (aws-lc-rs) | AEAD only | AEAD only |
 
 - A TLS 1.2 connection keeps 2 send copies after patch 1 unless the TLS 1.2
-  GCM and ChaCha20 encrypters also override `encrypt_into`; they also build a
-  `PrefixedPayload` (rustls `crypto/ring/tls12.rs:291,372`). Patch 2 applies
-  to both versions. Patch 3 as written is TLS 1.3 only.
+  GCM and ChaCha20 encrypters also override `encrypt_into`; they also build
+  a `PrefixedPayload` (rustls `src/crypto/ring/tls12.rs:291,372`). Patch 2
+  applies to both versions. Patch 3 as written is TLS 1.3 only.
 - On mio, receive has one more copy: `unbuffered::feed` appends the
   ciphertext into `CiphertextBuf` (`unbuffered/mod.rs:586-603`).
 - The `tls-buffered` engine receives through `reader()`, which patch 2 does
@@ -616,7 +632,7 @@ Each step is a separate pull request in the repository it changes.
      builds: `ringline/src/tls/mod.rs:286-291`,
      `ringline/src/tls/buffered.rs:772-777`, and
      `docs/tls-premutation-bound-design.md:42-45` and `:205`.
-   - `docs/ktls-design.md:251` (P-15) and `:532` (work item 1) say ringline
+   - `docs/ktls-design.md:251` (P-15) and `:532` (prerequisite 1) say ringline
      never builds a rustls config. After step 1 the builders do, and a kTLS
      path sets `enable_secret_extraction` in them; a `from_rustls` config
      still needs the caller to set it. Update both rows.
