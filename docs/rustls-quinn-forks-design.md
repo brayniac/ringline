@@ -255,11 +255,11 @@ TCP, step 1:
   second that is about 168 s. The documentation of the version setting says
   so.
 - `TlsInfo` returns `ringline-tls-config` enums (`TlsVersion`,
-  `CipherSuite`) for the version and cipher suite, both
-  `#[non_exhaustive]`. A caller can still get the IANA code of a suite the
-  enum does not name, such as one from the provider of a `from_rustls`
-  config (see "Escape hatches").
-  The in-tree callers (`tls_echo.rs:612,616`) only check for `Some`.
+  `CipherSuite`) for the version and cipher suite, both `#[non_exhaustive]`.
+  A caller can still get the IANA code of a suite the enum does not name,
+  such as one from the provider of a `from_rustls` config (see "Escape
+  hatches"). The in-tree callers (`tls_echo.rs:612,616`) only check for
+  `Some`.
 - ringline keeps exporting `TlsConfig` and `TlsClientConfig` at today's
   paths, `ringline::TlsConfig`, `ringline::TlsClientConfig`
   (`ringline/src/lib.rs:484-486`) and the same names under
@@ -318,11 +318,17 @@ QUIC, step 2:
     which rustls holds behind `Arc`s. `peer.rs:1323-1342` needs two servers
     that cannot resume each other's sessions, so it needs two `TlsConfig`s.
   - On the client, the clone would share the resumption store. rustls keys
-    tickets by server name only (`client/hs.rs:1117-1120`), and
-    `take_tls13_ticket` takes the newest (`client/handy.rs:189-197`). TCP
-    and QUIC connections to one host would then take each other's tickets,
-    and a QUIC connection holding a TCP ticket sends no 0-RTT. ringline-quic
-    gives the QUIC clone its own client resumption store.
+    tickets by server name only (rustls `src/client/hs.rs:1117-1120`), and
+    `take_tls13_ticket` takes the newest (`src/client/handy.rs:189-197`).
+    TCP and QUIC connections to one host would then take each other's
+    tickets, and a QUIC connection holding a TCP ticket sends no 0-RTT.
+  - For a config built by the builders, ringline-quic gives the QUIC clone
+    its own client resumption store. A config from `from_rustls` keeps the
+    `resumption` the caller set, because rustls exposes no way to read it. A
+    caller that shares one such config between TCP and QUIC gives each its
+    own store. The `QuicConfig` documentation says so.
+  - One QUIC store per `TlsClientConfig`, created once and shared by every
+    `QuicConfig` built from it and by their clones.
 - A caller can set the ALPN list for QUIC separately: HTTP/3 uses `h3`
   where TCP uses `h2` or `http/1.1`. ALPN stays optional, as it is in
   quinn-proto. Most of the QUIC and H3 tests set none.
@@ -354,10 +360,9 @@ QUIC, step 2:
   `CipherSuite` enums. `TlsInfo` stays in ringline.
 - Its dependencies are rustls (upstream 0.23.46 until step 5, then
   `ringline-tls`), `rustls-pki-types`, and, until step 5, `rustls-webpki`
-  for its floor.
-  It has no dependency on the `ringline` crate, so ringline-quic, which
-  depends on it, stays protocol-only. ringline-quic has `ringline` only as a
-  dev-dependency today.
+  for its floor. It has no dependency on the `ringline` crate, so
+  ringline-quic, which depends on it, stays protocol-only. ringline-quic has
+  `ringline` only as a dev-dependency today.
 - ringline and ringline-quic both depend on it and re-export its types.
 - A caller can pass one config value to both only if ringline and
   ringline-quic resolve the same `ringline-tls-config` version. Under 0.x,
@@ -401,7 +406,7 @@ QUIC, step 2:
   Each such release takes a new `ringline-tls-config` minor version. The
   CHANGELOG entry for it names the upstream versions and the ringline
   patches.
-- Every other item follows ringline's semver.
+- Every other item follows the semver of the crate that defines it.
 
 Crates that implement upstream rustls traits do not plug into the fork.
 Examples are `rustls-platform-verifier`, alternative crypto providers, and a
@@ -425,7 +430,9 @@ upstream's traits does not port.
     raises its rustls requirement. It resolves by keeping the fork's
     package name, with the higher of the fork's current `ringline-tls`
     requirement and the lowest `ringline-tls` release that contains the
-    rustls version upstream now requires.
+    rustls version upstream now requires. The workflow reads that mapping
+    from the rustls fork's release notes (see "Versions"). If no such
+    release exists yet, it opens an issue instead of a pull request.
   - In the rustls fork, rustls takes webpki from the repository's root
     `[workspace.dependencies]` (`webpki = { workspace = true }`, rustls
     `Cargo.toml.orig:46`). Step 3 raises that line to 0.103.16, so it
@@ -609,9 +616,10 @@ Each step is a separate pull request in the repository it changes.
      builds: `ringline/src/tls/mod.rs:286-291`,
      `ringline/src/tls/buffered.rs:772-777`, and
      `docs/tls-premutation-bound-design.md:42-45` and `:205`.
-   - `docs/ktls-design.md:251` (P-15) says ringline never builds a rustls
-     config. After step 1 the builders do, and a kTLS path sets
-     `enable_secret_extraction` in them. Update that row.
+   - `docs/ktls-design.md:251` (P-15) and `:532` (work item 1) say ringline
+     never builds a rustls config. After step 1 the builders do, and a kTLS
+     path sets `enable_secret_extraction` in them; a `from_rustls` config
+     still needs the caller to set it. Update both rows.
    - Add `publish_if_needed ringline-tls-config` to
      `.github/workflows/release.yml` ahead of `ringline`, which publishes
      first today.
