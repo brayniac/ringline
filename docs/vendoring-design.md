@@ -1,10 +1,10 @@
 # Vendoring rustls and quinn-proto
 
 Status: proposal (2026-10-27). Nothing here is built. The owner decided on
-2026-10-26 to vendor rustls into a `ringline-tls` crate and quinn-proto into
-ringline's QUIC crates, so that ringline can change the TLS record layer and
-the QUIC packet path itself. This document says how, what it costs, and which
-decisions are still open.
+2026-10-26 to vendor rustls and quinn-proto, so that ringline can change the
+TLS record layer and the QUIC packet path itself, and on 2026-10-27 that each
+lives in its own repository under `ringline-rs` as a maintained fork of
+upstream. This document says how, and what it costs.
 
 Related: `docs/ktls-design.md`, `docs/tls-unbuffered-design.md`,
 `docs/syscalls-and-copies.md`.
@@ -49,17 +49,42 @@ which the vendored copy keeps.
 
 ## Layout
 
-### `ringline-tls`: the vendored rustls
+### The forks
 
-- A published workspace crate whose contents are upstream's `rustls/`
-  directory at a release tag. The package is renamed to `ringline-tls` and the
-  library to `ringline_tls`.
-- Its public API is rustls's API. It is not ringline's stable API (see
-  "Public API").
-- rustls refers to its own items through 977 `crate::` paths in 98 files.
-  Those paths resolve only at a crate root. That is why the vendored code is a
-  crate of its own and not a module of `ringline`.
-- Its dependencies stay external crates:
+| Repository | Fork of | Published crate | Library name | Used by |
+|---|---|---|---|---|
+| `ringline-rs/rustls` | `rustls/rustls` | `ringline-tls` | `rustls` | ringline, `ringline-quic-proto` |
+| `ringline-rs/quinn` | `quinn-rs/quinn` | `ringline-quic-proto` | `quinn_proto` | `ringline-quic` |
+
+- Each is a GitHub fork. It keeps upstream's history and can open pull
+  requests against upstream directly.
+- ringline's code lives on one branch per upstream line: `ringline/0.23` in
+  the rustls fork and `ringline/0.11` in the quinn fork.
+  - The branch starts at upstream's release tag.
+  - The first commit on it renames the package.
+  - Each further commit is one ringline patch.
+  - `git diff <upstream tag> ringline/0.23` is always exactly ringline's
+    changes.
+- Only the package is renamed, not the library: `ringline-tls` builds a
+  library still called `rustls`.
+  - upstream's tests, examples, fuzz targets and BoGo runner build unchanged.
+    The fork's other workspace members point at it with
+    `rustls = { package = "ringline-tls", path = ... }`.
+  - A crate that depends on both `ringline-tls` and upstream `rustls` must
+    rename one of the two dependency keys. Without the rename, rustc stops
+    with `E0464` (multiple candidates for `rustls`). This was checked with
+    two toy packages, and renaming one key, for example
+    `upstream_rustls = { package = "rustls", ... }`, builds.
+  - ringline's own tests are such a crate, because they keep upstream rustls
+    as the peer.
+  - Callers who go through ringline's re-export never see the clash.
+- The vendored quinn-proto depends on `rustls = { package = "ringline-tls" }`.
+  Its `rustls::` paths stay as they are, and a binary has one TLS stack for
+  TCP and QUIC.
+- ringline enables only quinn-proto's `rustls-ring` feature, with default
+  features off (workspace `Cargo.toml:63`). The fork keeps
+  `rustls-platform-verifier`, `aws-lc-rs`, `qlog` and `arbitrary` optional.
+- Dependencies that stay upstream crates:
   - `rustls-pki-types`. Callers load certificates and keys with it, so
     certificate loading keeps working with the rest of the ecosystem.
   - `rustls-webpki`, for certificate path validation. No change is planned.
@@ -68,24 +93,18 @@ which the vendored copy keeps.
   Advisories against these keep reaching users through `cargo audit` as they
   do today.
 
-### quinn-proto
+### Versions
 
-- The owner asked for quinn-proto inside the QUIC library. The vendored code
-  has the same constraint as rustls: 131 `crate::` paths in 46 files.
-- Two ways to do it:
-  - A separate crate, `ringline-quic-proto`. The upstream tree is unchanged
-    apart from the rename.
-  - A module of `ringline-quic`. Every `crate::` path is rewritten to
-    `crate::proto::` on every import, and the diff against upstream always
-    contains those rewrites.
-- Decided: the separate crate (see "Decisions"). Its diff against upstream
-  then shows only ringline's patches.
-- The vendored quinn-proto's `crypto::rustls` module depends on
-  `ringline-tls`. A binary then has one TLS stack for TCP and QUIC.
-- ringline enables only quinn-proto's `rustls-ring` feature, with default
-  features off (workspace `Cargo.toml:63`). The vendored copy keeps
-  `rustls-platform-verifier`, `aws-lc-rs`, `qlog` and `arbitrary` optional,
-  or drops them.
+- The forks have their own version numbers. `ringline-tls` 0.1.x is based on
+  rustls 0.23.x, and `ringline-quic-proto` 0.1.x on quinn-proto 0.11.x.
+- A merge of a newer upstream patch release, or a ringline patch that adds
+  API, is a 0.1.x patch release.
+- Moving to rustls 0.24 is `ringline-tls` 0.2.0.
+- Reusing upstream's numbers would not work. A ringline-only fix released
+  as 0.23.47 would collide with upstream's 0.23.47. crates.io refuses
+  a version that differs from a published one only in build metadata
+  (`0.23.46+ringline.1`).
+- Each release's notes name the upstream tag it contains.
 
 ### Unchanged
 
@@ -94,7 +113,9 @@ which the vendored copy keeps.
   upstream's code on purpose.
 - ringline's TLS tests keep upstream rustls as the peer. For example,
   `ringline/tests/tls_echo.rs` drives `rustls::ClientConnection` over a std
-  socket. Every such test then checks the vendored code against upstream's.
+  socket. Every such test then checks the fork against upstream.
+- quinn-proto stays the protocol crate with no I/O under `ringline-quic`, the
+  same split as `resp-proto` under `ringline-redis`.
 
 ## Public API
 
@@ -159,7 +180,7 @@ let client = ringline::TlsClientConfig::builder()
 - These cover custom certificate verifiers, certificate resolvers, crypto
   providers, and anything the builders do not offer yet.
 - Code that uses them follows the vendored code. A ringline release that
-  rebases or patches the vendored code may break it. The CHANGELOG entry for
+  updates or patches a fork may break it. The CHANGELOG entry for
   such a release names the upstream versions and the local patches.
 - Every other item follows ringline's semver.
 
@@ -169,49 +190,38 @@ providers, and a caller's own verifier. A caller's verifier ports with a change
 of import path; the trait shapes are the same. A third-party crate that
 implements upstream's traits does not port at all.
 
-## Importing and tracking upstream
+## Tracking upstream
 
-- Import from upstream's git release tag, not from crates.io. The rustls
-  crates.io package excludes `tests/**` and `src/testdata`. The quinn-proto
-  package includes its tests (`src/tests`).
-- Each vendored crate has an `UPSTREAM` file. It records the repository, tag,
-  commit and the list of local patches, one line each with its commit.
-- A script, `tools/vendor/import.sh <crate> <tag>`, writes the upstream tree
-  into the crate directory, applies the rename (package, library, and an
-  `extern crate ringline_tls as rustls;` alias in each test root so
-  upstream's tests compile unchanged), and commits that alone as
-  `vendor: import rustls <tag> (<commit>)`. Each local patch is a separate
-  commit on top.
-- `git diff <import commit> HEAD -- ringline-tls/` is therefore always exactly
-  the local patches.
-- Moving to a new upstream release means running the import for the new tag
-  on a branch and reapplying the patch commits. A patch that upstream has
-  taken is dropped at this step.
-- Patches that are general go upstream as well. Each accepted one makes the
-  next import smaller.
+- A new upstream release on the same line is merged into the ringline branch,
+  for example tag 0.23.47 into `ringline/0.23`.
+  - It is a merge, not a rebase, so the branch is never force-pushed and every
+    update goes through a pull request.
+  - The diff against the newest merged tag still shows only ringline's
+    changes.
+- When the release that contains a patch upstream has taken is merged, the
+  merge resolves to upstream's version and the patch leaves the diff.
+- General patches are also offered upstream, as pull requests from the fork.
+  Each one upstream accepts shrinks the diff.
 
 ### Automated updates
 
-A scheduled job, daily, does the following for each vendored crate:
+A scheduled workflow in each fork runs daily:
 
-1. It looks for an upstream release on the same line newer than the
-   recorded base, using upstream's git tags.
-   - The lines are 0.23.x for rustls and 0.11.x for quinn-proto.
+1. It fetches upstream's tags and looks for a release on the branch's line
+   newer than the last one merged.
    - It does not cross to a new line. 0.24 is a decision, not an update.
-2. If it finds one, it moves the patches onto the new release on a branch:
-   - the import script in this workspace, or
-   - a `git rebase` in a fork repository.
-3. It runs the crate's tests and ringline's TLS or QUIC tests.
-4. It opens a pull request that names the upstream release and its
-   advisories, if any. If the patches do not apply, it opens an issue
-   instead and names the conflicting patch.
-5. If the advisory check (below) reports an advisory against the current
-   base, the same job runs at once, and the pull request is marked as a
-   security fix.
+2. If it finds one, it merges the tag into a new branch off `ringline/0.23`
+   and runs the fork's tests.
+3. It opens a pull request naming the upstream release and any advisories it
+   fixes. If the merge conflicts, it opens an issue naming the conflicting
+   files instead.
+4. If the advisory check (see "Security process") reports an advisory against
+   the last merged release, the workflow runs at once, and the pull request is
+   labelled as a security fix.
 
-The pull request is reviewed and merged like any other. After it merges, a
-`ringline-tls` (or `ringline-quic-proto`) patch release goes out, and
-ringline's lockfile moves to it in a separate pull request.
+The pull request is reviewed and merged like any other, then the fork
+releases a patch version. A pull request in ringline then moves `Cargo.lock`
+to it; Dependabot or the same workflow opens it.
 
 ## Security process
 
@@ -226,19 +236,20 @@ Eight are against quinn-proto, fixed by 0.11.19:
 - RUSTSEC-2026-0338 to 0343
 - two GHSA
 
-Vendoring makes ringline responsible for shipping each of these.
+With the forks, ringline is responsible for shipping each of these.
 
 - **Detection.** `cargo audit` matches advisories by crate name, so it does not
   see `ringline-tls`.
-  - A CI step writes a lockfile listing `rustls` and `quinn-proto` at the
-    versions in the `UPSTREAM` files, and runs `cargo audit` against that file.
-    It runs daily, next to the existing audit job (`ci.yml:120-131`).
-  - An advisory against an imported version fails the job.
+  - A daily job in each fork writes a lockfile listing `rustls` (or
+    `quinn-proto`) at the last merged upstream release, and runs `cargo audit`
+    against that file.
+  - An advisory against that version fails the job and starts the update
+    workflow.
   - I have not checked cargo-audit's option for auditing a lockfile at a given
     path; it needs confirming before this step is written.
 - **Fix.**
-  - Import the fixed upstream release, reapply the patches, and release
-    `ringline-tls` as a semver-compatible patch version.
+  - Merge the fixed upstream release and release the fork as a
+    semver-compatible patch version.
   - `cargo update` then picks up the fix without a ringline release.
 - **Notice.** File a RustSec advisory against the affected `ringline-tls`
   versions, citing the upstream advisory, so downstream `cargo audit` runs
@@ -246,16 +257,15 @@ Vendoring makes ringline responsible for shipping each of these.
 
 ## Testing
 
-- CI runs the vendored crates' own tests: rustls's `tests/` and quinn-proto's
-  `src/tests`.
-- ringline's TLS tests run against an upstream rustls peer (see "Layout").
+- The fork's CI runs upstream's test suites on the ringline branch. That
+  covers rustls's `tests/` and quinn-proto's `src/tests`.
 - A patch to the record layer also passes rustls's fuzz targets and its BoGo
-  runner (the BoringSSL protocol test suite) before release. Both live in the
-  upstream repository outside `rustls/`, and the import script brings them in
-  too.
-- A copy-count test asserts bytes copied per plaintext byte for send and
-  receive. It is built from the measurement program the TLS5 evaluation used.
-  It fails if a rebase brings a copy back.
+  runner (the BoringSSL protocol test suite) before release. Both come with
+  the fork.
+- ringline's TLS tests run against an upstream rustls peer (see "Unchanged").
+- A copy-count test in the fork asserts bytes copied per plaintext byte for
+  send and receive. It is built from the measurement program the TLS5
+  evaluation used, and fails if a merge brings a copy back.
 
 ## First patches
 
@@ -297,16 +307,19 @@ operation at 64 B, 4 KiB and 64 KiB values.
 
 ## Sequence
 
-Each step is a separate PR.
+Each step is a separate pull request in the repository it changes.
 
 1. ringline's stable TLS configuration, still over upstream rustls 0.23.46.
    It changes `TlsConfig::new`, `TlsClientConfig::new` and `TlsInfo`, so it
    lands before 0.7.0. Callers port once.
-2. Import rustls 0.23.46 as `ringline-tls`, switch ringline to it, add the
-   advisory check. The diff against upstream is the rename only, with no
-   behaviour change.
+2. Fork rustls as `ringline-rs/rustls`.
+   - Branch `ringline/0.23` from the 0.23.46 tag and rename the package.
+   - Add the advisory check and the update workflow.
+   - Publish `ringline-tls` 0.1.0 and switch ringline to it.
+   - The diff against upstream is the rename only, with no behaviour change.
 3. rustls patches 1 and 2, each measured.
-4. Import quinn-proto 0.11.19 against `ringline-tls`, and move
+4. Fork quinn as `ringline-rs/quinn`, with `ringline-quic-proto` 0.1.0
+   based on quinn-proto 0.11.19 and using `ringline-tls`. Then move
    ringline-quic's configuration to the stable types. This changes
    ringline-quic's public API, so it also belongs before 0.7.0 if 0.7.0 is to
    be the last break.
@@ -317,9 +330,12 @@ re-exports. Goal 2 is what makes that possible.
 
 ## Costs
 
-- **Size.** 49,208 lines of rustls source and 31,209 of quinn-proto, plus
-  their tests, move into the repository. These are counts of `src/*.rs` in the
-  crates.io packages.
+- **Two more repositories.** ringline maintains 49,208 lines of rustls source
+  and 31,209 of quinn-proto, plus their tests. These are counts of `src/*.rs`
+  in the crates.io packages.
+- **Changes across repositories.** A ringline change that needs a fork patch
+  takes a pull request in the fork, a fork release, and then the ringline pull
+  request. Protocol changes to `resp-proto` already work this way.
 - **Upstream releases.** Every upstream security release becomes a ringline
   release (see "Security process").
 - **Duplicate rustls.** A binary that also uses upstream rustls, through
@@ -334,35 +350,14 @@ re-exports. Goal 2 is what makes that possible.
 
 Owner, 2026-10-27:
 
-1. quinn-proto is a separate crate, `ringline-quic-proto`. It is the
-   sans-IO protocol crate under `ringline-quic`, the same split as
-   `resp-proto` under `ringline-redis`.
+1. quinn-proto is a separate crate, `ringline-quic-proto`, not a module of
+   `ringline-quic`. As a module, its 131 `crate::` paths (in 46 files) would
+   have to be rewritten on every update.
 2. The rustls base is the released 0.23.46, with ringline's patches. Moving
-   to 0.24 waits for its release.
+   to 0.24 waits for its release. Updates within the line are automated (see
+   "Automated updates").
 3. The crypto provider stays ring until patches 1 and 2 are measured.
 4. The escape hatches stay. ringline's builders are the configuration API
    users are expected to use; the re-exports cover everything else.
-
-## Open decisions
-
-1. **Where the vendored crates live.**
-   - In this workspace, with the import script, or in their own
-     repositories under `ringline-rs`, the way `resp-proto` lives in
-     `ringline-rs/resp-proto`.
-   - Own repositories:
-     - They are GitHub forks, so they keep upstream's history.
-     - Moving to a new upstream release is a `git rebase` of the patch
-       branch onto the new tag.
-     - Upstream pull requests come straight from the fork.
-     - Upstream's CI, fuzz targets and BoGo runner come with the
-       repository.
-     - A change that needs a rustls patch takes two pull requests and a
-       `ringline-tls` release before ringline can depend on it, as protocol
-       changes to `resp-proto` already do.
-   - This workspace:
-     - A record-layer patch and the ringline change that uses it land in one
-       pull request.
-     - The repository grows by about 80,000 lines.
-     - Upstream history is reduced to one import commit per release.
-   - Recommendation: own repositories. They match the `resp-proto` pattern
-     and make the automated updates below a rebase.
+5. The forks live in their own repositories under `ringline-rs` (see
+   "Layout"), like `resp-proto`.
