@@ -218,8 +218,10 @@ TCP, step 1:
 - The builders cover what the 11 in-tree callers of `TlsConfig::new` and
   `TlsClientConfig::new` do: a certificate chain and key, a root store, ALPN,
   and the `webpki_roots::TLS_SERVER_ROOTS` trust anchors
-  (`&[TrustAnchor<'static>]`). Benchmark clients also need a client that
-  skips certificate verification.
+  (`&[TrustAnchor<'static>]`). No in-tree ringline client skips certificate
+  verification; `ringline-bench/src/bin/connect-bench.rs:71-124` does so on
+  a std rustls client. A client that skips it uses a custom verifier
+  through `from_rustls` (see "Escape hatches").
 
   | Callers | Files |
   |---|---|
@@ -227,12 +229,12 @@ TCP, step 1:
   | HTTP stack | `ringline-http/examples/http_get.rs`, `ringline-http/tests/public_servers.rs`, `ringline-h2/tests/round_trip.rs`, `ringline-grpc/tests/round_trip.rs` |
   | Benchmarks | `ringline-bench/src/bin/server.rs`, `ringline-benchmarks/src/protocols/http2.rs` |
 
-- Both builders set `max_fragment_size`. ringline's slot check reads it
+- Both builders can set `max_fragment_size`. ringline's slot check reads it
   (`ringline/src/config.rs:497-516`), and ringline's unit tests set it on
   both configs (`config.rs:1382,1488`). The slot-check error message
   (`config.rs:515`) changes to name the builder method.
 - Build errors are `#[non_exhaustive]` enums that hold no rustls type, so
-  they follow ringline's semver.
+  they follow `ringline-tls-config`'s semver.
 - The builders select the ring provider explicitly.
   `ServerConfig::builder()`, `ClientConfig::builder()`,
   `WebPkiClientVerifier::builder` and `WebPkiServerVerifier::builder` panic
@@ -252,9 +254,11 @@ TCP, step 1:
   (`ringline/src/tls/unbuffered/mod.rs:850-854`). At 100,000 records per
   second that is about 168 s. The documentation of the version setting says
   so.
-- `TlsInfo` returns ringline enums for the version and cipher suite, both
+- `TlsInfo` returns `ringline-tls-config` enums (`TlsVersion`,
+  `CipherSuite`) for the version and cipher suite, both
   `#[non_exhaustive]`. A caller can still get the IANA code of a suite the
-  enum does not name, such as one from a `from_rustls` config's provider.
+  enum does not name, such as one from the provider of a `from_rustls`
+  config (see "Escape hatches").
   The in-tree callers (`tls_echo.rs:612,616`) only check for `Some`.
 - ringline keeps exporting `TlsConfig` and `TlsClientConfig` at today's
   paths, `ringline::TlsConfig`, `ringline::TlsClientConfig`
@@ -300,9 +304,12 @@ QUIC, step 2:
   treats early data as an error (`ringline/src/tls/unbuffered/mod.rs:497-502`),
   so the TCP config keeps 0. ringline-quic sets the QUIC values on a clone
   of the rustls config.
-  - The 0-RTT defaults match quinn-proto's `with_single_cert` today: a
-    server accepts 0-RTT (`src/crypto/rustls.rs:487`, relied on at
-    `peer.rs:1065-1066`), and a client sends none unless enabled.
+  - The server default matches quinn-proto's `with_single_cert`: a server
+    accepts 0-RTT (`src/crypto/rustls.rs:487`, relied on at
+    `peer.rs:1065-1066`). The client default matches rustls's,
+    `enable_early_data = false`, which in-tree clients get today through
+    `QuicClientConfig::try_from`. A client can enable it, as
+    `peer.rs:1093,1352` do.
   - That changes one in-tree server. The http3 benchmark server builds its
     config through `QuicServerConfig::try_from` from a plain rustls config
     (`ringline-benchmarks/src/protocols/http3.rs:305-307`), so it does not
@@ -310,6 +317,12 @@ QUIC, step 2:
   - The clone shares the rustls config's session storage and ticketer,
     which rustls holds behind `Arc`s. `peer.rs:1323-1342` needs two servers
     that cannot resume each other's sessions, so it needs two `TlsConfig`s.
+  - On the client, the clone would share the resumption store. rustls keys
+    tickets by server name only (`client/hs.rs:1117-1120`), and
+    `take_tls13_ticket` takes the newest (`client/handy.rs:189-197`). TCP
+    and QUIC connections to one host would then take each other's tickets,
+    and a QUIC connection holding a TCP ticket sends no 0-RTT. ringline-quic
+    gives the QUIC clone its own client resumption store.
 - A caller can set the ALPN list for QUIC separately: HTTP/3 uses `h3`
   where TCP uses `h2` or `http/1.1`. ALPN stays optional, as it is in
   quinn-proto. Most of the QUIC and H3 tests set none.
@@ -340,7 +353,8 @@ QUIC, step 2:
   `TlsConfig`, `TlsClientConfig`, their builders, and the `TlsVersion` and
   `CipherSuite` enums. `TlsInfo` stays in ringline.
 - Its dependencies are rustls (upstream 0.23.46 until step 5, then
-  `ringline-tls`), `rustls-pki-types`, and `rustls-webpki` for its floor.
+  `ringline-tls`), `rustls-pki-types`, and, until step 5, `rustls-webpki`
+  for its floor.
   It has no dependency on the `ringline` crate, so ringline-quic, which
   depends on it, stays protocol-only. ringline-quic has `ringline` only as a
   dev-dependency today.
@@ -409,7 +423,8 @@ upstream's traits does not port.
     `[workspace.dependencies]` (`rustls = { workspace = true }`), so the
     rename to `ringline-tls` is on that line. It conflicts whenever upstream
     raises its rustls requirement. It resolves by keeping the fork's
-    package name, with the lowest `ringline-tls` release that contains the
+    package name, with the higher of the fork's current `ringline-tls`
+    requirement and the lowest `ringline-tls` release that contains the
     rustls version upstream now requires.
   - In the rustls fork, rustls takes webpki from the repository's root
     `[workspace.dependencies]` (`webpki = { workspace = true }`, rustls
@@ -594,6 +609,9 @@ Each step is a separate pull request in the repository it changes.
      builds: `ringline/src/tls/mod.rs:286-291`,
      `ringline/src/tls/buffered.rs:772-777`, and
      `docs/tls-premutation-bound-design.md:42-45` and `:205`.
+   - `docs/ktls-design.md:251` (P-15) says ringline never builds a rustls
+     config. After step 1 the builders do, and a kTLS path sets
+     `enable_secret_extraction` in them. Update that row.
    - Add `publish_if_needed ringline-tls-config` to
      `.github/workflows/release.yml` ahead of `ringline`, which publishes
      first today.
