@@ -257,8 +257,9 @@ pub enum ConnectionError {
     /// The peer does not implement a QUIC version this endpoint supports.
     #[error("peer does not support a QUIC version this endpoint supports")]
     VersionMismatch,
-    /// The connection failed with a QUIC transport error, raised by either
-    /// endpoint, including TLS handshake failures (codes 0x100–0x1ff).
+    /// This endpoint detected a QUIC transport error, including a TLS
+    /// handshake failure (codes 0x100–0x1ff), and closed the connection. A
+    /// transport error the peer detects arrives as `ConnectionClosed`.
     /// `code` is the QUIC transport error code.
     #[error("transport error {code:#x}: {reason}")]
     TransportError {
@@ -430,7 +431,10 @@ stats_struct! {
         datagrams: u64,
         /// Payload bytes.
         bytes: u64,
-        /// System calls (more than one datagram can go in one with GSO or GRO).
+        /// Sent: the transmits quinn-proto produced, one per `OutgoingPacket`,
+        /// each possibly several datagrams. Received: the QUIC packets
+        /// processed, which exceeds `datagrams` when a datagram carries
+        /// coalesced packets. Not a count of system calls.
         ios: u64,
     }
 }
@@ -512,7 +516,7 @@ stats_struct! {
         lost_plpmtud_probes: u64,
         /// Times the path MTU was found to have shrunk.
         black_holes_detected: u64,
-        /// The current path MTU, in bytes.
+        /// The largest UDP payload the path currently supports, in bytes.
         current_mtu: u16,
     }
 }

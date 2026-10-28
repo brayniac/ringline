@@ -241,7 +241,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     store separate from TCP's (`TlsClientConfig::quic_resumption`). rustls
     keys tickets by server name only, so a shared store let TCP and QUIC
     connections to one host take each other's tickets. A `from_rustls`
-    config keeps its own store.
+    config uses its rustls `resumption` for TCP and QUIC alike.
   - `QuicConfig::server`, `client`, `endpoint_config`, `server_config` and
     `client_config` are replaced by the builder and by
     `QuicConfig::from_proto(endpoint, server, client)`, which takes complete

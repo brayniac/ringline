@@ -1919,7 +1919,10 @@ fn poll_send_yields_nothing_until_flush() {
 /// Complete a TLS handshake over memory with the TCP configs, and read the
 /// session tickets the server sends after it, so the client's TCP store
 /// holds tickets for "localhost".
-fn tcp_handshake_in_memory(client: &TlsClientConfig, server: &TlsConfig) {
+fn tcp_handshake_in_memory(
+    client: &TlsClientConfig,
+    server: &TlsConfig,
+) -> Option<ringline_quic::tls_config::rustls::HandshakeKind> {
     use ringline_quic::tls_config::rustls;
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut c = rustls::ClientConnection::new(client.rustls_config().clone(), name).unwrap();
@@ -1942,6 +1945,7 @@ fn tcp_handshake_in_memory(client: &TlsClientConfig, server: &TlsConfig) {
         }
     }
     assert!(!c.is_handshaking(), "the in-memory TCP handshake completed");
+    c.handshake_kind()
 }
 
 /// Connect, let the server's session ticket arrive, and close.
@@ -1997,8 +2001,14 @@ fn quic_session_store_is_shared_and_separate_from_tcp() {
     let mut client_a = QuicEndpoint::new(cfg_a, ca);
     warm_up(&mut client_a, &mut server, ca, sa);
 
-    // Newer tickets for "localhost", in the TCP store.
+    // Newer tickets for "localhost", in the TCP store. The second handshake
+    // resuming shows the first stored a ticket there.
     tcp_handshake_in_memory(&tls_client, &tls_server);
+    assert_eq!(
+        tcp_handshake_in_memory(&tls_client, &tls_server),
+        Some(ringline_quic::tls_config::rustls::HandshakeKind::Resumed),
+        "the TCP store holds tickets for localhost"
+    );
 
     let mut client_b = QuicEndpoint::new(cfg_b, cb);
     let conn = client_b
@@ -2039,6 +2049,7 @@ fn connection_stats_count_both_directions() {
     for _ in 0..8 {
         drain(&mut client, &mut server, ca, sa);
     }
+    assert_eq!((client.send_queue_len(), server.send_queue_len()), (0, 0));
     let c = client.connection_stats(cc).unwrap();
     let s = server.connection_stats(sc).unwrap();
     assert!(c.udp_tx().bytes() > c.udp_rx().bytes(), "{c:?}");
@@ -2054,4 +2065,28 @@ fn connection_stats_count_both_directions() {
     assert_eq!(s.frame_tx().stream(), 0, "{:?}", s.frame_tx());
     assert_eq!(c.frame_rx().stream(), 0, "{:?}", c.frame_rx());
     assert!(c.path().current_mtu() > 0);
+}
+
+/// `connect` on an endpoint with no client config names the missing config.
+#[test]
+fn connect_without_a_client_config_is_refused() {
+    let (certs, key) = self_signed();
+    let mut server = QuicEndpoint::new(
+        server_config(certs, key),
+        "127.0.0.1:52401".parse().unwrap(),
+    );
+    let r = server.connect(
+        common::now(),
+        "127.0.0.1:52402".parse().unwrap(),
+        "localhost",
+    );
+    assert!(
+        matches!(
+            r,
+            Err(ringline_quic::Error::Connect(
+                ringline_quic::ConnectError::NoClientConfig
+            ))
+        ),
+        "{r:?}"
+    );
 }

@@ -759,8 +759,9 @@ impl QuicEndpoint {
     /// On the client side this becomes true immediately after `connect`
     /// if the client was built with
     /// [`QuicConfigBuilder::zero_rtt(true)`](crate::QuicConfigBuilder::zero_rtt)
-    /// and its session store holds a ticket for the server name. On the server side it becomes true if the
-    /// peer's Initial included 0-RTT material we could decrypt.
+    /// and its session store holds a ticket for the server name. On the
+    /// server side it becomes true if the peer's Initial included 0-RTT
+    /// material we could decrypt.
     ///
     /// Once `true`, any data written via `stream_send` /
     /// `stream_send_chunks` / `send_datagram` before the handshake
