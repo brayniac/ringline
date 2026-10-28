@@ -2067,7 +2067,8 @@ fn connection_stats_count_both_directions() {
     assert!(c.path().current_mtu() > 0);
 }
 
-/// `connect` on an endpoint with no client config names the missing config.
+/// `connect` on an endpoint with no client config returns
+/// `Error::Connect(ConnectError::NoClientConfig)`.
 #[test]
 fn connect_without_a_client_config_is_refused() {
     let (certs, key) = self_signed();
