@@ -57,7 +57,9 @@ const MIN_FRAGMENT_SIZE: usize = 32;
 pub enum Error {
     /// [`TlsConfigBuilder::cert`] was not called, or was given an empty
     /// chain.
-    #[error("a server TLS config needs a certificate: call TlsConfigBuilder::cert")]
+    #[error(
+        "a server TLS config needs a certificate: call TlsConfigBuilder::cert with a non-empty chain"
+    )]
     NoCertificate,
     /// [`TlsConfigBuilder::versions`] or [`TlsClientConfigBuilder::versions`]
     /// was given an empty list.
@@ -247,9 +249,9 @@ impl TlsConfigBuilder {
 
     /// The plaintext per TLS record plus 5 (the record header length), in
     /// `32..=16389`. A record then carries at most `size - 5` bytes of
-    /// plaintext and is `size + 17` bytes on the wire with TLS 1.3, `size +
-    /// 24` with a TLS 1.2 GCM suite. Defaults to 16384 bytes of plaintext per
-    /// record.
+    /// plaintext and is at most `size + 17` bytes on the wire with TLS 1.3,
+    /// or `size + 24` with a TLS 1.2 GCM suite. Defaults to 16384 bytes of
+    /// plaintext per record.
     pub fn max_fragment_size(mut self, size: usize) -> Self {
         self.max_fragment_size = Some(size);
         self
@@ -367,9 +369,9 @@ impl TlsClientConfigBuilder {
 
     /// The plaintext per TLS record plus 5 (the record header length), in
     /// `32..=16389`. A record then carries at most `size - 5` bytes of
-    /// plaintext and is `size + 17` bytes on the wire with TLS 1.3, `size +
-    /// 24` with a TLS 1.2 GCM suite. Defaults to 16384 bytes of plaintext per
-    /// record.
+    /// plaintext and is at most `size + 17` bytes on the wire with TLS 1.3,
+    /// or `size + 24` with a TLS 1.2 GCM suite. Defaults to 16384 bytes of
+    /// plaintext per record.
     pub fn max_fragment_size(mut self, size: usize) -> Self {
         self.max_fragment_size = Some(size);
         self
@@ -486,7 +488,18 @@ mod tests {
 
     #[test]
     fn builders_handshake_with_tls13_by_default() {
-        let (server, client) = pair(&default_versions());
+        // No `.versions`: the builders' own defaults must include TLS 1.3.
+        let (chain, key) = self_signed();
+        let server = TlsConfig::builder()
+            .cert(chain.clone(), key)
+            .alpn(&[b"h2", b"http/1.1"])
+            .build()
+            .unwrap();
+        let client = TlsClientConfig::builder()
+            .root_certificates(chain)
+            .alpn(&[b"http/1.1"])
+            .build()
+            .unwrap();
         let c = handshake(&server, &client);
         assert_eq!(
             c.protocol_version().and_then(TlsVersion::from_rustls),

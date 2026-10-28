@@ -23,7 +23,8 @@ let client = TlsClientConfig::builder()
 The builders use rustls's *ring* provider and accept TLS 1.2 and TLS 1.3.
 `TlsConfig::from_rustls` and `TlsClientConfig::from_rustls` wrap a rustls
 configuration for what the builders do not cover, such as client
-certificates or a custom verifier. Those escape hatches follow rustls's
+certificates or a custom verifier. These, the `rustls_config` accessors, the
+enums' `from_rustls` conversions and the `rustls` re-export follow rustls's
 version; the rest of the crate follows its own semver.
 
 The design is in
