@@ -2017,15 +2017,32 @@ fn quic_session_store_is_shared_and_separate_from_tcp() {
 fn connection_stats_count_both_directions() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+    // 32 KiB from the client and nothing from the server, so the client's
+    // sent bytes exceed its received bytes and the server's the reverse.
     let stream = client.open_bi(cc).unwrap().unwrap();
-    client.stream_send(cc, stream, b"stats").unwrap();
+    let payload = vec![0x5au8; 32 * 1024];
+    let mut sent = 0;
+    for _ in 0..64 {
+        if sent == payload.len() {
+            break;
+        }
+        sent += client
+            .stream_send(cc, stream, &payload[sent..])
+            .unwrap_or(0);
+        client.flush(common::now());
+        drain(&mut client, &mut server, ca, sa);
+        let mut buf = vec![0u8; 64 * 1024];
+        let _ = server.stream_recv(common::now(), sc, stream, &mut buf);
+    }
+    assert_eq!(sent, payload.len());
     client.stream_finish(common::now(), cc, stream).unwrap();
     for _ in 0..8 {
         drain(&mut client, &mut server, ca, sa);
     }
     let c = client.connection_stats(cc).unwrap();
     let s = server.connection_stats(sc).unwrap();
-    assert!(c.udp_tx().bytes() > 0 && c.udp_rx().bytes() > 0);
+    assert!(c.udp_tx().bytes() > c.udp_rx().bytes(), "{c:?}");
+    assert!(s.udp_rx().bytes() > s.udp_tx().bytes(), "{s:?}");
     // Every datagram the server sent reached the client's connection. The
     // reverse can differ by the datagrams the server's endpoint handled
     // before the connection existed.

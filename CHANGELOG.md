@@ -223,7 +223,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Breaking:** `ringline-quic`'s public API names no quinn-proto type.
+- **Breaking:** `ringline-quic`'s public API names no quinn-proto type
+  outside `QuicConfig::from_proto` and the `proto` re-export.
   - `QuicConfig::builder()` takes a `TlsConfig` (`server`), a
     `TlsClientConfig` (`client`) or both, the types ringline uses for TCP.
     It sets QUIC's ALPN list (`alpn`), 0-RTT (`zero_rtt`) and the transport
@@ -246,13 +247,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `QuicConfig::from_proto(endpoint, server, client)`, which takes complete
     quinn-proto configs through the new `ringline_quic::proto` re-export.
   - `StreamId`, `VarInt`, `Dir`, `Side`, `ConnectError`,
-    `ConnectionError`, `ReadError`, `ReadableError`, `WriteError` and
-    `ConnectionStats` are ringline-quic types. `Error`, `QuicEvent` and the
-    `QuicEndpoint` stream methods use them. `ConnectionStats` has
-    accessors (`rtt`, `cwnd`, `lost_packets`, `udp_tx_bytes`, ...) in place
-    of quinn-proto's public fields. The `FrameStats`, `PathStats` and
-    `UdpStats` re-exports are removed. `ringline-h3` uses ringline-quic's
+    `ConnectionError`, `ReadError`, `ReadableError`, `WriteError`,
+    `ConnectionStats`, `UdpStats`, `FrameStats` and `PathStats` are
+    ringline-quic types. `Error`, `QuicEvent` and the `QuicEndpoint` stream
+    methods use them. The stats types hold every field of quinn-proto's,
+    read through accessors (`stats.path().rtt()`, `stats.udp_tx().bytes()`)
+    in place of public fields. `ringline-h3` uses ringline-quic's
     `StreamId`.
+  - `QuicEndpoint::close_connection` takes its code as a `VarInt`, as
+    `reset_stream` and `stop_sending` do, in place of a `u32`.
+  - `QuicEndpoint::connect` on an endpoint without a client config returns
+    `Error::Connect(ConnectError::NoClientConfig)`; before, it returned
+    `Error::ConnectionClosed`.
 - **Breaking:** `TlsConfig::new(Arc<rustls::ServerConfig>)` and
   `TlsClientConfig::new(Arc<rustls::ClientConfig>)` are replaced by
   `TlsConfig::builder()` and `TlsClientConfig::builder()`, or by

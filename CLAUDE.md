@@ -133,7 +133,7 @@ This is a Cargo workspace. The core runtime is in `ringline/`; protocol client c
 - **ringline-h2** — Sans-IO HTTP/2 client framing (HPACK, streams), zero runtime deps
 - **ringline-h3** — Sans-IO HTTP/3 framing on `ringline-quic` (QPACK static-table only, control streams)
 - **ringline-tls-config** — `TlsConfig`/`TlsClientConfig` and their builders, the `TlsVersion`/`CipherSuite` enums, and the rustls escape hatch (`from_rustls`, `rustls_config`, the `rustls` re-export). ringline re-exports it as `ringline::tls_config`. Design: `docs/rustls-quinn-forks-design.md`
-- **ringline-quic** — Sans-IO QUIC wrapping `quinn-proto`'s state machine. Its API names no quinn-proto type: `QuicConfig::builder()` takes ringline-tls-config's `TlsConfig`/`TlsClientConfig`, and stream IDs, errors, events and stats are its own types (`types.rs`); `QuicConfig::from_proto` and the `proto` re-export are the escape hatch
+- **ringline-quic** — Sans-IO QUIC wrapping `quinn-proto`'s state machine. Its API names no quinn-proto type: `QuicConfig::builder()` takes ringline-tls-config's `TlsConfig`/`TlsClientConfig`, and stream IDs, errors, events and stats are its own types (stream IDs, errors and stats in `types.rs`); `QuicConfig::from_proto` and the `proto` re-export are the escape hatch
 - **ringline-http** — Async HTTP/1.1 + HTTP/2 client bridging `ringline-h2` to `ConnCtx`
 - **ringline-grpc** — Sans-IO gRPC framing on `ringline-h2` (no protobuf dep; caller serializes)
 - **ringline-bench** / **ringline-benchmarks** — unpublished load-gen tools: `ringline-bench` is the echo/cache server comparison (ringline vs tokio); `ringline-benchmarks` is the multi-protocol harness (tcp/udp/redis/memcache/http1/2/3/quic) with a `force-mio` feature for backend A/B

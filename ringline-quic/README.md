@@ -57,7 +57,8 @@ types follow quinn-proto's version.
 ## Features
 
 - Event-driven API wrapping quinn-proto's sans-IO state machine
-- Stream IDs, errors, events and statistics are ringline-quic types, so the
-  API does not change when the quinn-proto version underneath does
+- Stream IDs, errors, events and statistics are ringline-quic types, so a
+  quinn-proto upgrade changes only `QuicConfig::from_proto` and the `proto`
+  re-export
 - Connection and stream management
 - Integrates with ringline's UDP support (`UdpCtx`)
