@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "ringline",
+    "ringline-tls-config",
     "ringline-redis",
     "ringline-memcache",
     "ringline-quic",
@@ -29,7 +30,8 @@ repository = "https://github.com/ringline-rs/ringline"
 
 [workspace.dependencies]
 # Internal crates
-ringline = { path = "ringline", version = "0.7.0-alpha.22" }
+ringline = { path = "ringline", version = "0.7.0-alpha.23" }
+ringline-tls-config = { path = "ringline-tls-config", version = "0.1.0" }
 ringline-quic = { path = "ringline-quic" }
 ringline-http = { path = "ringline-http" }
 ringline-h2 = { path = "ringline-h2" }
@@ -79,9 +81,10 @@ rustls = { version = "0.23.46", default-features = false }
 # rustls-webpki >= 0.103.16 patches:
 #   RUSTSEC-2026-0382    certificate verification may accept distrusted
 #                        intermediates
-# rustls 0.23.46 requires only ^0.103.14, so ringline and ringline-quic, the
-# published crates that use rustls outside their dev-dependencies, depend on
-# rustls-webpki directly to carry this floor to downstream resolvers.
+# rustls 0.23.46 requires only ^0.103.14, so ringline, ringline-tls-config and
+# ringline-quic, the published crates that use rustls outside their
+# dev-dependencies, depend on rustls-webpki directly to carry this floor to
+# downstream resolvers.
 rustls-webpki = { version = "0.103.16", default-features = false }
 slab = "0.4"
 rcgen = "0.13"

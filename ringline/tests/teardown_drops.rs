@@ -508,10 +508,7 @@ impl AsyncEventHandler for ConnectsInConnection {
 /// A TLS client config whose handshakes never complete against a plain TCP
 /// target, which reads the ClientHello and never answers.
 fn tls_client() -> ringline::TlsClientConfig {
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    ringline::TlsClientConfig::new(std::sync::Arc::new(config))
+    ringline::TlsClientConfig::builder().build().unwrap()
 }
 
 /// A listener with a backlog of 0 whose accept queue is full, so the kernel

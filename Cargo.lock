@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.7.0-alpha.22"
+version = "0.7.0-alpha.23"
 dependencies = [
  "bytes",
  "criterion",
@@ -1656,6 +1656,7 @@ dependencies = [
  "pin-project-lite",
  "proptest",
  "rcgen",
+ "ringline-tls-config",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
@@ -1821,6 +1822,17 @@ dependencies = [
  "ketama",
  "resp-proto",
  "ringline",
+ "thiserror",
+]
+
+[[package]]
+name = "ringline-tls-config"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "thiserror",
 ]
 

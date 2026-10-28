@@ -28,13 +28,12 @@ fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
 fn server_tls_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Arc<rustls::ServerConfig> {
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .unwrap();
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Arc::new(config)
+) -> TlsConfig {
+    TlsConfig::builder()
+        .cert(certs, key)
+        .alpn(&[b"h2"])
+        .build()
+        .unwrap()
 }
 
 fn client_tls_config(certs: &[CertificateDer<'static>]) -> Arc<rustls::ClientConfig> {
@@ -455,7 +454,7 @@ fn h2_request_response() {
     let client_tls = client_tls_config(&certs);
 
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls))
+        .tls(server_tls)
         .build()
         .expect("valid config");
 
@@ -504,7 +503,7 @@ fn h2_request_with_body() {
     let client_tls = client_tls_config(&certs);
 
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls))
+        .tls(server_tls)
         .build()
         .expect("valid config");
 

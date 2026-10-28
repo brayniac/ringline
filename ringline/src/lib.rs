@@ -484,5 +484,10 @@ pub use worker::Runtime;
 pub use config::TlsClientConfig;
 /// Server-side TLS configuration.
 pub use config::TlsConfig;
+/// The TLS configuration crate: the builders, their errors and the rustls
+/// escape hatch, [`tls_config::rustls`].
+pub use ringline_tls_config as tls_config;
+/// TLS protocol versions and cipher suites, as [`TlsInfo`] reports them.
+pub use ringline_tls_config::{CipherSuite, TlsVersion};
 /// TLS session info (protocol version, cipher suite, etc.).
 pub use tls::TlsInfo;

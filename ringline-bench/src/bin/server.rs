@@ -29,17 +29,16 @@ struct ProxyCfg {
 /// Generated per process: the connect-rate benchmark is about handshake cost,
 /// not about key management, and generating here keeps cert material out of
 /// the repo and off the guests.
-fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+fn self_signed_server_config() -> ringline::TlsConfig {
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("generate self-signed cert");
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let chain = vec![CertificateDer::from(cert.cert)];
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key.into())
-        .expect("valid server config");
-    std::sync::Arc::new(config)
+    ringline::TlsConfig::builder()
+        .cert(chain, key.into())
+        .build()
+        .expect("valid server config")
 }
 
 /// Everything the echo arm needs. A struct for the same reason `ProxyCfg` is
@@ -749,7 +748,7 @@ fn run_ringline(cfg: EchoCfg) {
         None => staged,
     };
     let staged = if tls {
-        staged.tls(ringline::TlsConfig::new(self_signed_server_config()))
+        staged.tls(self_signed_server_config())
     } else {
         staged
     };

@@ -772,10 +772,7 @@ pub(crate) mod test_support {
     /// bound budgets 29 bytes of per-record overhead for TLS 1.2 GCM's
     /// explicit nonce plus tag, against TLS 1.3's 22, and a worst case that is
     /// only ever asserted against the cheaper version is not a worst case.
-    /// The library build negotiates TLS 1.3 only (rustls is pulled without
-    /// `tls12`), but `ringline/Cargo.toml` enables `tls12` for
-    /// dev-dependencies and resolver 2 unifies that into every test target —
-    /// so this is reachable here and a downstream crate can unify it in too.
+    /// The builders enable TLS 1.2 by default, so connections reach it.
     pub(crate) fn handshaked_with_versions(
         versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> (BufferedKind, BufferedKind) {

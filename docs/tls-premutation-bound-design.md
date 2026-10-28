@@ -39,12 +39,10 @@ Per record: a 5-byte header plus AEAD expansion. TLS 1.3 adds 17 bytes
 (content-type byte + tag); TLS 1.2 GCM adds 24 (explicit nonce + tag). So
 **22 bytes per record on TLS 1.3, 29 on TLS 1.2 GCM**.
 
-**The bound uses 29.** The library build negotiates only TLS 1.3 — `rustls`
-is pulled without the `tls12` feature — but `ringline/Cargo.toml` enables
-`tls12` for dev-dependencies, and with resolver 2 that unifies for every
-test target. A downstream crate can unify it in too. A bound that is right
-for the library build and wrong under `cargo test` is not a bound. This is
-also why the existing `MAX_RECORD_WIRE_LEN` is the wrong constant to reuse:
+**The bound uses 29.** The `TlsConfig` and `TlsClientConfig` builders
+enable TLS 1.2 next to TLS 1.3 by default (`ringline-tls-config` enables
+rustls's `tls12` feature), so a connection can negotiate a TLS 1.2 GCM
+suite. This is also why the existing `MAX_RECORD_WIRE_LEN` is the wrong constant to reuse:
 it assumes TLS 1.3 and explicitly disclaims correctness dependence.
 
 Fragment size comes from `ClientConfig`/`ServerConfig::max_fragment_size`
@@ -202,7 +200,7 @@ development machine for no reason; PR 8 widens that to `cfg(test)`.
 - **fragment-size override** (`max_fragment_size = Some(2048)`): same, and
   the off-by-five is visible here — a bound that forgot the header
   subtraction under-counts records;
-- TLS 1.2 (`rustls::version::TLS12`, reachable in test builds only): the
+- TLS 1.2 (`rustls::version::TLS12`, enabled by default): the
   29-byte worst case is exercised rather than assumed;
 - the unbuffered slot bound against a slot size that holds several records,
   which is the case the byte formula under-estimates;

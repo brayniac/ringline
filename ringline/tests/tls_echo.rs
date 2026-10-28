@@ -103,6 +103,22 @@ fn server_tls_config(
     Arc::new(config)
 }
 
+/// The server config ringline uses, built with ringline's builder.
+fn ringline_server_tls(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> TlsConfig {
+    TlsConfig::builder().cert(certs, key).build().unwrap()
+}
+
+/// The client config ringline uses, built with ringline's builder.
+fn ringline_client_tls(certs: &[CertificateDer<'static>]) -> ringline::TlsClientConfig {
+    ringline::TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap()
+}
+
 fn client_tls_config(certs: &[CertificateDer<'static>]) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
@@ -153,17 +169,14 @@ fn a_plaintext_and_a_tls_listener_coexist_in_one_process() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     // No process-wide `.tls()`: the TLS listener carries its own config, and
     // the plaintext one must stay plaintext.
     let config = test_config_builder().build().expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
-        .bind_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            TlsConfig::new(server_config),
-        )
+        .bind_tls("127.0.0.1:0".parse().unwrap(), server_config)
         .launch::<TlsEchoHandler>()
         .expect("launch failed");
 
@@ -213,10 +226,10 @@ fn tls_echo_with_external_client() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -334,10 +347,10 @@ fn tls_single_send_larger_than_rustls_buffer() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -389,7 +402,7 @@ fn tls_echo_large_multichunk() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     // The 1 MiB payload needs > 64 in-flight echo chunks at peak (the
     // synchronous client writes the whole payload before reading, so echo
@@ -399,7 +412,7 @@ fn tls_echo_large_multichunk() {
     // silent short echo. Give this test 4× headroom.
     let config = test_config_builder()
         .send_pool(256, 16448)
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -535,11 +548,11 @@ fn tls_outbound_connect_and_echo() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     // Start TLS server.
     let srv_config = test_config_builder()
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
 
@@ -553,9 +566,9 @@ fn tls_outbound_connect_and_echo() {
     TLS_SERVER_ADDR.set(addr.parse().unwrap()).ok();
 
     // Start client-only ringline with TLS client config.
-    let client_tls = client_tls_config(&certs);
+    let client_tls = ringline_client_tls(&certs);
     let cli_config = test_config_builder()
-        .tls_client(ringline::TlsClientConfig::new(client_tls))
+        .tls_client(client_tls)
         .build()
         .expect("valid config");
 
@@ -581,8 +594,8 @@ fn tls_outbound_connect_and_echo() {
 /// Snapshot of TlsInfo fields recorded by the handler on the first recv.
 struct TlsInfoSnapshot {
     is_some: bool,
-    protocol_version_some: bool,
-    cipher_suite_some: bool,
+    protocol_version: Option<ringline::TlsVersion>,
+    cipher_suite: Option<ringline::CipherSuite>,
     alpn_protocol: Option<Vec<u8>>,
     sni_hostname: Option<String>,
 }
@@ -607,14 +620,8 @@ impl AsyncEventHandler for TlsInfoHandler {
                             let info: Option<TlsInfo> = tx.tls_info();
                             let snapshot = TlsInfoSnapshot {
                                 is_some: info.is_some(),
-                                protocol_version_some: info
-                                    .as_ref()
-                                    .and_then(|i| i.protocol_version())
-                                    .is_some(),
-                                cipher_suite_some: info
-                                    .as_ref()
-                                    .and_then(|i| i.cipher_suite())
-                                    .is_some(),
+                                protocol_version: info.as_ref().and_then(|i| i.protocol_version()),
+                                cipher_suite: info.as_ref().and_then(|i| i.cipher_suite()),
                                 alpn_protocol: info
                                     .as_ref()
                                     .and_then(|i| i.alpn_protocol())
@@ -662,20 +669,17 @@ fn tls_info_accessors_with(per_listener: bool) {
     *TLS_INFO_SNAPSHOT.lock().unwrap() = None;
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     let (shutdown, handles) = if per_listener {
         let config = test_config_builder().build().expect("valid config");
         RinglineBuilder::new(config)
-            .bind_tls(
-                "127.0.0.1:0".parse().unwrap(),
-                TlsConfig::new(server_config),
-            )
+            .bind_tls("127.0.0.1:0".parse().unwrap(), server_config)
             .launch::<TlsInfoHandler>()
             .expect("launch failed")
     } else {
         let config = test_config_builder()
-            .tls(TlsConfig::new(server_config))
+            .tls(server_config)
             .build()
             .expect("valid config");
         RinglineBuilder::new(config)
@@ -729,13 +733,18 @@ fn tls_info_accessors_with(per_listener: bool) {
         snap.is_some,
         "conn.tls_info() returned None after handshake"
     );
-    assert!(
-        snap.protocol_version_some,
-        "protocol_version() was None after completed TLS handshake"
+    // Both peers offer TLS 1.3, which rustls prefers.
+    assert_eq!(
+        snap.protocol_version,
+        Some(ringline::TlsVersion::Tls13),
+        "protocol_version() after a completed TLS handshake"
     );
+    let suite = snap
+        .cipher_suite
+        .expect("cipher_suite() was None after completed TLS handshake");
     assert!(
-        snap.cipher_suite_some,
-        "cipher_suite() was None after completed TLS handshake"
+        !matches!(suite, ringline::CipherSuite::Unknown(_)),
+        "a ring TLS 1.3 suite is named: {suite:?}"
     );
     // No ALPN protocols are configured in server_tls_config, so the handshake
     // does not negotiate one.
@@ -768,7 +777,7 @@ fn a_bind_tls_listener_with_a_slot_too_small_for_tls_is_refused() {
     let result = RinglineBuilder::new(config)
         .bind_tls(
             "127.0.0.1:0".parse().unwrap(),
-            TlsConfig::new(server_tls_config(certs, key)),
+            ringline_server_tls(certs, key),
         )
         .launch::<TlsInfoHandler>();
     let err = match result {
@@ -860,10 +869,10 @@ fn server_close_sends_close_notify<H: AsyncEventHandler>() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -976,7 +985,7 @@ fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .send_pool(1024, 16448)
         .close_notify_timeout_ms(300)
         .build()
@@ -1150,7 +1159,7 @@ fn no_close_notify_after_a_pending_write_shutdown() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .send_pool(1024, 16448)
         .build()
         .expect("valid config");
@@ -1270,7 +1279,7 @@ fn send_after_close_is_refused<H: AsyncEventHandler>() {
     // A slot that holds a whole record, which a bounded TLS send needs on the
     // unbuffered engine.
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .send_pool(256, 16448)
         .build()
         .expect("valid config");
@@ -1397,7 +1406,7 @@ fn a_tls_send_chain_is_encrypted() {
     *TLS_CHAIN_RESULTS.lock().unwrap() = None;
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -1509,10 +1518,10 @@ fn tls_tick_close_sends_close_notify() {
     *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = None;
 
     let (certs, key) = generate_self_signed();
-    let server_config = server_tls_config(certs.clone(), key);
+    let server_config = ringline_server_tls(certs.clone(), key);
 
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -1711,7 +1720,7 @@ fn forward_to_conn_from_a_tls_source() {
 
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .forward_hold_cap(1)
         .build()
         .expect("valid config");
@@ -1887,7 +1896,7 @@ fn a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer() {
 
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .forward_hold_cap(8)
         .build()
         .expect("valid config");
@@ -1960,7 +1969,7 @@ fn a_tls_reader_that_does_not_read_stops_its_peer() {
     const LIMIT: u64 = 64 << 20;
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -2032,7 +2041,7 @@ fn a_tls_peer_close_is_seen_while_nothing_reads() {
     *TLS_CLOSE_SEEN.lock().unwrap() = None;
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -2148,7 +2157,7 @@ fn a_tls_connection_is_refused_as_a_forward_sink() {
 
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .build()
         .expect("valid config");
     let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
@@ -2245,7 +2254,7 @@ fn a_close_notify_with_the_clients_finished_is_read_to_eof() {
     *TLS_HS_CLOSE_INBOUND.lock().unwrap() = None;
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -2372,7 +2381,7 @@ fn a_close_notify_with_the_servers_flight_is_read_to_eof() {
     });
 
     let config = test_config_builder()
-        .tls_client(ringline::TlsClientConfig::new(client_tls_config(&certs)))
+        .tls_client(ringline_client_tls(&certs))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -2451,7 +2460,7 @@ fn tls_sends_while_a_receive_is_in_flight() {
     *TLS_SEND_WHILE_RECV.lock().unwrap() = None;
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
-        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .tls(ringline_server_tls(certs.clone(), key))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -2629,7 +2638,7 @@ fn partial_ticket_exchange(send: bool) -> (Vec<u8>, bool) {
     });
 
     let config = test_config_builder()
-        .tls_client(ringline::TlsClientConfig::new(client_tls_config(&certs)))
+        .tls_client(ringline_client_tls(&certs))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)

@@ -11,7 +11,7 @@ mod common;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, TlsClientConfig};
 
@@ -20,14 +20,11 @@ use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, TlsClientCo
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn test_config(alpn: &[&[u8]]) -> Config {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    if !alpn.is_empty() {
-        tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    }
+    let tls = TlsClientConfig::builder()
+        .trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        .alpn(alpn)
+        .build()
+        .expect("valid TLS config");
 
     ConfigBuilder::new()
         .workers(1)
@@ -35,7 +32,7 @@ fn test_config(alpn: &[&[u8]]) -> Config {
         .sq_entries(64)
         .max_connections(64)
         .send_pool(64, 16448)
-        .tls_client(TlsClientConfig::new(Arc::new(tls)))
+        .tls_client(tls)
         .build()
         .expect("valid config")
 }

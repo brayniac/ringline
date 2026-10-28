@@ -69,20 +69,23 @@ pub use backend_uring::*;
 
 /// Information about a negotiated TLS session.
 pub struct TlsInfo {
-    pub(crate) protocol_version: Option<rustls::ProtocolVersion>,
-    pub(crate) cipher_suite: Option<rustls::SupportedCipherSuite>,
+    pub(crate) protocol_version: Option<ringline_tls_config::TlsVersion>,
+    pub(crate) cipher_suite: Option<ringline_tls_config::CipherSuite>,
     pub(crate) alpn_protocol: Option<Vec<u8>>,
     pub(crate) sni_hostname: Option<String>,
 }
 
 impl TlsInfo {
     /// The negotiated TLS protocol version, if the handshake has completed.
-    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+    pub fn protocol_version(&self) -> Option<ringline_tls_config::TlsVersion> {
         self.protocol_version
     }
 
-    /// The negotiated cipher suite, if the handshake has completed.
-    pub fn cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+    /// The negotiated cipher suite, if the handshake has completed. A suite
+    /// [`CipherSuite`](ringline_tls_config::CipherSuite) does not name is
+    /// [`CipherSuite::Unknown`](ringline_tls_config::CipherSuite::Unknown)
+    /// with its IANA code.
+    pub fn cipher_suite(&self) -> Option<ringline_tls_config::CipherSuite> {
         self.cipher_suite
     }
 
@@ -284,12 +287,9 @@ pub(crate) const DEFAULT_MAX_PLAINTEXT_PER_RECORD: usize =
 /// `src/crypto/ring/tls13.rs:230`) and TLS 1.2 ChaCha20-Poly1305 by 16, so 29
 /// covers every suite either engine can negotiate.
 ///
-/// **29, not 22, deliberately.** The library build resolves rustls without the
-/// `tls12` feature, so it negotiates only TLS 1.3 — but `ringline/Cargo.toml`
-/// enables `tls12` for dev-dependencies, and resolver 2 unifies that into every
-/// test target. TLS 1.2 is therefore reachable under `cargo test`, and in any
-/// downstream crate that unifies the feature in. A bound that is right for the
-/// library build and wrong under test is not a bound.
+/// **29, not 22.** The `TlsConfig` and `TlsClientConfig` builders enable
+/// TLS 1.2 next to TLS 1.3 by default (`ringline-tls-config` enables rustls's
+/// `tls12` feature), so a connection can negotiate a TLS 1.2 GCM suite.
 ///
 /// Deliberately *not* derived from one maximum-size TLS 1.3 record, which
 /// assumes TLS 1.3 and explicitly disclaims correctness dependence. Sizing
@@ -738,8 +738,14 @@ impl TlsTable {
     pub fn get_info(&self, conn_index: u32) -> Option<TlsInfo> {
         let tls_conn = self.conns[conn_index as usize].as_ref()?;
         Some(TlsInfo {
-            protocol_version: tls_conn.conn.protocol_version(),
-            cipher_suite: tls_conn.conn.negotiated_cipher_suite(),
+            protocol_version: tls_conn
+                .conn
+                .protocol_version()
+                .and_then(ringline_tls_config::TlsVersion::from_rustls),
+            cipher_suite: tls_conn
+                .conn
+                .negotiated_cipher_suite()
+                .map(|s| ringline_tls_config::CipherSuite::from_rustls(s.suite())),
             alpn_protocol: tls_conn.conn.alpn_protocol().map(|s| s.to_vec()),
             sni_hostname: tls_conn.conn.sni_hostname().map(|s| s.to_string()),
         })

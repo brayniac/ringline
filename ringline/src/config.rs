@@ -32,33 +32,7 @@ pub enum AcceptMode {
     Merged,
 }
 
-/// TLS configuration. Pass a pre-built rustls ServerConfig.
-#[derive(Clone)]
-pub struct TlsConfig {
-    /// Pre-built rustls ServerConfig. User loads certs/keys and configures ALPN etc.
-    pub(crate) server_config: std::sync::Arc<rustls::ServerConfig>,
-}
-
-impl TlsConfig {
-    /// Wrap a pre-built rustls `ServerConfig` (configure certs/ALPN/etc. on the rustls side).
-    pub fn new(server_config: std::sync::Arc<rustls::ServerConfig>) -> Self {
-        Self { server_config }
-    }
-}
-
-/// TLS client configuration for outbound connections.
-#[derive(Clone)]
-pub struct TlsClientConfig {
-    /// Pre-built rustls ClientConfig. User configures root certs, ALPN, etc.
-    pub(crate) client_config: std::sync::Arc<rustls::ClientConfig>,
-}
-
-impl TlsClientConfig {
-    /// Wrap a pre-built rustls `ClientConfig`.
-    pub fn new(client_config: std::sync::Arc<rustls::ClientConfig>) -> Self {
-        Self { client_config }
-    }
-}
+pub use ringline_tls_config::{TlsClientConfig, TlsConfig};
 
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
@@ -479,7 +453,7 @@ impl Config {
     ///
     /// The unbuffered record layer writes whole records into a slot and cannot
     /// split one across two. Below one whole worst-case record (`F + 29`,
-    /// where `F` is the plaintext per record from the rustls config's
+    /// where `F` is the plaintext per record from the TLS config's
     /// `max_fragment_size`) a bounded send has no admission bound and is
     /// refused, on both backends, and on io_uring a plain send that finds the
     /// pool short part-way through encryption closes the connection. So the
@@ -494,12 +468,8 @@ impl Config {
             .tls
             .iter()
             .chain(self.listener_tls.iter().flatten())
-            .map(|t| t.server_config.max_fragment_size)
-            .chain(
-                self.tls_client
-                    .iter()
-                    .map(|c| c.client_config.max_fragment_size),
-            );
+            .map(|t| t.max_fragment_size())
+            .chain(self.tls_client.iter().map(|c| c.max_fragment_size()));
         let Some(record) = fragment_sizes
             .map(|f| crate::tls::plaintext_per_record(f) + crate::tls::MAX_RECORD_OVERHEAD)
             .max()
@@ -512,7 +482,8 @@ impl Config {
                 "send_copy_slot_size is {} but the unbuffered TLS record layer needs a slot of \
                  at least {min} bytes to hold one whole TLS record for the configured \
                  max_fragment_size; raise send_copy_slot_size (ConfigBuilder::send_pool), \
-                 lower max_fragment_size in the rustls config, or build with the \
+                 lower max_fragment_size (TlsConfigBuilder::max_fragment_size, \
+                 TlsClientConfigBuilder::max_fragment_size), or build with the \
                  tls-buffered feature",
                 self.send_copy_slot_size,
             )));
@@ -986,7 +957,7 @@ impl ConfigBuilder {
     /// and 29 is the header plus the TLS 1.2 GCM nonce and tag, so 16413 bytes
     /// at the default fragment size. The unbuffered TLS engine (the default)
     /// cannot split a record across slots, so a `slot_size` smaller than one
-    /// whole record for any configured rustls config is rejected:
+    /// whole record for any configured TLS config is rejected:
     /// [`ConfigBuilder::build`] checks the server and client configs, and
     /// `launch()` checks each `bind_tls` listener's. The default of 16448
     /// holds one whole record at the default fragment size. With the
@@ -1375,12 +1346,11 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let mut sc = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key.into())
-            .unwrap();
-        sc.max_fragment_size = max_fragment_size;
-        TlsConfig::new(std::sync::Arc::new(sc))
+        let mut builder = TlsConfig::builder().cert(vec![cert_der], key.into());
+        if let Some(size) = max_fragment_size {
+            builder = builder.max_fragment_size(size);
+        }
+        builder.build().unwrap()
     }
 
     // The shipped default holds one whole record at the default fragment
@@ -1481,12 +1451,12 @@ mod tests {
     #[test]
     #[cfg(not(feature = "tls-buffered"))]
     fn validate_checks_the_client_config_too() {
-        let client = |max_fragment_size| {
-            let mut cc = rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth();
-            cc.max_fragment_size = max_fragment_size;
-            TlsClientConfig::new(std::sync::Arc::new(cc))
+        let client = |max_fragment_size: Option<usize>| {
+            let mut builder = TlsClientConfig::builder();
+            if let Some(size) = max_fragment_size {
+                builder = builder.max_fragment_size(size);
+            }
+            builder.build().unwrap()
         };
         config_with(|c| {
             c.tls_client = Some(client(None));

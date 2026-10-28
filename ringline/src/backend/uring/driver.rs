@@ -922,15 +922,15 @@ impl Driver {
             if has_server || has_client {
                 Some(crate::tls::TlsTable::with_listener_configs(
                     config.max_connections,
-                    config.tls.as_ref().map(|tc| tc.server_config.clone()),
+                    config.tls.as_ref().map(|tc| tc.rustls_config().clone()),
                     config
                         .tls_client
                         .as_ref()
-                        .map(|tc| tc.client_config.clone()),
+                        .map(|tc| tc.rustls_config().clone()),
                     config
                         .listener_tls
                         .iter()
-                        .map(|slot| slot.as_ref().map(|tc| tc.server_config.clone()))
+                        .map(|slot| slot.as_ref().map(|tc| tc.rustls_config().clone()))
                         .collect(),
                 ))
             } else {

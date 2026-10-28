@@ -11,7 +11,7 @@
 use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, TlsClientConfig};
 
@@ -98,17 +98,16 @@ fn main() {
     TARGET.set(Target { addr, host, path }).unwrap();
 
     // Configure TLS with h2 ALPN.
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let tls = TlsClientConfig::builder()
+        .trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        .alpn(&[b"h2"])
+        .build()
+        .expect("valid TLS config");
 
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
-        .tls_client(TlsClientConfig::new(Arc::new(tls)))
+        .tls_client(tls)
         .build()
         .expect("valid config");
 

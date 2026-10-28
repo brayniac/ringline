@@ -126,17 +126,20 @@ jobs:
 
           echo "=== Publishing workspace crates ==="
 
-          # Tier 0: core runtime (no workspace deps)
+          # Tier 0: crates with no workspace deps
+          publish_if_needed ringline-tls-config
+
+          # Tier 1: core runtime (depends on ringline-tls-config)
           publish_if_needed ringline
 
-          # Tier 1: crates that depend only on ringline or external crates
+          # Tier 2: crates that depend only on ringline or external crates
           publish_if_needed ringline-h2
           publish_if_needed ringline-quic
           publish_if_needed ringline-redis
           publish_if_needed ringline-memcache
           publish_if_needed ringline-ping
 
-          # Tier 2: crates that depend on other workspace crates
+          # Tier 3: crates that depend on other workspace crates
           publish_if_needed ringline-h3
           publish_if_needed ringline-grpc
           publish_if_needed ringline-http
