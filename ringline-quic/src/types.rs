@@ -130,8 +130,11 @@ pub enum Side {
 pub struct StreamId(u64);
 
 impl StreamId {
-    /// The stream with the given initiator, direction and index.
+    /// The stream with the given initiator, direction and index. `index`
+    /// is below 2^60, the most streams of one kind a connection can open;
+    /// higher bits are dropped.
     pub fn new(initiator: Side, dir: Dir, index: u64) -> Self {
+        let index = index & ((1 << 60) - 1);
         let side = match initiator {
             Side::Client => 0,
             Side::Server => 1,
@@ -177,6 +180,14 @@ impl StreamId {
 
     pub(crate) fn from_proto(id: quinn_proto::StreamId) -> Self {
         Self(quinn_proto::VarInt::from(id).into_inner())
+    }
+}
+
+impl TryFrom<u64> for StreamId {
+    type Error = VarIntBoundsExceeded;
+    /// The stream with this wire identifier, which must be below 2^62.
+    fn try_from(id: u64) -> Result<Self, Self::Error> {
+        VarInt::from_u64(id).map(|v| Self(v.into_inner()))
     }
 }
 
@@ -246,8 +257,9 @@ pub enum ConnectionError {
     /// The peer does not implement a QUIC version this endpoint supports.
     #[error("peer does not support a QUIC version this endpoint supports")]
     VersionMismatch,
-    /// The peer violated the QUIC protocol. `code` is the QUIC transport
-    /// error code.
+    /// The connection failed with a QUIC transport error, raised by either
+    /// endpoint, including TLS handshake failures (codes 0x100–0x1ff).
+    /// `code` is the QUIC transport error code.
     #[error("transport error {code:#x}: {reason}")]
     TransportError {
         /// The QUIC transport error code.
@@ -381,93 +393,176 @@ impl WriteError {
     }
 }
 
+/// Defines an opaque statistics struct copied field by field from its
+/// quinn-proto counterpart, with one accessor per field.
+macro_rules! stats_struct {
+    (
+        $(#[$meta:meta])*
+        $name:ident from $proto:path {
+            $( $(#[$fmeta:meta])* $field:ident : $ty:ty ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct $name {
+            $( $field: $ty, )*
+        }
+
+        impl $name {
+            pub(crate) fn from_proto(s: &$proto) -> Self {
+                Self { $( $field: s.$field, )* }
+            }
+
+            $(
+                $(#[$fmeta])*
+                pub fn $field(&self) -> $ty {
+                    self.$field
+                }
+            )*
+        }
+    };
+}
+
+stats_struct! {
+    /// UDP traffic in one direction.
+    UdpStats from quinn_proto::UdpStats {
+        /// Datagrams.
+        datagrams: u64,
+        /// Payload bytes.
+        bytes: u64,
+        /// System calls (more than one datagram can go in one with GSO or GRO).
+        ios: u64,
+    }
+}
+
+stats_struct! {
+    /// QUIC frames in one direction, counted by frame type.
+    FrameStats from quinn_proto::FrameStats {
+        /// ACK frames.
+        acks: u64,
+        /// ACK_FREQUENCY frames.
+        ack_frequency: u64,
+        /// CRYPTO frames.
+        crypto: u64,
+        /// CONNECTION_CLOSE frames.
+        connection_close: u64,
+        /// DATA_BLOCKED frames.
+        data_blocked: u64,
+        /// DATAGRAM frames.
+        datagram: u64,
+        /// HANDSHAKE_DONE frames.
+        handshake_done: u8,
+        /// IMMEDIATE_ACK frames.
+        immediate_ack: u64,
+        /// MAX_DATA frames.
+        max_data: u64,
+        /// MAX_STREAM_DATA frames.
+        max_stream_data: u64,
+        /// MAX_STREAMS frames for bidirectional streams.
+        max_streams_bidi: u64,
+        /// MAX_STREAMS frames for unidirectional streams.
+        max_streams_uni: u64,
+        /// NEW_CONNECTION_ID frames.
+        new_connection_id: u64,
+        /// NEW_TOKEN frames.
+        new_token: u64,
+        /// PATH_CHALLENGE frames.
+        path_challenge: u64,
+        /// PATH_RESPONSE frames.
+        path_response: u64,
+        /// PING frames.
+        ping: u64,
+        /// RESET_STREAM frames.
+        reset_stream: u64,
+        /// RETIRE_CONNECTION_ID frames.
+        retire_connection_id: u64,
+        /// STREAM_DATA_BLOCKED frames.
+        stream_data_blocked: u64,
+        /// STREAMS_BLOCKED frames for bidirectional streams.
+        streams_blocked_bidi: u64,
+        /// STREAMS_BLOCKED frames for unidirectional streams.
+        streams_blocked_uni: u64,
+        /// STOP_SENDING frames.
+        stop_sending: u64,
+        /// STREAM frames.
+        stream: u64,
+    }
+}
+
+stats_struct! {
+    /// The network path's statistics.
+    PathStats from quinn_proto::PathStats {
+        /// The current smoothed round-trip time estimate.
+        rtt: Duration,
+        /// The smallest round-trip time measured.
+        min_rtt: Duration,
+        /// The congestion window, in bytes.
+        cwnd: u64,
+        /// Congestion events.
+        congestion_events: u64,
+        /// Packets declared lost.
+        lost_packets: u64,
+        /// Bytes declared lost.
+        lost_bytes: u64,
+        /// Packets sent.
+        sent_packets: u64,
+        /// Path MTU discovery probes sent.
+        sent_plpmtud_probes: u64,
+        /// Path MTU discovery probes declared lost.
+        lost_plpmtud_probes: u64,
+        /// Times the path MTU was found to have shrunk.
+        black_holes_detected: u64,
+        /// The current path MTU, in bytes.
+        current_mtu: u16,
+    }
+}
+
 /// A snapshot of a connection's statistics, from
 /// [`QuicEndpoint::connection_stats`](crate::QuicEndpoint::connection_stats).
-#[derive(Clone, Copy, Debug)]
+/// It holds every field of quinn-proto's `ConnectionStats`.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ConnectionStats {
-    rtt: Duration,
-    cwnd: u64,
-    congestion_events: u64,
-    current_mtu: u16,
-    sent_packets: u64,
-    lost_packets: u64,
-    lost_bytes: u64,
-    udp_tx_datagrams: u64,
-    udp_tx_bytes: u64,
-    udp_rx_datagrams: u64,
-    udp_rx_bytes: u64,
+    udp_tx: UdpStats,
+    udp_rx: UdpStats,
+    frame_tx: FrameStats,
+    frame_rx: FrameStats,
+    path: PathStats,
 }
 
 impl ConnectionStats {
     pub(crate) fn from_proto(s: &quinn_proto::ConnectionStats) -> Self {
         Self {
-            rtt: s.path.rtt,
-            cwnd: s.path.cwnd,
-            congestion_events: s.path.congestion_events,
-            current_mtu: s.path.current_mtu,
-            sent_packets: s.path.sent_packets,
-            lost_packets: s.path.lost_packets,
-            lost_bytes: s.path.lost_bytes,
-            udp_tx_datagrams: s.udp_tx.datagrams,
-            udp_tx_bytes: s.udp_tx.bytes,
-            udp_rx_datagrams: s.udp_rx.datagrams,
-            udp_rx_bytes: s.udp_rx.bytes,
+            udp_tx: UdpStats::from_proto(&s.udp_tx),
+            udp_rx: UdpStats::from_proto(&s.udp_rx),
+            frame_tx: FrameStats::from_proto(&s.frame_tx),
+            frame_rx: FrameStats::from_proto(&s.frame_rx),
+            path: PathStats::from_proto(&s.path),
         }
     }
 
-    /// The current smoothed round-trip time estimate.
-    pub fn rtt(&self) -> Duration {
-        self.rtt
+    /// UDP traffic sent.
+    pub fn udp_tx(&self) -> UdpStats {
+        self.udp_tx
     }
 
-    /// The congestion window, in bytes.
-    pub fn cwnd(&self) -> u64 {
-        self.cwnd
+    /// UDP traffic received.
+    pub fn udp_rx(&self) -> UdpStats {
+        self.udp_rx
     }
 
-    /// How many congestion events the connection has had.
-    pub fn congestion_events(&self) -> u64 {
-        self.congestion_events
+    /// Frames sent.
+    pub fn frame_tx(&self) -> FrameStats {
+        self.frame_tx
     }
 
-    /// The current path MTU, in bytes.
-    pub fn current_mtu(&self) -> u16 {
-        self.current_mtu
+    /// Frames received.
+    pub fn frame_rx(&self) -> FrameStats {
+        self.frame_rx
     }
 
-    /// Packets sent.
-    pub fn sent_packets(&self) -> u64 {
-        self.sent_packets
-    }
-
-    /// Packets declared lost.
-    pub fn lost_packets(&self) -> u64 {
-        self.lost_packets
-    }
-
-    /// Bytes declared lost.
-    pub fn lost_bytes(&self) -> u64 {
-        self.lost_bytes
-    }
-
-    /// UDP datagrams sent.
-    pub fn udp_tx_datagrams(&self) -> u64 {
-        self.udp_tx_datagrams
-    }
-
-    /// UDP payload bytes sent.
-    pub fn udp_tx_bytes(&self) -> u64 {
-        self.udp_tx_bytes
-    }
-
-    /// UDP datagrams received.
-    pub fn udp_rx_datagrams(&self) -> u64 {
-        self.udp_rx_datagrams
-    }
-
-    /// UDP payload bytes received.
-    pub fn udp_rx_bytes(&self) -> u64 {
-        self.udp_rx_bytes
+    /// The network path's statistics: RTT, congestion window, loss, MTU.
+    pub fn path(&self) -> PathStats {
+        self.path
     }
 }
 
@@ -498,6 +593,84 @@ mod tests {
         assert_eq!(StreamId::new(Side::Server, Dir::Bi, 0).into_inner(), 1);
         assert_eq!(StreamId::new(Side::Client, Dir::Uni, 0).into_inner(), 2);
         assert_eq!(StreamId::new(Side::Server, Dir::Uni, 1).into_inner(), 7);
+    }
+
+    #[test]
+    fn stream_id_display_and_wire_form() {
+        assert_eq!(
+            StreamId::new(Side::Client, Dir::Bi, 3).to_string(),
+            "client bidirectional stream 3"
+        );
+        assert_eq!(
+            StreamId::new(Side::Server, Dir::Uni, 0).to_string(),
+            "server unidirectional stream 0"
+        );
+        let id = StreamId::try_from(7).unwrap();
+        assert_eq!(
+            (id.initiator(), id.dir(), id.index()),
+            (Side::Server, Dir::Uni, 1)
+        );
+        assert!(StreamId::try_from(1u64 << 62).is_err());
+    }
+
+    #[test]
+    fn connection_error_conversion() {
+        let transport = quinn_proto::TransportError {
+            code: quinn_proto::TransportErrorCode::crypto(0x2a),
+            frame: None,
+            reason: "bad certificate".into(),
+        };
+        assert_eq!(
+            ConnectionError::from_proto(quinn_proto::ConnectionError::TransportError(transport)),
+            ConnectionError::TransportError {
+                code: 0x12a,
+                reason: "bad certificate".into(),
+            }
+        );
+        let close = quinn_proto::ConnectionClose {
+            error_code: quinn_proto::TransportErrorCode::crypto(0x28),
+            frame_type: None,
+            reason: Bytes::from_static(b"handshake"),
+        };
+        assert_eq!(
+            ConnectionError::from_proto(quinn_proto::ConnectionError::ConnectionClosed(close)),
+            ConnectionError::ConnectionClosed {
+                code: 0x128,
+                reason: Bytes::from_static(b"handshake"),
+            }
+        );
+        let app = quinn_proto::ApplicationClose {
+            error_code: quinn_proto::VarInt::from_u32(0x99),
+            reason: Bytes::from_static(b"bye"),
+        };
+        assert_eq!(
+            ConnectionError::from_proto(quinn_proto::ConnectionError::ApplicationClosed(app)),
+            ConnectionError::ApplicationClosed {
+                code: VarInt::from_u32(0x99),
+                reason: Bytes::from_static(b"bye"),
+            }
+        );
+        for (theirs, ours) in [
+            (
+                quinn_proto::ConnectionError::VersionMismatch,
+                ConnectionError::VersionMismatch,
+            ),
+            (quinn_proto::ConnectionError::Reset, ConnectionError::Reset),
+            (
+                quinn_proto::ConnectionError::TimedOut,
+                ConnectionError::TimedOut,
+            ),
+            (
+                quinn_proto::ConnectionError::LocallyClosed,
+                ConnectionError::LocallyClosed,
+            ),
+            (
+                quinn_proto::ConnectionError::CidsExhausted,
+                ConnectionError::CidsExhausted,
+            ),
+        ] {
+            assert_eq!(ConnectionError::from_proto(theirs), ours);
+        }
     }
 
     #[test]

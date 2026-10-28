@@ -325,7 +325,10 @@ impl QuicEndpoint {
         peer: SocketAddr,
         server_name: &str,
     ) -> Result<QuicConnId, Error> {
-        let client_config = self.client_config.clone().ok_or(Error::ConnectionClosed)?;
+        let client_config = self
+            .client_config
+            .clone()
+            .ok_or(Error::Connect(ConnectError::NoClientConfig))?;
 
         let (ch, conn) = self
             .endpoint
@@ -647,7 +650,13 @@ impl QuicEndpoint {
     /// before this call returns, so the peer is told about the closure as
     /// soon as the caller flushes its UDP socket. There is no need for the
     /// caller to also call [`flush`](Self::flush).
-    pub fn close_connection(&mut self, now: Instant, conn: QuicConnId, code: u32, reason: &[u8]) {
+    pub fn close_connection(
+        &mut self,
+        now: Instant,
+        conn: QuicConnId,
+        code: VarInt,
+        reason: &[u8],
+    ) {
         let key = conn.0 as usize;
         if !self.connections.contains(key) {
             return;
@@ -661,7 +670,7 @@ impl QuicEndpoint {
         }
         self.connections[key].conn.close(
             now,
-            quinn_proto::VarInt::from_u32(code),
+            code.to_proto(),
             bytes::Bytes::copy_from_slice(reason),
         );
         // Drain the CONNECTION_CLOSE packet (and any final acks) so callers
@@ -748,8 +757,9 @@ impl QuicEndpoint {
     /// data is/was possible).
     ///
     /// On the client side this becomes true immediately after `connect`
-    /// if the configured rustls client has a session resumption ticket
-    /// for the server name. On the server side it becomes true if the
+    /// if the client was built with
+    /// [`QuicConfigBuilder::zero_rtt(true)`](crate::QuicConfigBuilder::zero_rtt)
+    /// and its session store holds a ticket for the server name. On the server side it becomes true if the
     /// peer's Initial included 0-RTT material we could decrypt.
     ///
     /// Once `true`, any data written via `stream_send` /

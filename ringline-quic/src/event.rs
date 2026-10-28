@@ -81,7 +81,7 @@ pub enum QuicEvent {
     /// has not yet completed (no `NewConnection` event yet).
     ///
     /// Fires once per inbound connection. `QuicEndpoint` has no accessor
-    /// for the negotiated ALPN or SNI name yet.
+    /// for the negotiated ALPN or SNI name.
     HandshakeDataReady { conn: QuicConnId },
 
     /// 0-RTT was attempted on this outbound connection but the peer

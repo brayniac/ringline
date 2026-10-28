@@ -66,7 +66,8 @@ impl QuicConfig {
 
     /// A configuration from complete quinn-proto configurations, for what
     /// the builder does not cover (a non-default [`EndpointConfig`], other
-    /// crypto, per-side transport settings). Part of the escape hatches:
+    /// crypto, per-side transport settings, and other transport settings
+    /// such as keep-alive and datagram buffers). Part of the escape hatches:
     /// its arguments are [`proto`](crate::proto) types, which follow
     /// quinn-proto's version.
     ///
@@ -168,6 +169,13 @@ impl QuicConfigBuilder {
     /// Make connections with this TLS configuration. Setting both
     /// [`server`](Self::server) and `client` gives an endpoint that accepts
     /// and connects.
+    ///
+    /// A `TlsClientConfig` from `TlsClientConfig::builder` gives QUIC
+    /// connections a session store separate from TCP's, shared by every
+    /// `QuicConfig` built from it. One from `from_rustls` uses its rustls
+    /// `resumption` for TCP and QUIC alike; to keep them apart, pass two
+    /// rustls configs, each with its own `Resumption`, to two `from_rustls`
+    /// calls.
     pub fn client(mut self, tls: TlsClientConfig) -> Self {
         self.client = Some(tls);
         self
@@ -216,8 +224,11 @@ impl QuicConfigBuilder {
         self
     }
 
-    /// How long a connection may be idle before it closes, or `None` for no
-    /// limit. A duration over about 146,000 years is treated as no limit.
+    /// The idle timeout this endpoint advertises, or `None` to advertise
+    /// none. A connection closes after the smaller of the two endpoints'
+    /// timeouts and has none only when neither endpoint sets one. A duration
+    /// under 1 ms, or of 2^62 ms (about 146 million years) or more,
+    /// advertises none.
     pub fn max_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.max_idle_timeout = Some(timeout);
         self
@@ -241,8 +252,9 @@ impl QuicConfigBuilder {
     /// and the client sides.
     ///
     /// Fails if a TLS configuration does not enable TLS 1.3 or has no
-    /// cipher suite QUIC can use. Without the check quinn-proto accepts such
-    /// a configuration and panics on the first connection.
+    /// cipher suite QUIC can use. Without the TLS 1.3 check, quinn-proto
+    /// accepts a TLS 1.2-only configuration and panics on the first
+    /// connection.
     pub fn build(self) -> Result<QuicConfig, ConfigError> {
         if self.server.is_none() && self.client.is_none() {
             return Err(ConfigError::NoTlsConfig);
@@ -477,6 +489,16 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, ConfigError::NoInitialCipherSuite), "{err}");
+    }
+
+    /// Windows of 2^62 bytes or more saturate at the largest QUIC integer.
+    #[test]
+    fn windows_saturate() {
+        let b = QuicConfig::builder()
+            .stream_receive_window(u64::MAX)
+            .receive_window(1 << 20);
+        assert_eq!(b.stream_receive_window, Some(VarInt::MAX));
+        assert_eq!(b.receive_window, Some(VarInt::from_u32(1 << 20)));
     }
 
     /// QUIC gets its own ALPN and early-data settings on a copy; the TCP

@@ -26,8 +26,8 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     (vec![CertificateDer::from(cert.cert)], key.into())
 }
 
-/// A server config builder with its own TLS config, and so its own
-/// session-ticket key.
+/// A server config builder with its own TLS config, and so its own server
+/// session cache.
 fn server_builder(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -353,7 +353,7 @@ fn close_connection_drains_close_packet_without_explicit_flush() {
     let (_cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
     let pre = server.send_queue_len();
-    server.close_connection(common::now(), sc, 0x42, b"bye");
+    server.close_connection(common::now(), sc, VarInt::from_u32(0x42), b"bye");
     let post = server.send_queue_len();
     assert!(
         post > pre,
@@ -367,7 +367,7 @@ fn close_connection_delivers_event_to_peer() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
-    server.close_connection(common::now(), sc, 0x42, b"bye");
+    server.close_connection(common::now(), sc, VarInt::from_u32(0x42), b"bye");
     server.flush(common::now());
 
     let mut client_close = None;
@@ -378,17 +378,22 @@ fn close_connection_delivers_event_to_peer() {
         sa,
         |c, _| {
             while let Some(ev) = c.poll_event() {
-                if let QuicEvent::ConnectionClosed { .. } = ev {
-                    client_close = Some(true);
+                if let QuicEvent::ConnectionClosed { reason, .. } = ev {
+                    client_close = Some(reason);
                 }
             }
             client_close.is_some()
         },
         32,
     );
-    assert!(
-        client_close.is_some(),
-        "client should observe ConnectionClosed after server.close_connection"
+    let reason =
+        client_close.expect("client should observe ConnectionClosed after server.close_connection");
+    assert_eq!(
+        reason,
+        ringline_quic::ConnectionError::ApplicationClosed {
+            code: VarInt::from_u32(0x42),
+            reason: Bytes::from_static(b"bye"),
+        }
     );
 
     // After the close round-trips, the client connection should eventually
@@ -493,7 +498,7 @@ fn closed_connection_id_returns_invalid() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
-    server.close_connection(common::now(), sc, 0, b"goodbye");
+    server.close_connection(common::now(), sc, VarInt::from_u32(0), b"goodbye");
     server.flush(common::now());
 
     // Drive until the client connection is purged from its slab.
@@ -608,12 +613,14 @@ fn idle_timeout_closes_connection() {
     // pruned its connection slab.
     let mut closed = 0;
     while let Some(ev) = client.poll_event() {
-        if let QuicEvent::ConnectionClosed { .. } = ev {
+        if let QuicEvent::ConnectionClosed { reason, .. } = ev {
+            assert_eq!(reason, ringline_quic::ConnectionError::TimedOut);
             closed += 1;
         }
     }
     while let Some(ev) = server.poll_event() {
-        if let QuicEvent::ConnectionClosed { .. } = ev {
+        if let QuicEvent::ConnectionClosed { reason, .. } = ev {
+            assert_eq!(reason, ringline_quic::ConnectionError::TimedOut);
             closed += 1;
         }
     }
@@ -1203,7 +1210,7 @@ fn zero_rtt_round_trip() {
 
     // Close conn 1 cleanly. The server's CONNECTION_CLOSE flushes;
     // client observes ConnectionClosed.
-    client.close_connection(common::now(), cc1, 0, b"warmup-done");
+    client.close_connection(common::now(), cc1, VarInt::from_u32(0), b"warmup-done");
     for _ in 0..8 {
         drain(&mut client, &mut server, ca, sa);
         while let Some(_ev) = client.poll_event() {}
@@ -1287,8 +1294,8 @@ fn zero_rtt_round_trip() {
 fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
     // Build a client + two independent server endpoints. Each
     // `TlsConfig::builder` call yields a fresh rustls ServerConfig
-    // with its own session-ticket encryption key, so a ticket issued
-    // by server A cannot be decrypted by server B. Client sees a
+    // with its own server session cache, so server B has no entry for
+    // a ticket server A issued. Client sees a
     // 0-RTT rejection on the second handshake.
     //
     // This test pins the `ZeroRttRejected` event semantics in place:
@@ -1336,7 +1343,7 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
             drain(&mut client, &mut server_a, ca, sa);
             common::advance(Duration::from_millis(2));
         }
-        client.close_connection(common::now(), cc1, 0, b"done");
+        client.close_connection(common::now(), cc1, VarInt::from_u32(0), b"done");
         for _ in 0..8 {
             drain(&mut client, &mut server_a, ca, sa);
         }
@@ -1767,8 +1774,8 @@ fn close_connection_called_twice_is_idempotent() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
 
-    client.close_connection(common::now(), cc, 0, b"first");
-    client.close_connection(common::now(), cc, 0, b"second");
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"first");
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"second");
 
     let mut close_events = 0;
     while let Some(ev) = client.poll_event() {
@@ -1858,7 +1865,7 @@ fn stream_send_on_closing_connection_returns_connection_closing() {
     let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
     let stream = client.open_bi(cc).unwrap().unwrap();
 
-    client.close_connection(common::now(), cc, 0, b"done");
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"done");
     // Now the connection is closed locally — `get_conn_mut` rejects
     // application operations with `InvalidConnection`.
     let err = client
@@ -1905,4 +1912,129 @@ fn poll_send_yields_nothing_until_flush() {
         client.poll_send().is_some(),
         "flush must generate the packet for the buffered bytes"
     );
+}
+
+// ── Session store and statistics ───────────────────────────────────────
+
+/// Complete a TLS handshake over memory with the TCP configs, and read the
+/// session tickets the server sends after it, so the client's TCP store
+/// holds tickets for "localhost".
+fn tcp_handshake_in_memory(client: &TlsClientConfig, server: &TlsConfig) {
+    use ringline_quic::tls_config::rustls;
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut c = rustls::ClientConnection::new(client.rustls_config().clone(), name).unwrap();
+    let mut s = rustls::ServerConnection::new(server.rustls_config().clone()).unwrap();
+    for _ in 0..16 {
+        let mut buf = Vec::new();
+        while c.wants_write() {
+            c.write_tls(&mut buf).unwrap();
+        }
+        s.read_tls(&mut buf.as_slice()).unwrap();
+        s.process_new_packets().unwrap();
+        buf.clear();
+        while s.wants_write() {
+            s.write_tls(&mut buf).unwrap();
+        }
+        c.read_tls(&mut buf.as_slice()).unwrap();
+        c.process_new_packets().unwrap();
+        if !c.is_handshaking() && !s.is_handshaking() && !s.wants_write() {
+            break;
+        }
+    }
+    assert!(!c.is_handshaking(), "the in-memory TCP handshake completed");
+}
+
+/// Connect, let the server's session ticket arrive, and close.
+fn warm_up(client: &mut QuicEndpoint, server: &mut QuicEndpoint, ca: SocketAddr, sa: SocketAddr) {
+    let (cc, _sc) = handshake(client, server, ca, sa);
+    for _ in 0..16 {
+        drain(client, server, ca, sa);
+        common::advance(Duration::from_millis(2));
+    }
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"warm");
+    for _ in 0..8 {
+        drain(client, server, ca, sa);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+    }
+}
+
+/// QUIC configs built from one `TlsClientConfig`, and from its clones,
+/// share one QUIC session store, and that store is not TCP's. A ticket
+/// from a TCP handshake to the same name, which would carry no 0-RTT,
+/// does not displace the QUIC ticket.
+#[test]
+fn quic_session_store_is_shared_and_separate_from_tcp() {
+    let (certs, key) = self_signed();
+    let tls_server = TlsConfig::builder()
+        .cert(certs.clone(), key)
+        .build()
+        .unwrap();
+    let tls_client = TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap();
+    let server_cfg = QuicConfig::builder()
+        .server(tls_server.clone())
+        .max_concurrent_bidi_streams(64)
+        .build()
+        .unwrap();
+    let cfg_a = QuicConfig::builder()
+        .client(tls_client.clone())
+        .zero_rtt(true)
+        .build()
+        .unwrap();
+    let cfg_b = QuicConfig::builder()
+        .client(tls_client.clone())
+        .zero_rtt(true)
+        .build()
+        .unwrap();
+
+    let sa: SocketAddr = "127.0.0.1:52301".parse().unwrap();
+    let ca: SocketAddr = "127.0.0.1:52302".parse().unwrap();
+    let cb: SocketAddr = "127.0.0.1:52303".parse().unwrap();
+    let mut server = QuicEndpoint::new(server_cfg, sa);
+    let mut client_a = QuicEndpoint::new(cfg_a, ca);
+    warm_up(&mut client_a, &mut server, ca, sa);
+
+    // Newer tickets for "localhost", in the TCP store.
+    tcp_handshake_in_memory(&tls_client, &tls_server);
+
+    let mut client_b = QuicEndpoint::new(cfg_b, cb);
+    let conn = client_b
+        .connect(common::now(), sa, "localhost")
+        .expect("connect");
+    assert!(
+        client_b.has_0rtt(conn),
+        "a QuicConfig from the same TlsClientConfig has the QUIC ticket"
+    );
+}
+
+/// `connection_stats` reports each direction's traffic separately: the
+/// server's sent datagrams are the client's received ones, and only the
+/// client's side counts sent stream frames.
+#[test]
+fn connection_stats_count_both_directions() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+    let stream = client.open_bi(cc).unwrap().unwrap();
+    client.stream_send(cc, stream, b"stats").unwrap();
+    client.stream_finish(common::now(), cc, stream).unwrap();
+    for _ in 0..8 {
+        drain(&mut client, &mut server, ca, sa);
+    }
+    let c = client.connection_stats(cc).unwrap();
+    let s = server.connection_stats(sc).unwrap();
+    assert!(c.udp_tx().bytes() > 0 && c.udp_rx().bytes() > 0);
+    // Every datagram the server sent reached the client's connection. The
+    // reverse can differ by the datagrams the server's endpoint handled
+    // before the connection existed.
+    assert_eq!(s.udp_tx().datagrams(), c.udp_rx().datagrams());
+    assert!(c.udp_tx().datagrams() >= s.udp_rx().datagrams());
+    // Only the client sent stream data.
+    assert!(c.frame_tx().stream() >= 1, "{:?}", c.frame_tx());
+    assert!(s.frame_rx().stream() >= 1, "{:?}", s.frame_rx());
+    assert_eq!(s.frame_tx().stream(), 0, "{:?}", s.frame_tx());
+    assert_eq!(c.frame_rx().stream(), 0, "{:?}", c.frame_rx());
+    assert!(c.path().current_mtu() > 0);
 }

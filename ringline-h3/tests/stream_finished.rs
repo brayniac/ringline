@@ -349,7 +349,12 @@ fn connection_close_cleans_up_state() {
     );
 
     // Close the QUIC connection.
-    server_ep.close_connection(common::now(), server_conn, 0, b"graceful closure".as_ref());
+    server_ep.close_connection(
+        common::now(),
+        server_conn,
+        ringline_quic::VarInt::from_u32(0),
+        b"graceful closure".as_ref(),
+    );
 
     // Flush and process.
     shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);

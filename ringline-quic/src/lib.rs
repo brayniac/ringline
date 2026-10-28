@@ -47,8 +47,8 @@ pub use endpoint::{BatchGuard, Datagrams, OutgoingPacket, QuicEndpoint};
 pub use error::Error;
 pub use event::{QuicConnId, QuicEvent};
 pub use types::{
-    ConnectError, ConnectionError, ConnectionStats, Dir, ReadError, ReadableError, Side, StreamId,
-    VarInt, VarIntBoundsExceeded, WriteError,
+    ConnectError, ConnectionError, ConnectionStats, Dir, FrameStats, PathStats, ReadError,
+    ReadableError, Side, StreamId, UdpStats, VarInt, VarIntBoundsExceeded, WriteError,
 };
 
 /// The TLS configuration types [`QuicConfigBuilder`] takes.
