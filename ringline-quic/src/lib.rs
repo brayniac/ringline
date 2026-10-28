@@ -6,7 +6,11 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use ringline_quic::{QuicConfig, QuicEndpoint, QuicEvent};
+//! use ringline_quic::{QuicConfig, QuicEndpoint, QuicEvent, TlsConfig};
+//!
+//! let tls = TlsConfig::builder().cert(chain, key).build()?;
+//! let config = QuicConfig::builder().server(tls).alpn(&[b"h3"]).build()?;
+//! let mut quic = QuicEndpoint::new(config, local_addr);
 //!
 //! // Read the clock once per event-loop iteration and pass it to every call.
 //! let now = Instant::now();
@@ -36,13 +40,24 @@ pub mod config;
 pub mod endpoint;
 pub mod error;
 pub mod event;
+pub mod types;
 
-pub use config::QuicConfig;
+pub use config::{ConfigError, QuicConfig, QuicConfigBuilder};
 pub use endpoint::{BatchGuard, Datagrams, OutgoingPacket, QuicEndpoint};
 pub use error::Error;
 pub use event::{QuicConnId, QuicEvent};
-
-// Re-export commonly used quinn-proto types for convenience.
-pub use quinn_proto::{
-    ConnectionStats, Dir, FrameStats, PathStats, ReadError, StreamId, UdpStats, VarInt, WriteError,
+pub use types::{
+    ConnectError, ConnectionError, ConnectionStats, Dir, FrameStats, PathStats, ReadError,
+    ReadableError, Side, StreamId, UdpStats, VarInt, VarIntBoundsExceeded, WriteError,
 };
+
+/// The TLS configuration types [`QuicConfigBuilder`] takes.
+pub use ringline_tls_config::{TlsClientConfig, TlsConfig};
+
+/// The quinn-proto crate ringline-quic is built on, for
+/// [`QuicConfig::from_proto`]. Items reached through it follow quinn-proto's
+/// version, not ringline-quic's.
+pub use quinn_proto as proto;
+
+/// The TLS configuration crate, including its rustls re-export.
+pub use ringline_tls_config as tls_config;

@@ -1,4 +1,4 @@
-//! TLS configuration for [ringline].
+//! TLS configuration for [ringline] and [ringline-quic].
 //!
 //! [`TlsConfig`] configures servers and [`TlsClientConfig`] configures
 //! clients. Both are built with builders that take certificates and keys as
@@ -23,6 +23,7 @@
 //!
 //! [`TlsConfig::from_rustls`], [`TlsClientConfig::from_rustls`],
 //! [`TlsConfig::rustls_config`], [`TlsClientConfig::rustls_config`],
+//! [`TlsClientConfig::quic_resumption`],
 //! [`TlsVersion::from_rustls`], [`CipherSuite::from_rustls`] and the
 //! [`rustls`] re-export name rustls types. They cover what the builders do
 //! not: custom certificate verifiers and resolvers, client certificates,
@@ -32,6 +33,7 @@
 //! in a breaking release of this crate.
 //!
 //! [ringline]: https://docs.rs/ringline
+//! [ringline-quic]: https://docs.rs/ringline-quic
 
 use std::sync::Arc;
 
@@ -297,6 +299,10 @@ impl TlsConfigBuilder {
 #[derive(Clone)]
 pub struct TlsClientConfig {
     inner: Arc<rustls::ClientConfig>,
+    /// The session store QUIC connections use, separate from TCP's; see
+    /// [`TlsClientConfig::quic_resumption`]. `None` for a `from_rustls`
+    /// config.
+    quic_resumption: Option<rustls::client::Resumption>,
 }
 
 impl TlsClientConfig {
@@ -314,13 +320,32 @@ impl TlsClientConfig {
     /// Wrap a rustls client configuration built by the caller. Part of the
     /// escape hatches (see the crate docs).
     pub fn from_rustls(config: Arc<rustls::ClientConfig>) -> Self {
-        Self { inner: config }
+        Self {
+            inner: config,
+            quic_resumption: None,
+        }
     }
 
     /// The rustls client configuration. Part of the escape hatches (see the
     /// crate docs).
     pub fn rustls_config(&self) -> &Arc<rustls::ClientConfig> {
         &self.inner
+    }
+
+    /// The session-resumption store for QUIC connections made with this
+    /// configuration, or `None` for a configuration from
+    /// [`from_rustls`](Self::from_rustls). Part of the escape hatches (see
+    /// the crate docs).
+    ///
+    /// rustls keys stored tickets by server name only, so TCP and QUIC
+    /// connections sharing one store would take each other's tickets, and a
+    /// QUIC connection holding a ticket from a TCP server sends no 0-RTT.
+    /// ringline-quic gives QUIC connections this store instead. It is
+    /// created when the configuration is built and is shared by its clones.
+    /// A `from_rustls` configuration keeps the caller's `resumption` for
+    /// both.
+    pub fn quic_resumption(&self) -> Option<&rustls::client::Resumption> {
+        self.quic_resumption.as_ref()
     }
 
     /// The configured `max_fragment_size` (see
@@ -404,6 +429,7 @@ impl TlsClientConfigBuilder {
         config.max_fragment_size = self.max_fragment_size;
         Ok(TlsClientConfig {
             inner: Arc::new(config),
+            quic_resumption: Some(rustls::client::Resumption::default()),
         })
     }
 }

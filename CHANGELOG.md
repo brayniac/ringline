@@ -223,6 +223,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `ringline-quic`'s public API names no quinn-proto type
+  outside `QuicConfig::from_proto` and the `proto` re-export.
+  - `QuicConfig::builder()` takes a `TlsConfig` (`server`), a
+    `TlsClientConfig` (`client`) or both, the types ringline uses for TCP.
+    It sets QUIC's ALPN list (`alpn`), 0-RTT (`zero_rtt`) and the transport
+    settings `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`,
+    `stream_receive_window`, `receive_window`, `max_idle_timeout`,
+    `initial_rtt` and `migration`. ALPN and 0-RTT go on a copy of the TLS
+    config. A server accepts 0-RTT by default, as quinn-proto's
+    `ServerConfig::with_single_cert` does; a client sends none unless
+    `zero_rtt(true)`.
+  - `build()` returns `ConfigError` for a TLS config without TLS 1.3 or
+    without a cipher suite for QUIC Initial packets. quinn-proto accepts a
+    TLS 1.2-only config and panics on the first connection.
+  - A client built with `TlsClientConfig::builder()` gets a QUIC session
+    store separate from TCP's (`TlsClientConfig::quic_resumption`). rustls
+    keys tickets by server name only, so a shared store let TCP and QUIC
+    connections to one host take each other's tickets. A `from_rustls`
+    config uses its rustls `resumption` for TCP and QUIC alike.
+  - `QuicConfig::server`, `client`, `endpoint_config`, `server_config` and
+    `client_config` are replaced by the builder and by
+    `QuicConfig::from_proto(endpoint, server, client)`, which takes complete
+    quinn-proto configs through the new `ringline_quic::proto` re-export.
+  - `StreamId`, `VarInt`, `Dir`, `Side`, `ConnectError`,
+    `ConnectionError`, `ReadError`, `ReadableError`, `WriteError`,
+    `ConnectionStats`, `UdpStats`, `FrameStats` and `PathStats` are
+    ringline-quic types. `Error`, `QuicEvent` and the `QuicEndpoint` stream
+    methods use them. The stats types hold every field of quinn-proto's,
+    read through accessors (`stats.path().rtt()`, `stats.udp_tx().bytes()`)
+    in place of public fields. `ringline-h3` uses ringline-quic's
+    `StreamId`.
+  - `QuicEndpoint::close_connection` takes its code as a `VarInt`, as
+    `reset_stream` and `stop_sending` do, in place of a `u32`.
+  - `QuicEndpoint::connect` on an endpoint without a client config returns
+    `Error::Connect(ConnectError::NoClientConfig)`; before, it returned
+    `Error::ConnectionClosed`.
 - **Breaking:** `TlsConfig::new(Arc<rustls::ServerConfig>)` and
   `TlsClientConfig::new(Arc<rustls::ClientConfig>)` are replaced by
   `TlsConfig::builder()` and `TlsClientConfig::builder()`, or by
@@ -333,12 +369,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `ringline` `NvmeConfig`, `FsConfig` and `DirectIoConfig`: start from
     `Default::default()` and set `max_devices` (NVMe) or `max_files`, and
     `max_commands_in_flight`.
-  - `ringline-quic` `QuicConfig`: start from `QuicConfig::server` or
-    `QuicConfig::client` and set `endpoint_config`, `server_config`,
-    `client_config` (an endpoint can take both), `send_queue_capacity`,
-    `max_transmit_datagrams`, `allow_mtud` and `rng_seed`. An endpoint with
-    neither a server nor a client config, which could neither accept nor
-    connect, can no longer be built.
+  - `ringline-quic` `QuicConfig`: built with `QuicConfig::builder()` (see
+    the entry for the ringline-quic types above) or `QuicConfig::from_proto`,
+    then `send_queue_capacity`, `max_transmit_datagrams`, `allow_mtud` and
+    `rng_seed`. The builder refuses a configuration with neither a server
+    nor a client TLS config, which could neither accept nor connect.
   - `ringline-h2` `Settings` and `ringline-h3` `Settings`, which decoded
     SETTINGS frames also return: each value has a getter of the field's name
     and a `with_` setter (`with_max_field_section_size`, which the h3 docs

@@ -6,11 +6,9 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
-use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent};
+use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent, TlsClientConfig, TlsConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
@@ -20,32 +18,28 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
 }
 
 fn server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> QuicConfig {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(16u32.into());
-    transport.max_concurrent_uni_streams(16u32.into());
-    QuicConfig::server(Arc::new(sc))
+    let tls = TlsConfig::builder().cert(certs, key).build().unwrap();
+    QuicConfig::builder()
+        .server(tls)
+        .max_concurrent_bidi_streams(16)
+        .max_concurrent_uni_streams(16)
+        .build()
+        .unwrap()
 }
 
 fn client_config(certs: &[CertificateDer<'static>]) -> QuicConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert.clone()).unwrap();
-    }
-    let rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let mut cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
-    ));
-    let mut transport = TransportConfig::default();
-    // Tight per-stream window so server responses get backpressured.
-    transport.stream_receive_window(VarInt::from(1024u32));
-    transport.receive_window(VarInt::from(4096u32));
-    transport.max_concurrent_bidi_streams(16u32.into());
-    transport.max_concurrent_uni_streams(16u32.into());
-    cc.transport_config(Arc::new(transport));
-    QuicConfig::client(cc)
+    let tls = TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap();
+    QuicConfig::builder()
+        .client(tls)
+        .stream_receive_window(1024)
+        .receive_window(4096)
+        .max_concurrent_bidi_streams(16)
+        .max_concurrent_uni_streams(16)
+        .build()
+        .unwrap()
 }
 
 fn shuffle(
@@ -355,7 +349,12 @@ fn connection_close_cleans_up_state() {
     );
 
     // Close the QUIC connection.
-    server_ep.close_connection(common::now(), server_conn, 0, b"graceful closure".as_ref());
+    server_ep.close_connection(
+        common::now(),
+        server_conn,
+        ringline_quic::VarInt::from_u32(0),
+        b"graceful closure".as_ref(),
+    );
 
     // Flush and process.
     shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);

@@ -84,29 +84,31 @@ fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
     (vec![CertificateDer::from(cert.cert)], key.into())
 }
 
-fn quinn_server_config(
+fn ringline_quic_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Arc<quinn_proto::ServerConfig> {
-    let mut sc = quinn_proto::ServerConfig::with_single_cert(certs, key).expect("server config");
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(1024u32.into());
-    transport.max_concurrent_uni_streams(1024u32.into());
-    Arc::new(sc)
+) -> ringline_quic::QuicConfig {
+    let tls = ringline_quic::TlsConfig::builder()
+        .cert(certs, key)
+        .build()
+        .expect("server tls config");
+    ringline_quic::QuicConfig::builder()
+        .server(tls)
+        .max_concurrent_bidi_streams(1024)
+        .max_concurrent_uni_streams(1024)
+        .build()
+        .expect("server config")
 }
 
-fn quinn_client_config(certs: &[CertificateDer<'static>]) -> quinn_proto::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert.clone()).expect("add cert");
-    }
-    let crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    quinn_proto::ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(crypto)
-            .expect("quic client config"),
-    ))
+fn ringline_quic_client_config(certs: &[CertificateDer<'static>]) -> ringline_quic::QuicConfig {
+    let tls = ringline_quic::TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .expect("client tls config");
+    ringline_quic::QuicConfig::builder()
+        .client(tls)
+        .build()
+        .expect("quic client config")
 }
 
 // ── Server (ringline + QuicEndpoint) ────────────────────────────────
@@ -213,8 +215,7 @@ fn start_quic_server(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<BenchmarkServer, String> {
-    let server_config = quinn_server_config(certs, key);
-    let quic_config = ringline_quic::QuicConfig::server(server_config);
+    let quic_config = ringline_quic_server_config(certs, key);
 
     {
         let mut guard = SERVER_CFG.lock().unwrap();
@@ -283,11 +284,10 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
         udp: ringline::UdpCtx,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         let state = RINGLINE_QUIC_CFG.lock().ok()?.as_ref()?.clone();
-        let client_config = quinn_client_config(&state.certs);
+        let quic_config = ringline_quic_client_config(&state.certs);
         let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
         Some(Box::pin(async move {
-            let quic_config = ringline_quic::QuicConfig::client(client_config);
             let mut quic = ringline_quic::QuicEndpoint::new(quic_config, local_addr);
 
             // Kick off the connection. The handshake is driven by the
@@ -302,7 +302,7 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
 
             let mut read_buf = vec![0u8; 65536];
             let payload: Vec<u8> = vec![0xCDu8; state.msg_size];
-            let mut in_flight: HashMap<quinn_proto::StreamId, StreamPhase> = HashMap::new();
+            let mut in_flight: HashMap<ringline_quic::StreamId, StreamPhase> = HashMap::new();
             let mut connected = false;
             let mut local_ops: u64 = 0;
 
@@ -421,7 +421,7 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                                         Instant::now(),
                                         conn_id,
                                         stream,
-                                        quinn_proto::VarInt::from_u32(0),
+                                        ringline_quic::VarInt::from_u32(0),
                                     );
                                     break;
                                 }

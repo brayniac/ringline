@@ -9,12 +9,13 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use quinn_proto::{ClientConfig, ServerConfig};
-use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent};
+use ringline_quic::{
+    QuicConfig, QuicConfigBuilder, QuicConnId, QuicEndpoint, QuicEvent, StreamId, TlsClientConfig,
+    TlsConfig, VarInt,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 // ── Common helpers ─────────────────────────────────────────────────────
@@ -25,26 +26,34 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     (vec![CertificateDer::from(cert.cert)], key.into())
 }
 
+/// A server config builder with its own TLS config, and so its own server
+/// session cache.
+fn server_builder(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> QuicConfigBuilder {
+    let tls = TlsConfig::builder().cert(certs, key).build().unwrap();
+    QuicConfig::builder().server(tls)
+}
+
+fn client_builder(certs: &[CertificateDer<'static>]) -> QuicConfigBuilder {
+    let tls = TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap();
+    QuicConfig::builder().client(tls)
+}
+
 fn server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> QuicConfig {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(64u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    QuicConfig::server(Arc::new(sc))
+    server_builder(certs, key)
+        .max_concurrent_bidi_streams(64)
+        .max_concurrent_uni_streams(64)
+        .build()
+        .unwrap()
 }
 
 fn client_config(certs: &[CertificateDer<'static>]) -> QuicConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert.clone()).unwrap();
-    }
-    let rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
-    ));
-    QuicConfig::client(cc)
+    client_builder(certs).build().unwrap()
 }
 
 /// Drive both endpoints to a stable state by ferrying any pending packets
@@ -171,7 +180,7 @@ fn read_until_fin(
     rx_addr: SocketAddr,
     tx_addr: SocketAddr,
     rx_conn: QuicConnId,
-    stream: quinn_proto::StreamId,
+    stream: StreamId,
     expected_len: usize,
 ) -> (Vec<u8>, bool) {
     let mut acc = Vec::with_capacity(expected_len);
@@ -344,7 +353,7 @@ fn close_connection_drains_close_packet_without_explicit_flush() {
     let (_cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
     let pre = server.send_queue_len();
-    server.close_connection(common::now(), sc, 0x42, b"bye");
+    server.close_connection(common::now(), sc, VarInt::from_u32(0x42), b"bye");
     let post = server.send_queue_len();
     assert!(
         post > pre,
@@ -358,7 +367,7 @@ fn close_connection_delivers_event_to_peer() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
-    server.close_connection(common::now(), sc, 0x42, b"bye");
+    server.close_connection(common::now(), sc, VarInt::from_u32(0x42), b"bye");
     server.flush(common::now());
 
     let mut client_close = None;
@@ -369,17 +378,22 @@ fn close_connection_delivers_event_to_peer() {
         sa,
         |c, _| {
             while let Some(ev) = c.poll_event() {
-                if let QuicEvent::ConnectionClosed { .. } = ev {
-                    client_close = Some(true);
+                if let QuicEvent::ConnectionClosed { reason, .. } = ev {
+                    client_close = Some(reason);
                 }
             }
             client_close.is_some()
         },
         32,
     );
-    assert!(
-        client_close.is_some(),
-        "client should observe ConnectionClosed after server.close_connection"
+    let reason =
+        client_close.expect("client should observe ConnectionClosed after server.close_connection");
+    assert_eq!(
+        reason,
+        ringline_quic::ConnectionError::ApplicationClosed {
+            code: VarInt::from_u32(0x42),
+            reason: Bytes::from_static(b"bye"),
+        }
     );
 
     // After the close round-trips, the client connection should eventually
@@ -431,7 +445,7 @@ fn many_concurrent_bidi_streams_round_trip() {
 
     // Open 16 bidirectional streams from the client. Each carries a
     // distinct payload that must round-trip independently.
-    let mut client_streams: Vec<(quinn_proto::StreamId, Vec<u8>)> = Vec::new();
+    let mut client_streams: Vec<(StreamId, Vec<u8>)> = Vec::new();
     for i in 0..16u8 {
         let stream = client
             .open_bi(cc)
@@ -484,7 +498,7 @@ fn closed_connection_id_returns_invalid() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
-    server.close_connection(common::now(), sc, 0, b"goodbye");
+    server.close_connection(common::now(), sc, VarInt::from_u32(0), b"goodbye");
     server.flush(common::now());
 
     // Drive until the client connection is purged from its slab.
@@ -568,31 +582,18 @@ fn server_drops_incoming_when_no_server_config() {
 fn idle_timeout_closes_connection() {
     // Configure short idle timeout via custom server transport.
     let (certs, key) = self_signed();
-    let mut sc = ServerConfig::with_single_cert(certs.clone(), key).unwrap();
-    let st = Arc::get_mut(&mut sc.transport).unwrap();
-    st.max_concurrent_bidi_streams(64u32.into());
-    st.max_idle_timeout(Some(Duration::from_millis(200).try_into().unwrap()));
-    let mut server = QuicEndpoint::new(
-        QuicConfig::server(Arc::new(sc)),
-        "127.0.0.1:50901".parse().unwrap(),
-    );
+    let server_cfg = server_builder(certs.clone(), key)
+        .max_concurrent_bidi_streams(64)
+        .max_idle_timeout(Some(Duration::from_millis(200)))
+        .build()
+        .unwrap();
+    let mut server = QuicEndpoint::new(server_cfg, "127.0.0.1:50901".parse().unwrap());
 
-    let mut cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from({
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in &certs {
-                roots.add(cert.clone()).unwrap();
-            }
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        })
-        .unwrap(),
-    ));
-    let mut ct = quinn_proto::TransportConfig::default();
-    ct.max_idle_timeout(Some(Duration::from_millis(200).try_into().unwrap()));
-    cc.transport_config(Arc::new(ct));
-    let mut client = QuicEndpoint::new(QuicConfig::client(cc), "127.0.0.1:50900".parse().unwrap());
+    let client_cfg = client_builder(&certs)
+        .max_idle_timeout(Some(Duration::from_millis(200)))
+        .build()
+        .unwrap();
+    let mut client = QuicEndpoint::new(client_cfg, "127.0.0.1:50900".parse().unwrap());
 
     let ca: SocketAddr = "127.0.0.1:50900".parse().unwrap();
     let sa: SocketAddr = "127.0.0.1:50901".parse().unwrap();
@@ -612,12 +613,14 @@ fn idle_timeout_closes_connection() {
     // pruned its connection slab.
     let mut closed = 0;
     while let Some(ev) = client.poll_event() {
-        if let QuicEvent::ConnectionClosed { .. } = ev {
+        if let QuicEvent::ConnectionClosed { reason, .. } = ev {
+            assert_eq!(reason, ringline_quic::ConnectionError::TimedOut);
             closed += 1;
         }
     }
     while let Some(ev) = server.poll_event() {
-        if let QuicEvent::ConnectionClosed { .. } = ev {
+        if let QuicEvent::ConnectionClosed { reason, .. } = ev {
+            assert_eq!(reason, ringline_quic::ConnectionError::TimedOut);
             closed += 1;
         }
     }
@@ -761,7 +764,7 @@ fn peer_stop_sending_surfaces_streamstopped_event() {
 
     // Server tells the client to stop sending.
     server
-        .stop_sending(common::now(), sc, s, quinn_proto::VarInt::from_u32(0x99))
+        .stop_sending(common::now(), sc, s, VarInt::from_u32(0x99))
         .unwrap();
     server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
@@ -783,7 +786,7 @@ fn peer_stop_sending_surfaces_streamstopped_event() {
         "client should receive StreamStopped after server's stop_sending — \
          silent loss here means the bug regressed",
     );
-    assert_eq!(code, quinn_proto::VarInt::from_u32(0x99));
+    assert_eq!(code, VarInt::from_u32(0x99));
 }
 
 #[test]
@@ -809,12 +812,7 @@ fn reset_stream_surfaces_read_error_to_peer() {
 
     // Client resets the send side.
     client
-        .reset_stream(
-            common::now(),
-            cc,
-            stream,
-            quinn_proto::VarInt::from_u32(0x42),
-        )
+        .reset_stream(common::now(), cc, stream, VarInt::from_u32(0x42))
         .unwrap();
     client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
@@ -823,8 +821,8 @@ fn reset_stream_surfaces_read_error_to_peer() {
     // (specifically, a `ReadError::Reset`).
     match server.stream_recv(common::now(), sc, s, &mut buf) {
         Ok(_) => panic!("expected an error after peer reset, got Ok"),
-        Err(ringline_quic::Error::Read(quinn_proto::ReadError::Reset(code))) => {
-            assert_eq!(code, quinn_proto::VarInt::from_u32(0x42));
+        Err(ringline_quic::Error::Read(ringline_quic::ReadError::Reset(code))) => {
+            assert_eq!(code, VarInt::from_u32(0x42));
         }
         Err(other) => panic!("expected ReadError::Reset, got {other:?}"),
     }
@@ -880,11 +878,11 @@ fn server_config_with_stream_limits(
     bidi: u32,
     uni: u32,
 ) -> QuicConfig {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(bidi.into());
-    transport.max_concurrent_uni_streams(uni.into());
-    QuicConfig::server(Arc::new(sc))
+    server_builder(certs, key)
+        .max_concurrent_bidi_streams(bidi)
+        .max_concurrent_uni_streams(uni)
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -958,7 +956,7 @@ fn streams_available_fires_when_peer_raises_limit() {
         drain(&mut client, &mut server, ca, sa);
         while let Some(ev) = client.poll_event() {
             if let QuicEvent::StreamsAvailable { dir, .. } = ev
-                && dir == quinn_proto::Dir::Bi
+                && dir == ringline_quic::Dir::Bi
             {
                 got_avail = true;
             }
@@ -1059,43 +1057,16 @@ fn datagram_drop_old_when_full_does_not_error() {
 
 // ── 0-RTT (early data) ─────────────────────────────────────────────────
 
-/// Build a `(client_cfg, server_cfg)` pair with rustls 0-RTT enabled on
-/// both sides. The client side enables `enable_early_data` so the
-/// resumption cache is populated after the first handshake; the server
-/// side gets `max_early_data_size = u32::MAX` for free from
-/// `quinn_proto::ServerConfig::with_single_cert`.
-///
-/// Both configs are returned independently (not shared by Arc) so the
-/// returned QuicConfigs can be passed by value to `QuicEndpoint::new`.
-/// The rustls ClientConfig inside the QuicConfig contains the
-/// session-resumption cache (rustls's default in-memory cache), which is
-/// what makes 0-RTT possible on a subsequent connection.
+/// Build a `(client_cfg, server_cfg)` pair with 0-RTT enabled on both
+/// sides. A server accepts 0-RTT by default; the client enables it with
+/// `zero_rtt(true)`. The client's QUIC session store (one per
+/// `TlsClientConfig`, shared by clones of the `QuicConfig`) holds the
+/// ticket from the first handshake, which makes 0-RTT possible on a later
+/// connection.
 fn zero_rtt_configs() -> (QuicConfig, QuicConfig) {
     let (certs, key) = self_signed();
-
-    // Server: with_single_cert already enables max_early_data_size.
-    let mut sc = ServerConfig::with_single_cert(certs.clone(), key).unwrap();
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(64u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    let server_cfg = QuicConfig::server(Arc::new(sc));
-
-    // Client: must explicitly enable_early_data; the rustls default
-    // resumption cache (in-memory, 256 server-name slots) is on by
-    // default and stores tickets keyed by server-name.
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in &certs {
-        roots.add(cert.clone()).unwrap();
-    }
-    let mut rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    rustls_cfg.enable_early_data = true;
-    let cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
-    ));
-    let client_cfg = QuicConfig::client(cc);
-
+    let server_cfg = server_config(certs.clone(), key);
+    let client_cfg = client_builder(&certs).zero_rtt(true).build().unwrap();
     (client_cfg, server_cfg)
 }
 
@@ -1139,7 +1110,7 @@ fn read_full(
     rx_addr: SocketAddr,
     tx_addr: SocketAddr,
     rx_conn: QuicConnId,
-    stream: quinn_proto::StreamId,
+    stream: StreamId,
 ) -> (Vec<u8>, bool) {
     let mut acc = Vec::new();
     let mut buf = vec![0u8; 4096];
@@ -1239,7 +1210,7 @@ fn zero_rtt_round_trip() {
 
     // Close conn 1 cleanly. The server's CONNECTION_CLOSE flushes;
     // client observes ConnectionClosed.
-    client.close_connection(common::now(), cc1, 0, b"warmup-done");
+    client.close_connection(common::now(), cc1, VarInt::from_u32(0), b"warmup-done");
     for _ in 0..8 {
         drain(&mut client, &mut server, ca, sa);
         while let Some(_ev) = client.poll_event() {}
@@ -1270,7 +1241,7 @@ fn zero_rtt_round_trip() {
     // 0-RTT uni stream) — both arrive in events, but we only get one
     // shot at each, so collect them both as we drain.
     let mut server_sc2: Option<QuicConnId> = None;
-    let mut server_zero_rtt_stream: Option<quinn_proto::StreamId> = None;
+    let mut server_zero_rtt_stream: Option<StreamId> = None;
     for _ in 0..16 {
         drain(&mut client, &mut server, ca, sa);
         while let Some(ev) = server.poll_event() {
@@ -1322,9 +1293,9 @@ fn zero_rtt_round_trip() {
 #[test]
 fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
     // Build a client + two independent server endpoints. Each
-    // `QuicConfig::server` call yields a fresh rustls ServerConfig
-    // with its own session-ticket encryption key, so a ticket issued
-    // by server A cannot be decrypted by server B. Client sees a
+    // `TlsConfig::builder` call yields a fresh rustls ServerConfig
+    // with its own server session cache, so server B has no entry for
+    // a ticket server A issued. Client sees a
     // 0-RTT rejection on the second handshake.
     //
     // This test pins the `ZeroRttRejected` event semantics in place:
@@ -1334,26 +1305,11 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
 
     // Two server configs sharing the same identity.
     let mk_server = |certs: &Vec<CertificateDer<'static>>, key: &PrivateKeyDer<'static>| {
-        let mut sc = ServerConfig::with_single_cert(certs.clone(), key.clone_key()).unwrap();
-        let transport = Arc::get_mut(&mut sc.transport).unwrap();
-        transport.max_concurrent_bidi_streams(64u32.into());
-        transport.max_concurrent_uni_streams(64u32.into());
-        QuicConfig::server(Arc::new(sc))
+        server_config(certs.clone(), key.clone_key())
     };
 
     // Single client config with resumption + early-data.
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in &certs {
-        roots.add(cert.clone()).unwrap();
-    }
-    let mut rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    rustls_cfg.enable_early_data = true;
-    let cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
-    ));
-    let client_cfg = QuicConfig::client(cc);
+    let client_cfg = client_builder(&certs).zero_rtt(true).build().unwrap();
 
     // ── Warmup against server A ────────────────────────────────────
     let ca: SocketAddr = "127.0.0.1:52200".parse().unwrap();
@@ -1387,7 +1343,7 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
             drain(&mut client, &mut server_a, ca, sa);
             common::advance(Duration::from_millis(2));
         }
-        client.close_connection(common::now(), cc1, 0, b"done");
+        client.close_connection(common::now(), cc1, VarInt::from_u32(0), b"done");
         for _ in 0..8 {
             drain(&mut client, &mut server_a, ca, sa);
         }
@@ -1505,12 +1461,12 @@ fn server_config_with_migration(
     key: PrivateKeyDer<'static>,
     migration_allowed: bool,
 ) -> QuicConfig {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    sc.migration(migration_allowed);
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(64u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    QuicConfig::server(Arc::new(sc))
+    server_builder(certs, key)
+        .migration(migration_allowed)
+        .max_concurrent_bidi_streams(64)
+        .max_concurrent_uni_streams(64)
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -1582,7 +1538,7 @@ fn peer_address_changed_event_fires_on_migration() {
 
 #[test]
 fn migration_disabled_drops_packets_from_new_address() {
-    // With `ServerConfig::migration(false)`, quinn-proto silently drops
+    // With `migration(false)`, quinn-proto silently drops
     // packets that arrive from a new source address rather than
     // initiating path validation. The connection stays on the original
     // path; no event fires.
@@ -1663,7 +1619,7 @@ fn quic_sustained_large_stream_round_trip() {
     let started = std::time::Instant::now();
     let mut written = 0usize;
     let mut received: Vec<u8> = Vec::with_capacity(payload.len());
-    let mut server_stream: Option<quinn_proto::StreamId> = None;
+    let mut server_stream: Option<StreamId> = None;
     let mut fin_seen = false;
     let mut buf = vec![0u8; 64 * 1024];
     // Simulated time advances one round per `drain`, so this bounds the
@@ -1687,7 +1643,7 @@ fn quic_sustained_large_stream_round_trip() {
         if written < payload.len() {
             match client.stream_send(cc, stream, &payload[written..]) {
                 Ok(n) => written += n,
-                Err(ringline_quic::Error::Write(quinn_proto::WriteError::Blocked)) => {
+                Err(ringline_quic::Error::Write(ringline_quic::WriteError::Blocked)) => {
                     // Window full — keep ferrying so the server can
                     // ack/drain and reopen it.
                 }
@@ -1818,8 +1774,8 @@ fn close_connection_called_twice_is_idempotent() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
 
-    client.close_connection(common::now(), cc, 0, b"first");
-    client.close_connection(common::now(), cc, 0, b"second");
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"first");
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"second");
 
     let mut close_events = 0;
     while let Some(ev) = client.poll_event() {
@@ -1859,12 +1815,7 @@ fn stream_finish_surfaces_peer_stop_sending_error_code() {
     }
     let server_stream = server_stream.expect("server saw stream");
     server
-        .stop_sending(
-            common::now(),
-            sc,
-            server_stream,
-            quinn_proto::VarInt::from_u32(0xc0de),
-        )
+        .stop_sending(common::now(), sc, server_stream, VarInt::from_u32(0xc0de))
         .expect("stop_sending");
     server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
@@ -1914,7 +1865,7 @@ fn stream_send_on_closing_connection_returns_connection_closing() {
     let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
     let stream = client.open_bi(cc).unwrap().unwrap();
 
-    client.close_connection(common::now(), cc, 0, b"done");
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"done");
     // Now the connection is closed locally — `get_conn_mut` rejects
     // application operations with `InvalidConnection`.
     let err = client
@@ -1960,5 +1911,183 @@ fn poll_send_yields_nothing_until_flush() {
     assert!(
         client.poll_send().is_some(),
         "flush must generate the packet for the buffered bytes"
+    );
+}
+
+// ── Session store and statistics ───────────────────────────────────────
+
+/// Complete a TLS handshake over memory with the TCP configs, and read the
+/// session tickets the server sends after it, so the client's TCP store
+/// holds tickets for "localhost".
+fn tcp_handshake_in_memory(
+    client: &TlsClientConfig,
+    server: &TlsConfig,
+) -> Option<ringline_quic::tls_config::rustls::HandshakeKind> {
+    use ringline_quic::tls_config::rustls;
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut c = rustls::ClientConnection::new(client.rustls_config().clone(), name).unwrap();
+    let mut s = rustls::ServerConnection::new(server.rustls_config().clone()).unwrap();
+    for _ in 0..16 {
+        let mut buf = Vec::new();
+        while c.wants_write() {
+            c.write_tls(&mut buf).unwrap();
+        }
+        s.read_tls(&mut buf.as_slice()).unwrap();
+        s.process_new_packets().unwrap();
+        buf.clear();
+        while s.wants_write() {
+            s.write_tls(&mut buf).unwrap();
+        }
+        c.read_tls(&mut buf.as_slice()).unwrap();
+        c.process_new_packets().unwrap();
+        if !c.is_handshaking() && !s.is_handshaking() && !s.wants_write() {
+            break;
+        }
+    }
+    assert!(!c.is_handshaking(), "the in-memory TCP handshake completed");
+    c.handshake_kind()
+}
+
+/// Connect, let the server's session ticket arrive, and close.
+fn warm_up(client: &mut QuicEndpoint, server: &mut QuicEndpoint, ca: SocketAddr, sa: SocketAddr) {
+    let (cc, _sc) = handshake(client, server, ca, sa);
+    for _ in 0..16 {
+        drain(client, server, ca, sa);
+        common::advance(Duration::from_millis(2));
+    }
+    client.close_connection(common::now(), cc, VarInt::from_u32(0), b"warm");
+    for _ in 0..8 {
+        drain(client, server, ca, sa);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+    }
+}
+
+/// QUIC configs built from one `TlsClientConfig`, and from its clones,
+/// share one QUIC session store, and that store is not TCP's. A ticket
+/// from a TCP handshake to the same name, which would carry no 0-RTT,
+/// does not displace the QUIC ticket.
+#[test]
+fn quic_session_store_is_shared_and_separate_from_tcp() {
+    let (certs, key) = self_signed();
+    let tls_server = TlsConfig::builder()
+        .cert(certs.clone(), key)
+        .build()
+        .unwrap();
+    let tls_client = TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap();
+    let server_cfg = QuicConfig::builder()
+        .server(tls_server.clone())
+        .max_concurrent_bidi_streams(64)
+        .build()
+        .unwrap();
+    let cfg_a = QuicConfig::builder()
+        .client(tls_client.clone())
+        .zero_rtt(true)
+        .build()
+        .unwrap();
+    let cfg_b = QuicConfig::builder()
+        .client(tls_client.clone())
+        .zero_rtt(true)
+        .build()
+        .unwrap();
+
+    let sa: SocketAddr = "127.0.0.1:52301".parse().unwrap();
+    let ca: SocketAddr = "127.0.0.1:52302".parse().unwrap();
+    let cb: SocketAddr = "127.0.0.1:52303".parse().unwrap();
+    let mut server = QuicEndpoint::new(server_cfg, sa);
+    let mut client_a = QuicEndpoint::new(cfg_a, ca);
+    warm_up(&mut client_a, &mut server, ca, sa);
+
+    // Newer tickets for "localhost", in the TCP store. The second handshake
+    // resuming shows the first stored a ticket there.
+    tcp_handshake_in_memory(&tls_client, &tls_server);
+    assert_eq!(
+        tcp_handshake_in_memory(&tls_client, &tls_server),
+        Some(ringline_quic::tls_config::rustls::HandshakeKind::Resumed),
+        "the TCP store holds tickets for localhost"
+    );
+
+    let mut client_b = QuicEndpoint::new(cfg_b, cb);
+    let conn = client_b
+        .connect(common::now(), sa, "localhost")
+        .expect("connect");
+    assert!(
+        client_b.has_0rtt(conn),
+        "a QuicConfig from the same TlsClientConfig has the QUIC ticket"
+    );
+}
+
+/// `connection_stats` reports each direction's traffic separately: the
+/// server's sent datagrams are the client's received ones, and only the
+/// client's side counts sent stream frames.
+#[test]
+fn connection_stats_count_both_directions() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+    // 32 KiB from the client and nothing from the server, so the client's
+    // sent bytes exceed its received bytes and the server's the reverse.
+    let stream = client.open_bi(cc).unwrap().unwrap();
+    let payload = vec![0x5au8; 32 * 1024];
+    let mut sent = 0;
+    for _ in 0..64 {
+        if sent == payload.len() {
+            break;
+        }
+        sent += client
+            .stream_send(cc, stream, &payload[sent..])
+            .unwrap_or(0);
+        client.flush(common::now());
+        drain(&mut client, &mut server, ca, sa);
+        let mut buf = vec![0u8; 64 * 1024];
+        let _ = server.stream_recv(common::now(), sc, stream, &mut buf);
+    }
+    assert_eq!(sent, payload.len());
+    client.stream_finish(common::now(), cc, stream).unwrap();
+    for _ in 0..8 {
+        drain(&mut client, &mut server, ca, sa);
+    }
+    assert_eq!((client.send_queue_len(), server.send_queue_len()), (0, 0));
+    let c = client.connection_stats(cc).unwrap();
+    let s = server.connection_stats(sc).unwrap();
+    assert!(c.udp_tx().bytes() > c.udp_rx().bytes(), "{c:?}");
+    assert!(s.udp_rx().bytes() > s.udp_tx().bytes(), "{s:?}");
+    // Every datagram the server sent reached the client's connection. The
+    // reverse can differ by the datagrams the server's endpoint handled
+    // before the connection existed.
+    assert_eq!(s.udp_tx().datagrams(), c.udp_rx().datagrams());
+    assert!(c.udp_tx().datagrams() >= s.udp_rx().datagrams());
+    // Only the client sent stream data.
+    assert!(c.frame_tx().stream() >= 1, "{:?}", c.frame_tx());
+    assert!(s.frame_rx().stream() >= 1, "{:?}", s.frame_rx());
+    assert_eq!(s.frame_tx().stream(), 0, "{:?}", s.frame_tx());
+    assert_eq!(c.frame_rx().stream(), 0, "{:?}", c.frame_rx());
+    assert!(c.path().current_mtu() > 0);
+}
+
+/// `connect` on an endpoint with no client config returns
+/// `Error::Connect(ConnectError::NoClientConfig)`.
+#[test]
+fn connect_without_a_client_config_is_refused() {
+    let (certs, key) = self_signed();
+    let mut server = QuicEndpoint::new(
+        server_config(certs, key),
+        "127.0.0.1:52401".parse().unwrap(),
+    );
+    let r = server.connect(
+        common::now(),
+        "127.0.0.1:52402".parse().unwrap(),
+        "localhost",
+    );
+    assert!(
+        matches!(
+            r,
+            Err(ringline_quic::Error::Connect(
+                ringline_quic::ConnectError::NoClientConfig
+            ))
+        ),
+        "{r:?}"
     );
 }

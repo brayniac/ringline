@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event,
-    ServerConfig,
 };
 use ringline::{
     AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, UdpCtx, select, sleep,
@@ -28,16 +27,23 @@ fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
     (vec![cert_der], key.into())
 }
 
-fn server_crypto(
+/// The ringline-quic server config. The client side of these tests is a raw
+/// upstream `quinn_proto::Endpoint`.
+fn server_quic_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Arc<ServerConfig> {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    // Allow enough concurrent streams for tests.
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(64u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    Arc::new(sc)
+) -> QuicConfig {
+    let tls = ringline_quic::TlsConfig::builder()
+        .cert(certs, key)
+        .build()
+        .unwrap();
+    QuicConfig::builder()
+        .server(tls)
+        // Allow enough concurrent streams for tests.
+        .max_concurrent_bidi_streams(64)
+        .max_concurrent_uni_streams(64)
+        .build()
+        .unwrap()
 }
 
 fn client_crypto(certs: &[CertificateDer<'static>]) -> ClientConfig {
@@ -398,10 +404,8 @@ fn quic_echo() {
     }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
-    let server_cfg = server_crypto(certs.clone(), key);
+    let quic_config = server_quic_config(certs.clone(), key);
     let client_cfg = client_crypto(&certs);
-
-    let quic_config = QuicConfig::server(server_cfg);
 
     // Store config for server handler.
     SERVER_CONFIG
@@ -444,10 +448,8 @@ fn quic_multi_stream() {
     }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
-    let server_cfg = server_crypto(certs.clone(), key);
+    let quic_config = server_quic_config(certs.clone(), key);
     let client_cfg = client_crypto(&certs);
-
-    let quic_config = QuicConfig::server(server_cfg);
 
     SERVER_CONFIG
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -497,10 +499,8 @@ fn quic_large_message() {
     }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
-    let server_cfg = server_crypto(certs.clone(), key);
+    let quic_config = server_quic_config(certs.clone(), key);
     let client_cfg = client_crypto(&certs);
-
-    let quic_config = QuicConfig::server(server_cfg);
 
     SERVER_CONFIG
         .get_or_init(|| std::sync::Mutex::new(None))

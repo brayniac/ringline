@@ -910,7 +910,12 @@ impl H3Connection {
         if let Some(conn) = self.conn_id
             && !matches!(self.state, H3State::Closed)
         {
-            quic.close_connection(now, conn, code, err.to_string().as_bytes());
+            quic.close_connection(
+                now,
+                conn,
+                ringline_quic::VarInt::from_u32(code),
+                err.to_string().as_bytes(),
+            );
         }
         self.state = H3State::Closed;
         self.events.push_back(H3Event::Error(err));

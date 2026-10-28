@@ -3,15 +3,16 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::BytesMut;
-use quinn_proto::{
-    ClientConfig, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Event, StreamEvent,
-    StreamId, WriteError,
-};
+use quinn_proto::{ClientConfig, ConnectionHandle, DatagramEvent, Event, StreamEvent};
 use slab::Slab;
 
 use crate::config::QuicConfig;
 use crate::error::Error;
 use crate::event::{QuicConnId, QuicEvent};
+use crate::types::{
+    ConnectError, ConnectionError, ConnectionStats, Dir, ReadError, ReadableError, StreamId,
+    VarInt, WriteError,
+};
 
 /// A sans-IO QUIC endpoint.
 ///
@@ -324,11 +325,15 @@ impl QuicEndpoint {
         peer: SocketAddr,
         server_name: &str,
     ) -> Result<QuicConnId, Error> {
-        let client_config = self.client_config.clone().ok_or(Error::ConnectionClosed)?;
+        let client_config = self
+            .client_config
+            .clone()
+            .ok_or(Error::Connect(ConnectError::NoClientConfig))?;
 
         let (ch, conn) = self
             .endpoint
-            .connect(now, client_config, peer, server_name)?;
+            .connect(now, client_config, peer, server_name)
+            .map_err(|e| Error::Connect(ConnectError::from_proto(e)))?;
 
         let key = self.insert_connection(ch, conn, true);
         self.drain_transmits(key, now);
@@ -346,24 +351,23 @@ impl QuicEndpoint {
         data: &[u8],
     ) -> Result<usize, Error> {
         let c = self.get_conn_mut(conn)?;
-        match c.conn.send_stream(stream).write(data) {
+        match c.conn.send_stream(stream.to_proto()).write(data) {
             Ok(n) => Ok(n),
-            Err(WriteError::Blocked) if c.conn.is_closed() => {
+            Err(quinn_proto::WriteError::Blocked) if c.conn.is_closed() => {
                 // quinn-proto's `write_source` short-circuits to `Blocked`
                 // once the connection is in Closed/Draining — but no
                 // `StreamWritable` event will ever fire to unblock us.
                 // Translate to a distinct error so callers don't retry.
                 Err(Error::ConnectionClosing)
             }
-            Err(e) => Err(Error::Write(e)),
+            Err(e) => Err(Error::Write(WriteError::from_proto(e))),
         }
     }
 
     /// Send scatter-gather data on a QUIC stream without copying.
     ///
     /// Each [`Bytes`](bytes::Bytes) in `chunks` is handed to quinn-proto's
-    /// [`SendStream::write_chunks`](quinn_proto::SendStream::write_chunks);
-    /// partial chunks are advanced in place (their refcount drops the
+    /// `SendStream::write_chunks`; partial chunks are advanced in place (their refcount drops the
     /// consumed prefix) and fully-consumed chunks are replaced with an
     /// empty `Bytes`. Returns the total bytes written across all chunks.
     ///
@@ -377,10 +381,12 @@ impl QuicEndpoint {
         chunks: &mut [bytes::Bytes],
     ) -> Result<usize, Error> {
         let c = self.get_conn_mut(conn)?;
-        match c.conn.send_stream(stream).write_chunks(chunks) {
+        match c.conn.send_stream(stream.to_proto()).write_chunks(chunks) {
             Ok(written) => Ok(written.bytes),
-            Err(WriteError::Blocked) if c.conn.is_closed() => Err(Error::ConnectionClosing),
-            Err(e) => Err(Error::Write(e)),
+            Err(quinn_proto::WriteError::Blocked) if c.conn.is_closed() => {
+                Err(Error::ConnectionClosing)
+            }
+            Err(e) => Err(Error::Write(WriteError::from_proto(e))),
         }
     }
 
@@ -400,8 +406,10 @@ impl QuicEndpoint {
             return Err(Error::InvalidConnection);
         }
         let c = &mut self.connections[key];
-        let mut recv = c.conn.recv_stream(stream);
-        let mut chunks = recv.read(true)?;
+        let mut recv = c.conn.recv_stream(stream.to_proto());
+        let mut chunks = recv
+            .read(true)
+            .map_err(|e| Error::Readable(ReadableError::from_proto(e)))?;
         let mut total = 0;
         let mut finished = false;
         let mut read_err: Option<quinn_proto::ReadError> = None;
@@ -434,7 +442,7 @@ impl QuicEndpoint {
             self.drain_transmits(key, now);
         }
         if let Some(e) = read_err {
-            return Err(Error::Read(e));
+            return Err(Error::Read(ReadError::from_proto(e)));
         }
         Ok((total, finished))
     }
@@ -462,8 +470,10 @@ impl QuicEndpoint {
             return Err(Error::InvalidConnection);
         }
         let c = &mut self.connections[key];
-        let mut recv = c.conn.recv_stream(stream);
-        let mut chunks = recv.read(true)?;
+        let mut recv = c.conn.recv_stream(stream.to_proto());
+        let mut chunks = recv
+            .read(true)
+            .map_err(|e| Error::Readable(ReadableError::from_proto(e)))?;
         let mut total = 0;
         let mut finished = false;
         let mut read_err: Option<quinn_proto::ReadError> = None;
@@ -490,7 +500,7 @@ impl QuicEndpoint {
             self.drain_transmits(key, now);
         }
         if let Some(e) = read_err {
-            return Err(Error::Read(e));
+            return Err(Error::Read(ReadError::from_proto(e)));
         }
         Ok((total, finished))
     }
@@ -509,9 +519,11 @@ impl QuicEndpoint {
     ) -> Result<(), Error> {
         let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
-        match c.conn.send_stream(stream).finish() {
+        match c.conn.send_stream(stream.to_proto()).finish() {
             Ok(()) => {}
-            Err(quinn_proto::FinishError::Stopped(code)) => return Err(Error::StreamStopped(code)),
+            Err(quinn_proto::FinishError::Stopped(code)) => {
+                return Err(Error::StreamStopped(VarInt::from_proto(code)));
+            }
             Err(quinn_proto::FinishError::ClosedStream) => return Err(Error::StreamClosed),
         }
         self.drain_transmits(key, now);
@@ -529,11 +541,15 @@ impl QuicEndpoint {
         now: Instant,
         conn: QuicConnId,
         stream: StreamId,
-        error_code: quinn_proto::VarInt,
+        error_code: VarInt,
     ) -> Result<(), Error> {
         let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
-        match c.conn.recv_stream(stream).stop(error_code) {
+        match c
+            .conn
+            .recv_stream(stream.to_proto())
+            .stop(error_code.to_proto())
+        {
             Ok(()) => {}
             Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
         }
@@ -543,7 +559,7 @@ impl QuicEndpoint {
 
     /// Reset `stream`, indicating to the peer that no more data will be
     /// sent. The peer's recv side will surface a
-    /// [`quinn_proto::ReadError::Reset`] on its next `stream_recv`.
+    /// [`ReadError::Reset`] on its next `stream_recv`.
     /// Returns `Err(StreamClosed)` if the send side was already finished
     /// or reset.
     pub fn reset_stream(
@@ -551,11 +567,15 @@ impl QuicEndpoint {
         now: Instant,
         conn: QuicConnId,
         stream: StreamId,
-        error_code: quinn_proto::VarInt,
+        error_code: VarInt,
     ) -> Result<(), Error> {
         let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
-        match c.conn.send_stream(stream).reset(error_code) {
+        match c
+            .conn
+            .send_stream(stream.to_proto())
+            .reset(error_code.to_proto())
+        {
             Ok(()) => {}
             Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
         }
@@ -568,7 +588,10 @@ impl QuicEndpoint {
     /// Returns `None` if the peer's stream concurrency limit has been reached.
     pub fn open_bi(&mut self, conn: QuicConnId) -> Result<Option<StreamId>, Error> {
         let c = self.get_conn_mut(conn)?;
-        Ok(c.conn.streams().open(Dir::Bi))
+        Ok(c.conn
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .map(StreamId::from_proto))
     }
 
     /// Earliest quinn-proto timer deadline across all live connections,
@@ -597,22 +620,17 @@ impl QuicEndpoint {
         earliest
     }
 
-    /// Snapshot of quinn-proto connection statistics (RTT, CWND, frame
-    /// counts, loss). Useful for diagnostics and for adaptive policies
-    /// that want to react to congestion-control state.
-    ///
-    /// The returned [`quinn_proto::ConnectionStats`] is a `Copy` value
-    /// — callers can hold it indefinitely without keeping a borrow on
-    /// the endpoint.
-    pub fn connection_stats(
-        &self,
-        conn: QuicConnId,
-    ) -> Result<quinn_proto::ConnectionStats, Error> {
+    /// A snapshot of the connection's statistics: RTT, congestion window,
+    /// loss and UDP traffic. The returned [`ConnectionStats`] is `Copy` and
+    /// holds no borrow on the endpoint.
+    pub fn connection_stats(&self, conn: QuicConnId) -> Result<ConnectionStats, Error> {
         let key = conn.0 as usize;
         if !self.connections.contains(key) {
             return Err(Error::InvalidConnection);
         }
-        Ok(self.connections[key].conn.stats())
+        Ok(ConnectionStats::from_proto(
+            &self.connections[key].conn.stats(),
+        ))
     }
 
     /// Open a unidirectional stream.
@@ -620,7 +638,10 @@ impl QuicEndpoint {
     /// Returns `None` if the peer's stream concurrency limit has been reached.
     pub fn open_uni(&mut self, conn: QuicConnId) -> Result<Option<StreamId>, Error> {
         let c = self.get_conn_mut(conn)?;
-        Ok(c.conn.streams().open(Dir::Uni))
+        Ok(c.conn
+            .streams()
+            .open(quinn_proto::Dir::Uni)
+            .map(StreamId::from_proto))
     }
 
     /// Close a QUIC connection with the given error code and reason.
@@ -629,7 +650,13 @@ impl QuicEndpoint {
     /// before this call returns, so the peer is told about the closure as
     /// soon as the caller flushes its UDP socket. There is no need for the
     /// caller to also call [`flush`](Self::flush).
-    pub fn close_connection(&mut self, now: Instant, conn: QuicConnId, code: u32, reason: &[u8]) {
+    pub fn close_connection(
+        &mut self,
+        now: Instant,
+        conn: QuicConnId,
+        code: VarInt,
+        reason: &[u8],
+    ) {
         let key = conn.0 as usize;
         if !self.connections.contains(key) {
             return;
@@ -643,7 +670,7 @@ impl QuicEndpoint {
         }
         self.connections[key].conn.close(
             now,
-            quinn_proto::VarInt::from_u32(code),
+            code.to_proto(),
             bytes::Bytes::copy_from_slice(reason),
         );
         // Drain the CONNECTION_CLOSE packet (and any final acks) so callers
@@ -730,9 +757,11 @@ impl QuicEndpoint {
     /// data is/was possible).
     ///
     /// On the client side this becomes true immediately after `connect`
-    /// if the configured rustls client has a session resumption ticket
-    /// for the server name. On the server side it becomes true if the
-    /// peer's Initial included 0-RTT material we could decrypt.
+    /// if the client was built with
+    /// [`QuicConfigBuilder::zero_rtt(true)`](crate::QuicConfigBuilder::zero_rtt)
+    /// and its session store holds a ticket for the server name. On the
+    /// server side it becomes true if the peer's Initial included 0-RTT
+    /// material we could decrypt.
     ///
     /// Once `true`, any data written via `stream_send` /
     /// `stream_send_chunks` / `send_datagram` before the handshake
@@ -927,7 +956,7 @@ impl QuicEndpoint {
                     if !self.connections[key].close_event_emitted {
                         self.events.push_back(QuicEvent::ConnectionClosed {
                             conn: conn_id,
-                            reason,
+                            reason: ConnectionError::from_proto(reason),
                         });
                         self.connections[key].close_event_emitted = true;
                     }
@@ -954,10 +983,11 @@ impl QuicEndpoint {
                         // stream is a no-op, so emitting this unconditionally
                         // is safe.
                         while let Some(stream) = self.connections[key].conn.streams().accept(dir) {
+                            let stream = StreamId::from_proto(stream);
                             self.events.push_back(QuicEvent::StreamOpened {
                                 conn: conn_id,
                                 stream,
-                                bidi: dir == Dir::Bi,
+                                bidi: dir == quinn_proto::Dir::Bi,
                             });
                             self.events.push_back(QuicEvent::StreamReadable {
                                 conn: conn_id,
@@ -968,31 +998,33 @@ impl QuicEndpoint {
                     StreamEvent::Readable { id } => {
                         self.events.push_back(QuicEvent::StreamReadable {
                             conn: conn_id,
-                            stream: id,
+                            stream: StreamId::from_proto(id),
                         });
                     }
                     StreamEvent::Writable { id } => {
                         self.events.push_back(QuicEvent::StreamWritable {
                             conn: conn_id,
-                            stream: id,
+                            stream: StreamId::from_proto(id),
                         });
                     }
                     StreamEvent::Finished { id } => {
                         self.events.push_back(QuicEvent::StreamFinished {
                             conn: conn_id,
-                            stream: id,
+                            stream: StreamId::from_proto(id),
                         });
                     }
                     StreamEvent::Stopped { id, error_code } => {
                         self.events.push_back(QuicEvent::StreamStopped {
                             conn: conn_id,
-                            stream: id,
-                            error_code,
+                            stream: StreamId::from_proto(id),
+                            error_code: VarInt::from_proto(error_code),
                         });
                     }
                     StreamEvent::Available { dir } => {
-                        self.events
-                            .push_back(QuicEvent::StreamsAvailable { conn: conn_id, dir });
+                        self.events.push_back(QuicEvent::StreamsAvailable {
+                            conn: conn_id,
+                            dir: Dir::from_proto(dir),
+                        });
                     }
                 },
                 Event::DatagramReceived => {
