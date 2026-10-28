@@ -190,15 +190,12 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
 #[test]
 fn tls_does_not_resolve_on_a_partial_record() {
     let (certs, key) = self_signed();
-    let server = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs.clone(), key)
+    let server = TlsConfig::builder()
+        .cert(certs.clone(), key)
+        .build()
         .unwrap();
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            TlsConfig::new(Arc::new(server)),
-        )
+        .bind_tls("127.0.0.1:0".parse().unwrap(), server)
         .launch::<Tls>()
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address");

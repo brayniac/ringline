@@ -265,8 +265,9 @@ TCP, step 1:
   paths, `ringline::TlsConfig`, `ringline::TlsClientConfig`
   (`ringline/src/lib.rs:484-486`) and the same names under
   `ringline::config`, now as re-exports. `TlsInfo` stays defined in
-  ringline. `ringline::tls` is `pub(crate)` today (`lib.rs:190`); step 1
-  adds the public paths the escape hatches need.
+  ringline. ringline re-exports `ringline-tls-config` as
+  `ringline::tls_config`, which gives the escape hatches a public path;
+  ringline's internal `tls` module stays `pub(crate)` (`lib.rs:190`).
 - These stay escape-hatch only: a custom certificate verifier, a
   certificate resolver, a key log, client session resumption settings
   (`connect-bench.rs:124` disables resumption on a std client), server
@@ -402,8 +403,8 @@ QUIC, step 2:
 ### Escape hatches
 
 - `ringline_tls_config::rustls` re-exports the rustls crate it is built on,
-  and ringline re-exports that module as `ringline::tls::rustls`.
-  `TlsConfig::from_rustls(Arc<ringline::tls::rustls::ServerConfig>)` and
+  and ringline re-exports it as `ringline::tls_config::rustls`.
+  `TlsConfig::from_rustls(Arc<ringline::tls_config::rustls::ServerConfig>)` and
   `TlsClientConfig::from_rustls` accept a config built from it. The
   accessors and conversions in "The configuration crate" belong to the same
   set.

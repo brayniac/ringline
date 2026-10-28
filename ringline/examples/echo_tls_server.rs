@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use ringline::{
     AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
 };
@@ -41,7 +39,7 @@ impl AsyncEventHandler for TlsEcho {
     }
 }
 
-fn load_tls_config() -> Arc<rustls::ServerConfig> {
+fn load_tls_config() -> TlsConfig {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -60,12 +58,10 @@ fn load_tls_config() -> Arc<rustls::ServerConfig> {
     let key = PrivateKeyDer::from_pem_file(&key_pem)
         .unwrap_or_else(|e| panic!("failed to parse private key from {key_pem}: {e}"));
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("invalid TLS certificate/key");
-
-    Arc::new(config)
+    TlsConfig::builder()
+        .cert(certs, key)
+        .build()
+        .expect("invalid TLS certificate/key")
 }
 
 fn main() {
@@ -80,7 +76,7 @@ fn main() {
         .pin_to_core(false)
         .sq_entries(128)
         .max_connections(1024)
-        .tls(TlsConfig::new(server_config))
+        .tls(server_config)
         .build()
         .expect("valid config");
 

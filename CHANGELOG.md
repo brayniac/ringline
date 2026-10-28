@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- New crate `ringline-tls-config`, holding `TlsConfig`, `TlsClientConfig`,
+  their builders and the `TlsVersion` and `CipherSuite` enums. ringline
+  re-exports the types at their old paths and the crate as
+  `ringline::tls_config`. `TlsConfig::builder()` takes a certificate chain
+  and key, ALPN, `max_fragment_size` and the TLS versions;
+  `TlsClientConfig::builder()` takes root certificates or trust anchors
+  (for example `webpki_roots::TLS_SERVER_ROOTS`), ALPN, `max_fragment_size`
+  and the TLS versions. Both select rustls's *ring* provider explicitly.
+  `from_rustls`, `rustls_config` and `ringline::tls_config::rustls` wrap or
+  expose a rustls config for what the builders do not cover, such as a
+  custom verifier or client certificates. Design:
+  `docs/rustls-quinn-forks-design.md`.
 - io_uring: an accepted TLS connection can be parked (connection
   rebalancing, #443) once its handshake is done. Its TLS session moves to the
   adopting worker with it, including ciphertext received but not yet
@@ -211,6 +223,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `TlsConfig::new(Arc<rustls::ServerConfig>)` and
+  `TlsClientConfig::new(Arc<rustls::ClientConfig>)` are replaced by
+  `TlsConfig::builder()` and `TlsClientConfig::builder()`, or by
+  `from_rustls` with the same argument. `TlsInfo::protocol_version` returns
+  `Option<TlsVersion>` and `TlsInfo::cipher_suite` returns
+  `Option<CipherSuite>`; a suite the enum does not name is
+  `CipherSuite::Unknown` with its IANA code (`CipherSuite::iana_code`).
+- TLS 1.2 is enabled. `ringline-tls-config` enables rustls's `tls12`
+  feature and the builders accept TLS 1.2 and 1.3 by default; before, a
+  build negotiated TLS 1.2 only when another crate enabled the feature.
+  `versions(&[TlsVersion::Tls13])` restricts a config to TLS 1.3. A TLS 1.2
+  connection with an AES-GCM suite is closed after 2^24 records, because
+  TLS 1.2 cannot change its keys.
 - io_uring: a TLS connection receives ciphertext directly, with a one-shot
   `RECV` of up to `recv_direct_region` bytes, instead of through the
   provided-buffer ring. With the default (unbuffered) engine the receive

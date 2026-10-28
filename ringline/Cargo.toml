@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.7.0-alpha.22"
+version = "0.7.0-alpha.23"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -39,6 +39,7 @@ metriken = "0.11.3"
 pin-project-lite = "0.2"
 thiserror = "2"
 rustls = { workspace = true, features = ["std", "ring"] }
+ringline-tls-config = { workspace = true }
 # A version floor only (RUSTSEC-2026-0382); see the workspace Cargo.toml.
 rustls-webpki = { workspace = true }
 

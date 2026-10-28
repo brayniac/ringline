@@ -132,6 +132,7 @@ This is a Cargo workspace. The core runtime is in `ringline/`; protocol client c
 - **ringline-ping** — Simple PING/PONG client
 - **ringline-h2** — Sans-IO HTTP/2 client framing (HPACK, streams), zero runtime deps
 - **ringline-h3** — Sans-IO HTTP/3 framing on `ringline-quic` (QPACK static-table only, control streams)
+- **ringline-tls-config** — `TlsConfig`/`TlsClientConfig` and their builders, the `TlsVersion`/`CipherSuite` enums, and the rustls escape hatch (`from_rustls`, `rustls_config`, the `rustls` re-export). ringline re-exports it as `ringline::tls_config`. Design: `docs/rustls-quinn-forks-design.md`
 - **ringline-quic** — Sans-IO QUIC wrapping `quinn-proto`'s state machine
 - **ringline-http** — Async HTTP/1.1 + HTTP/2 client bridging `ringline-h2` to `ConnCtx`
 - **ringline-grpc** — Sans-IO gRPC framing on `ringline-h2` (no protobuf dep; caller serializes)
@@ -399,7 +400,7 @@ Two `ClientBuilder` knobs control batching of fired requests:
 
 These reflect deliberate owner decisions — follow them for any public-surface change:
 
-- **No `pub` fields on public config/value structs.** Everything is opaque: `pub(crate)` fields + builder or accessor methods (`Config`/`ConfigBuilder`, `TlsInfo`, `TlsConfig::new`). Do not split `Config` into sub-structs; it stays an opaque flat struct.
+- **No `pub` fields on public config/value structs.** Everything is opaque: `pub(crate)` fields + builder or accessor methods (`Config`/`ConfigBuilder`, `TlsInfo`, `TlsConfig::builder`). Do not split `Config` into sub-structs; it stays an opaque flat struct.
 - **Public error enums are `#[non_exhaustive]`.**
 - **Don't merge or prune send-path entry points casually.** The surviving set is deliberate: `with_data` vs `with_bytes`, `send` vs `send_nowait`, `.copy()` vs `.guard()`, `send_chain` (IO_LINK), `submit_batch` (dynamic part assembly) vs `build` (static) all carry distinct semantics.
 - **Breaking changes are batched into coordinated major releases** (see Release Process), not dribbled out.
@@ -415,7 +416,7 @@ These reflect deliberate owner decisions — follow them for any public-surface 
 
 Use the shared `release` skill from the custom-skills plugin (`/cs:release`; it discovers this repo's mechanism from the files below; there is no in-repo release skill). `/cs:open-pr` opens feature-branch PRs. Releases are **coordinated across all publishable crates**:
 
-1. Bump all package versions, the workspace `ringline` dependency requirement, AND the inter-crate exact-version requirements (http→h2, grpc→h2, h3→quic) — a stale `version = "0.x.0"` req excludes the new major and breaks publishing mid-sequence. Under 0.x a breaking release is `minor`, not `major`. The three `publish = false` crates (`ringline-bench`, `ringline-benchmarks`, `tools/doc-diagrams`) keep their own versions.
+1. Bump all package versions, the workspace `ringline` dependency requirement, AND the inter-crate exact-version requirements (http→h2, grpc→h2, h3→quic, ringline→tls-config) — a stale `version = "0.x.0"` req excludes the new major and breaks publishing mid-sequence. Under 0.x a breaking release is `minor`, not `major`. The three `publish = false` crates (`ringline-bench`, `ringline-benchmarks`, `tools/doc-diagrams`) keep their own versions.
 2. Update the committed `Cargo.lock` (CI is `--locked`).
 3. Move CHANGELOG `Unreleased` → the new version (Keep a Changelog format).
 4. PR commit message must start with `release: v` and name the version in `ringline/Cargo.toml`. After merge, `tag-release.yml` — a caller of the shared [`brayniac/rust-workflows`](https://github.com/brayniac/rust-workflows) `tag-release.yml@v1`, gated to `ringline-rs/ringline` — creates the `vX.Y.Z` tag → `release.yml` publishes unpublished crates to crates.io in dependency tiers.

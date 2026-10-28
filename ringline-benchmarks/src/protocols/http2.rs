@@ -262,13 +262,11 @@ impl ringline::AsyncEventHandler for RinglineHttp2Bench {
 }
 
 fn make_ringline_client_tls(cert: &CertificateDer<'static>) -> ringline::TlsClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.clone()).expect("add cert to roots");
-    let mut client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    client_config.alpn_protocols = vec![b"h2".to_vec()];
-    ringline::TlsClientConfig::new(Arc::new(client_config))
+    ringline::TlsClientConfig::builder()
+        .root_certificates([cert.clone()])
+        .alpn(&[b"h2"])
+        .build()
+        .expect("client tls config")
 }
 
 fn make_ringline_client_config(
