@@ -11,12 +11,12 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use bytes::Bytes;
-use quinn_proto::{ClientConfig, ServerConfig, TransportConfig};
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
-use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent, StreamId};
+use ringline_quic::{
+    QuicConfig, QuicConnId, QuicEndpoint, QuicEvent, StreamId, TlsClientConfig, TlsConfig,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
@@ -27,34 +27,31 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
 
 /// Server with permissive receive windows — we're not testing client→server.
 fn server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> QuicConfig {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(16u32.into());
-    transport.max_concurrent_uni_streams(16u32.into());
-    QuicConfig::server(Arc::new(sc))
+    let tls = TlsConfig::builder().cert(certs, key).build().unwrap();
+    QuicConfig::builder()
+        .server(tls)
+        .max_concurrent_bidi_streams(16)
+        .max_concurrent_uni_streams(16)
+        .build()
+        .unwrap()
 }
 
 /// Client with a *tight* per-stream receive window. The server, when sending
 /// a response body larger than this window, will hit `WriteError::Blocked`
 /// and exercise the queue-and-drain path we're regression-testing.
 fn client_config(certs: &[CertificateDer<'static>], stream_window: u64) -> QuicConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert.clone()).unwrap();
-    }
-    let rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let mut cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
-    ));
-    let mut transport = TransportConfig::default();
-    transport.stream_receive_window(stream_window.try_into().unwrap());
-    transport.receive_window((stream_window * 4).try_into().unwrap());
-    transport.max_concurrent_bidi_streams(16u32.into());
-    transport.max_concurrent_uni_streams(16u32.into());
-    cc.transport_config(Arc::new(transport));
-    QuicConfig::client(cc)
+    let tls = TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap();
+    QuicConfig::builder()
+        .client(tls)
+        .stream_receive_window(stream_window)
+        .receive_window(stream_window * 4)
+        .max_concurrent_bidi_streams(16)
+        .max_concurrent_uni_streams(16)
+        .build()
+        .unwrap()
 }
 
 /// Pump packets between two endpoints until neither has anything queued.

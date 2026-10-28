@@ -11,10 +11,8 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use quinn_proto::{ClientConfig, ServerConfig};
-use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent};
+use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent, TlsClientConfig, TlsConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
@@ -24,25 +22,21 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
 }
 
 fn server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> QuicConfig {
-    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(64u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    QuicConfig::server(Arc::new(sc))
+    let tls = TlsConfig::builder().cert(certs, key).build().unwrap();
+    QuicConfig::builder()
+        .server(tls)
+        .max_concurrent_bidi_streams(64)
+        .max_concurrent_uni_streams(64)
+        .build()
+        .unwrap()
 }
 
 fn client_config(certs: &[CertificateDer<'static>]) -> QuicConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert.clone()).unwrap();
-    }
-    let rustls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let cc = ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
-    ));
-    QuicConfig::client(cc)
+    let tls = TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .unwrap();
+    QuicConfig::builder().client(tls).build().unwrap()
 }
 
 /// Ferry packets between two endpoints until neither has anything queued.

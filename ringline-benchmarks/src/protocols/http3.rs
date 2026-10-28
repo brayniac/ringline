@@ -290,51 +290,47 @@ fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
 
 const H3_ALPN: &[u8] = b"h3";
 
-fn quinn_server_config(
+fn ringline_quic_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Arc<quinn_proto::ServerConfig> {
-    // Build a rustls ServerConfig directly so we can advertise the
-    // `h3` ALPN. `h3-quinn` (the tokio reference) requires this for
-    // the handshake to complete.
-    let mut tls_cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
+) -> ringline_quic::QuicConfig {
+    // `h3-quinn` (the tokio reference) requires the `h3` ALPN for the
+    // handshake to complete.
+    let tls = ringline_quic::TlsConfig::builder()
+        .cert(certs, key)
+        .build()
         .expect("server cert");
-    tls_cfg.alpn_protocols = vec![H3_ALPN.to_vec()];
-    let qsc =
-        quinn_proto::crypto::rustls::QuicServerConfig::try_from(tls_cfg).expect("quic server tls");
-    let mut sc = quinn_proto::ServerConfig::with_crypto(Arc::new(qsc));
-    let transport = Arc::get_mut(&mut sc.transport).unwrap();
-    transport.max_concurrent_bidi_streams(1024u32.into());
-    transport.max_concurrent_uni_streams(1024u32.into());
-    // Default 333 ms initial RTT comes from RFC 9002. On localhost
-    // it makes the pacer wildly over-conservative during the
-    // pre-first-ACK phase. 1 ms is closer to reality and lets the
-    // first burst of packets actually use the available bandwidth
-    // instead of being throttled.
-    transport.initial_rtt(Duration::from_millis(1));
-    Arc::new(sc)
+    ringline_quic::QuicConfig::builder()
+        .server(tls)
+        .alpn(&[H3_ALPN])
+        // This server did not accept 0-RTT before the QuicConfig builder,
+        // which accepts it by default; keep the measurement unchanged.
+        .zero_rtt(false)
+        .max_concurrent_bidi_streams(1024)
+        .max_concurrent_uni_streams(1024)
+        // Default 333 ms initial RTT comes from RFC 9002. On localhost
+        // it makes the pacer wildly over-conservative during the
+        // pre-first-ACK phase. 1 ms is closer to reality and lets the
+        // first burst of packets actually use the available bandwidth
+        // instead of being throttled.
+        .initial_rtt(Duration::from_millis(1))
+        .build()
+        .expect("quic server config")
 }
 
-fn quinn_client_config(certs: &[CertificateDer<'static>]) -> quinn_proto::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert.clone()).expect("add cert");
-    }
-    let mut tls_cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls_cfg.alpn_protocols = vec![H3_ALPN.to_vec()];
-    let qcc =
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic client tls");
-    let mut cc = quinn_proto::ClientConfig::new(Arc::new(qcc));
-    let mut tp = quinn_proto::TransportConfig::default();
-    tp.max_concurrent_bidi_streams(1024u32.into());
-    tp.max_concurrent_uni_streams(1024u32.into());
-    tp.initial_rtt(Duration::from_millis(1));
-    cc.transport_config(Arc::new(tp));
-    cc
+fn ringline_quic_client_config(certs: &[CertificateDer<'static>]) -> ringline_quic::QuicConfig {
+    let tls = ringline_quic::TlsClientConfig::builder()
+        .root_certificates(certs.iter().cloned())
+        .build()
+        .expect("client tls config");
+    ringline_quic::QuicConfig::builder()
+        .client(tls)
+        .alpn(&[H3_ALPN])
+        .max_concurrent_bidi_streams(1024)
+        .max_concurrent_uni_streams(1024)
+        .initial_rtt(Duration::from_millis(1))
+        .build()
+        .expect("quic client config")
 }
 
 // ── Server (ringline + QuicEndpoint + H3Connection) ─────────────────
@@ -459,8 +455,7 @@ fn start_h3_server(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<BenchmarkServer, String> {
-    let server_config = quinn_server_config(certs, key);
-    let quic_config = ringline_quic::QuicConfig::server(server_config);
+    let quic_config = ringline_quic_server_config(certs, key);
 
     {
         let mut guard = SERVER_CFG.lock().unwrap();
@@ -533,11 +528,10 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
         udp: ringline::UdpCtx,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         let state = RINGLINE_H3_CFG.lock().ok()?.as_ref()?.clone();
-        let client_config = quinn_client_config(&state.certs);
+        let quic_config = ringline_quic_client_config(&state.certs);
         let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
         Some(Box::pin(async move {
-            let quic_config = ringline_quic::QuicConfig::client(client_config);
             let mut quic = ringline_quic::QuicEndpoint::new(quic_config, local_addr);
             let mut h3 = ringline_h3::H3Connection::new(ringline_h3::Settings::default());
             h3.set_max_pending_bytes(64 * 1024 * 1024);

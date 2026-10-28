@@ -1,7 +1,7 @@
 use std::io;
 
+use crate::types::{ConnectError, ConnectionError, ReadError, ReadableError, VarInt, WriteError};
 use bytes::Bytes;
-use quinn_proto::{ConnectError, ConnectionError, ReadError, ReadableError, VarInt, WriteError};
 
 /// Errors returned by ringline-quic operations.
 ///

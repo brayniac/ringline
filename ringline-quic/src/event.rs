@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
+use crate::types::{ConnectionError, Dir, StreamId, VarInt};
 use bytes::Bytes;
-use quinn_proto::{ConnectionError, Dir, StreamId, VarInt};
 
 /// Opaque identifier for a QUIC connection within a [`QuicEndpoint`](crate::QuicEndpoint).
 ///
@@ -80,9 +80,8 @@ pub enum QuicEvent {
     /// questions about ALPN / SNI / cert selection — but the full handshake
     /// has not yet completed (no `NewConnection` event yet).
     ///
-    /// Servers that need per-SNI dispatch or per-ALPN routing inspect
-    /// `quinn_proto::Connection::crypto_session().handshake_data()` from
-    /// this event. Fires once per inbound connection.
+    /// Fires once per inbound connection. `QuicEndpoint` has no accessor
+    /// for the negotiated ALPN or SNI name yet.
     HandshakeDataReady { conn: QuicConnId },
 
     /// 0-RTT was attempted on this outbound connection but the peer
@@ -110,10 +109,9 @@ pub enum QuicEvent {
     /// `current` now"; the path is unsafe to trust for unbounded data
     /// until validation completes.
     ///
-    /// Server-side migration is gated on
-    /// [`quinn_proto::ServerConfig::migration`] (default true). If
-    /// `migration` is false, peer-initiated path changes are dropped
-    /// and this event never fires.
+    /// A server built with
+    /// [`QuicConfigBuilder::migration(false)`](crate::QuicConfigBuilder::migration)
+    /// drops peer-initiated path changes, and this event never fires.
     PeerAddressChanged {
         conn: QuicConnId,
         previous: SocketAddr,

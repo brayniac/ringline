@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.7.0-alpha.23"
+version = "0.7.0-alpha.24"
 dependencies = [
  "bytes",
  "criterion",
@@ -1804,6 +1804,7 @@ dependencies = [
  "quinn-proto",
  "rcgen",
  "ringline",
+ "ringline-tls-config",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
