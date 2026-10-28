@@ -385,8 +385,9 @@ QUIC, step 2:
   `QuicServerConfig` and `QuicClientConfig`. `ringline-tls-config` provides
   them through public accessors, `TlsConfig::rustls_config` and
   `TlsClientConfig::rustls_config`. It also provides conversions from
-  rustls's `ProtocolVersion` and `SupportedCipherSuite` to its enums. These
-  name rustls types, so they are part of the escape hatches below.
+  rustls's `ProtocolVersion` and `CipherSuite` to its enums (a
+  `SupportedCipherSuite` converts through `.suite()`). These name rustls
+  types, so they are part of the escape hatches below.
 - A `TlsClientConfig` built by the builders also holds the QUIC client
   resumption store, created when it is built and shared by its clones.
   ringline-quic reads it through an accessor that returns `None` for a

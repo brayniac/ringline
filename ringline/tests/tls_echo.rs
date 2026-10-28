@@ -594,8 +594,8 @@ fn tls_outbound_connect_and_echo() {
 /// Snapshot of TlsInfo fields recorded by the handler on the first recv.
 struct TlsInfoSnapshot {
     is_some: bool,
-    protocol_version_some: bool,
-    cipher_suite_some: bool,
+    protocol_version: Option<ringline::TlsVersion>,
+    cipher_suite: Option<ringline::CipherSuite>,
     alpn_protocol: Option<Vec<u8>>,
     sni_hostname: Option<String>,
 }
@@ -620,14 +620,8 @@ impl AsyncEventHandler for TlsInfoHandler {
                             let info: Option<TlsInfo> = tx.tls_info();
                             let snapshot = TlsInfoSnapshot {
                                 is_some: info.is_some(),
-                                protocol_version_some: info
-                                    .as_ref()
-                                    .and_then(|i| i.protocol_version())
-                                    .is_some(),
-                                cipher_suite_some: info
-                                    .as_ref()
-                                    .and_then(|i| i.cipher_suite())
-                                    .is_some(),
+                                protocol_version: info.as_ref().and_then(|i| i.protocol_version()),
+                                cipher_suite: info.as_ref().and_then(|i| i.cipher_suite()),
                                 alpn_protocol: info
                                     .as_ref()
                                     .and_then(|i| i.alpn_protocol())
@@ -739,13 +733,18 @@ fn tls_info_accessors_with(per_listener: bool) {
         snap.is_some,
         "conn.tls_info() returned None after handshake"
     );
-    assert!(
-        snap.protocol_version_some,
-        "protocol_version() was None after completed TLS handshake"
+    // Both peers offer TLS 1.3, which rustls prefers.
+    assert_eq!(
+        snap.protocol_version,
+        Some(ringline::TlsVersion::Tls13),
+        "protocol_version() after a completed TLS handshake"
     );
+    let suite = snap
+        .cipher_suite
+        .expect("cipher_suite() was None after completed TLS handshake");
     assert!(
-        snap.cipher_suite_some,
-        "cipher_suite() was None after completed TLS handshake"
+        !matches!(suite, ringline::CipherSuite::Unknown(_)),
+        "a ring TLS 1.3 suite is named: {suite:?}"
     );
     // No ALPN protocols are configured in server_tls_config, so the handshake
     // does not negotiate one.

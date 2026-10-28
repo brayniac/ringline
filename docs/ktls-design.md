@@ -529,7 +529,7 @@ reference point.
 
 | # | Item | Size | Note |
 |---|---|---|---|
-| 1 | `enable_secret_extraction` on the rustls config | **Small, but a public-API decision** | It gates everything [P-15] and defaults false. The `ringline-tls-config` builders build the rustls config, so they can set it when kTLS is enabled. A config wrapped with `from_rustls` needs the caller to set it, and kTLS would silently stay off if the caller does not |
+| 1 | `enable_secret_extraction` on the rustls config | **Small** | It gates everything [P-15] and defaults false. The `ringline-tls-config` builders build the rustls config, so they can set it when kTLS is enabled. A config wrapped with `from_rustls` needs the caller to set it, and kTLS would silently stay off if the caller does not |
 | 2 | By-value access to the rustls connection | **Small** | Two accessors: `TlsTable::take(conn_index) -> Option<TlsConn>` and `UnbufferedConn::into_kind(self)`. The ownership chain is already consumable [P-18] |
 | 3 | TCP `RecvMsgMulti` on **both** backends | **Large** | See 3.3 |
 | 4 | `setsockopt` on a fixed descriptor | **Small** | `opcode::SetSockOpt` exists in the pinned `io-uring` 0.7.12 and takes `impl UseFixed` [P-11]; the kernel imposes no level restriction on the setsockopt direction, and both `TCP_ULP` and `TLS_TX` were **measured** installing successfully on a fixed descriptor [P-20]. Note the `optval` (which holds **key material**) must satisfy Domain Invariant 1 — live until the CQE — and be zeroized after |

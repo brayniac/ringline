@@ -233,7 +233,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - TLS 1.2 is enabled. `ringline-tls-config` enables rustls's `tls12`
   feature and the builders accept TLS 1.2 and 1.3 by default; before, a
   build negotiated TLS 1.2 only when another crate enabled the feature.
-  `versions(&[TlsVersion::Tls13])` restricts a config to TLS 1.3. A TLS 1.2
+  `versions(&[TlsVersion::Tls13])` restricts a config to TLS 1.3. This also
+  applies to a config built with rustls's `ServerConfig::builder()` or
+  `ClientConfig::builder()` and passed to `from_rustls`; restrict it with
+  `builder_with_protocol_versions(&[&rustls::version::TLS13])`. A TLS 1.2
   connection with an AES-GCM suite is closed after 2^24 records, because
   TLS 1.2 cannot change its keys.
 - io_uring: a TLS connection receives ciphertext directly, with a one-shot

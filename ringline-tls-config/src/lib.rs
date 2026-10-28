@@ -1,4 +1,4 @@
-//! TLS configuration shared by [ringline] and [ringline-quic].
+//! TLS configuration for [ringline].
 //!
 //! [`TlsConfig`] configures servers and [`TlsClientConfig`] configures
 //! clients. Both are built with builders that take certificates and keys as
@@ -32,7 +32,6 @@
 //! in a breaking release of this crate.
 //!
 //! [ringline]: https://docs.rs/ringline
-//! [ringline-quic]: https://docs.rs/ringline-quic
 
 use std::sync::Arc;
 
@@ -45,8 +44,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor};
 /// rustls's version, not this crate's.
 pub use rustls;
 
-/// The largest `max_fragment_size` rustls accepts: a 16384-byte record body
-/// plus the 5-byte record header.
+/// The largest `max_fragment_size` rustls accepts: 16384 bytes of plaintext
+/// plus the 5-byte header length.
 const MAX_FRAGMENT_SIZE: usize = 16384 + 5;
 
 /// The smallest `max_fragment_size` rustls accepts.
@@ -56,7 +55,8 @@ const MIN_FRAGMENT_SIZE: usize = 32;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// [`TlsConfigBuilder::cert`] was not called.
+    /// [`TlsConfigBuilder::cert`] was not called, or was given an empty
+    /// chain.
     #[error("a server TLS config needs a certificate: call TlsConfigBuilder::cert")]
     NoCertificate,
     /// [`TlsConfigBuilder::versions`] or [`TlsClientConfigBuilder::versions`]
@@ -87,8 +87,9 @@ pub enum TlsVersion {
 }
 
 impl TlsVersion {
-    /// The rustls version this one names, or `None` for a version this enum
-    /// does not name. Part of the escape hatches (see the crate docs).
+    /// The `TlsVersion` for a rustls `ProtocolVersion`, or `None` for a
+    /// version this enum does not name. Part of the escape hatches (see the
+    /// crate docs).
     pub fn from_rustls(version: rustls::ProtocolVersion) -> Option<Self> {
         match version {
             rustls::ProtocolVersion::TLSv1_2 => Some(Self::Tls12),
@@ -108,8 +109,11 @@ impl TlsVersion {
 /// A TLS cipher suite.
 ///
 /// The named variants are the suites rustls's *ring* provider offers. A
-/// suite from another provider (see [`TlsConfig::from_rustls`]) is
-/// [`Unknown`](Self::Unknown) with its IANA code.
+/// suite whose IANA code is not one of these, for example one that only
+/// another provider offers (see [`TlsConfig::from_rustls`]), is
+/// [`Unknown`](Self::Unknown) with its code. To test for a specific suite,
+/// compare [`iana_code`](Self::iana_code) rather than matching `Unknown`:
+/// a later release may name a suite that is `Unknown` today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 #[allow(non_camel_case_types)]
@@ -208,8 +212,9 @@ impl TlsConfig {
         &self.inner
     }
 
-    /// The largest TLS record this configuration writes, header included,
-    /// or `None` for rustls's default (16384 bytes of plaintext per record).
+    /// The configured `max_fragment_size` (see
+    /// [`TlsConfigBuilder::max_fragment_size`]), or `None` for rustls's
+    /// default of 16384 bytes of plaintext per record.
     pub fn max_fragment_size(&self) -> Option<usize> {
         self.inner.max_fragment_size
     }
@@ -240,8 +245,11 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// The largest TLS record to write, header included, in `32..=16389`.
-    /// Defaults to rustls's default of 16384 bytes of plaintext per record.
+    /// The plaintext per TLS record plus 5 (the record header length), in
+    /// `32..=16389`. A record then carries at most `size - 5` bytes of
+    /// plaintext and is `size + 17` bytes on the wire with TLS 1.3, `size +
+    /// 24` with a TLS 1.2 GCM suite. Defaults to 16384 bytes of plaintext per
+    /// record.
     pub fn max_fragment_size(mut self, size: usize) -> Self {
         self.max_fragment_size = Some(size);
         self
@@ -261,6 +269,9 @@ impl TlsConfigBuilder {
     /// Build the configuration.
     pub fn build(self) -> Result<TlsConfig, Error> {
         let (chain, key) = self.cert.ok_or(Error::NoCertificate)?;
+        if chain.is_empty() {
+            return Err(Error::NoCertificate);
+        }
         let versions = rustls_versions(&self.versions)?;
         check_fragment_size(self.max_fragment_size)?;
         let mut config = rustls::ServerConfig::builder_with_provider(provider())
@@ -310,8 +321,9 @@ impl TlsClientConfig {
         &self.inner
     }
 
-    /// The largest TLS record this configuration writes, header included,
-    /// or `None` for rustls's default (16384 bytes of plaintext per record).
+    /// The configured `max_fragment_size` (see
+    /// [`TlsClientConfigBuilder::max_fragment_size`]), or `None` for rustls's
+    /// default of 16384 bytes of plaintext per record.
     pub fn max_fragment_size(&self) -> Option<usize> {
         self.inner.max_fragment_size
     }
@@ -353,8 +365,11 @@ impl TlsClientConfigBuilder {
         self
     }
 
-    /// The largest TLS record to write, header included, in `32..=16389`.
-    /// Defaults to rustls's default of 16384 bytes of plaintext per record.
+    /// The plaintext per TLS record plus 5 (the record header length), in
+    /// `32..=16389`. A record then carries at most `size - 5` bytes of
+    /// plaintext and is `size + 17` bytes on the wire with TLS 1.3, `size +
+    /// 24` with a TLS 1.2 GCM suite. Defaults to 16384 bytes of plaintext per
+    /// record.
     pub fn max_fragment_size(mut self, size: usize) -> Self {
         self.max_fragment_size = Some(size);
         self
@@ -397,7 +412,8 @@ fn default_versions() -> Vec<TlsVersion> {
 
 /// rustls's *ring* provider, named explicitly. `ServerConfig::builder()`
 /// and the verifier builders panic when no process default provider is
-/// installed and rustls's features name more than one provider.
+/// installed and rustls's features do not name exactly one provider (both
+/// `ring` and `aws_lc_rs`, or `custom-provider`).
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -481,27 +497,34 @@ mod tests {
 
     #[test]
     fn tls12_is_enabled_by_default() {
-        let (server, _) = pair(&default_versions());
-        let (chain, _) = self_signed();
+        // Neither builder is given `.versions`; each side is paired with a
+        // peer restricted to TLS 1.2, and the handshake must complete.
+        let (chain, key) = self_signed();
+        let server = TlsConfig::builder()
+            .cert(chain.clone(), key.clone_key())
+            .build()
+            .unwrap();
         let client = TlsClientConfig::builder()
+            .root_certificates(chain.clone())
+            .build()
+            .unwrap();
+        let server12 = TlsConfig::builder()
+            .cert(chain.clone(), key)
+            .versions(&[TlsVersion::Tls12])
+            .build()
+            .unwrap();
+        let client12 = TlsClientConfig::builder()
             .root_certificates(chain)
             .versions(&[TlsVersion::Tls12])
             .build()
             .unwrap();
-        // The client's root is not the server's certificate, so the
-        // handshake cannot be driven to completion here; the server
-        // accepting a TLS 1.2-only ClientHello is what is checked.
-        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
-        let mut c = rustls::ClientConnection::new(client.rustls_config().clone(), name).unwrap();
-        let mut s = rustls::ServerConnection::new(server.rustls_config().clone()).unwrap();
-        let mut buf = Vec::new();
-        c.write_tls(&mut buf).unwrap();
-        s.read_tls(&mut buf.as_slice()).unwrap();
-        s.process_new_packets().unwrap();
-        assert_eq!(
-            s.protocol_version().and_then(TlsVersion::from_rustls),
-            Some(TlsVersion::Tls12)
-        );
+        for (s, c) in [(&server, &client12), (&server12, &client)] {
+            let conn = handshake(s, c);
+            assert_eq!(
+                conn.protocol_version().and_then(TlsVersion::from_rustls),
+                Some(TlsVersion::Tls12)
+            );
+        }
     }
 
     #[test]
@@ -557,6 +580,14 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(server.max_fragment_size(), Some(2048));
+        for good in [32, 16389] {
+            let server = TlsConfig::builder()
+                .cert(chain.clone(), key.clone_key())
+                .max_fragment_size(good)
+                .build()
+                .unwrap();
+            assert_eq!(server.max_fragment_size(), Some(good));
+        }
         for bad in [31, 16390] {
             let err = TlsConfig::builder()
                 .cert(chain.clone(), key.clone_key())
@@ -580,6 +611,15 @@ mod tests {
     fn build_errors() {
         assert!(matches!(
             TlsConfig::builder().build().err().unwrap(),
+            Error::NoCertificate
+        ));
+        let (_, key) = self_signed();
+        assert!(matches!(
+            TlsConfig::builder()
+                .cert(Vec::new(), key)
+                .build()
+                .err()
+                .unwrap(),
             Error::NoCertificate
         ));
         let (chain, key) = self_signed();
