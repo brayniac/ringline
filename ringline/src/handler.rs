@@ -1554,12 +1554,13 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Create TLS client state (buffers ClientHello internally).
-        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|e| {
-            // Stale fixed file entry is overwritten when the slot is reused.
-            let _ = self.ring.register_files_update(conn_index, &[-1]);
-            self.connections.release(conn_index);
-            crate::error::Error::RingSetup(format!("invalid server name: {e}"))
-        })?;
+        let sni =
+            ringline_tls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|e| {
+                // Stale fixed file entry is overwritten when the slot is reused.
+                let _ = self.ring.register_files_update(conn_index, &[-1]);
+                self.connections.release(conn_index);
+                crate::error::Error::RingSetup(format!("invalid server name: {e}"))
+            })?;
         if let Err(e) = tls_table.create_client(conn_index, sni) {
             // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
@@ -3330,7 +3331,7 @@ impl<'a> DriverCtx<'a> {
         // failure the already-established TCP connection must be torn down —
         // returning early here used to leak the slot and the registered
         // stream on every failed TLS connect attempt.
-        let sni = match rustls::pki_types::ServerName::try_from(server_name.to_owned()) {
+        let sni = match ringline_tls::pki_types::ServerName::try_from(server_name.to_owned()) {
             Ok(sni) => sni,
             Err(e) => {
                 self.close(token);

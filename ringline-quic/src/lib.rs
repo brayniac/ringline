@@ -1,7 +1,8 @@
-//! ringline-quic — QUIC protocol support via quinn-proto.
+//! ringline-quic — QUIC protocol support via ringline-quic-proto.
 //!
-//! This crate wraps [quinn-proto](https://docs.rs/quinn-proto)'s sans-IO QUIC
-//! state machine and exposes an event-based [`QuicEndpoint`] API.
+//! This crate wraps the sans-IO QUIC state machine of
+//! [ringline-quic-proto](https://docs.rs/ringline-quic-proto), ringline's fork
+//! of quinn-proto, and exposes an event-based [`QuicEndpoint`] API.
 //!
 //! # Example
 //!
@@ -54,10 +55,10 @@ pub use types::{
 /// The TLS configuration types [`QuicConfigBuilder`] takes.
 pub use ringline_tls_config::{TlsClientConfig, TlsConfig};
 
-/// The quinn-proto crate ringline-quic is built on, for
-/// [`QuicConfig::from_proto`]. Items reached through it follow quinn-proto's
-/// version, not ringline-quic's.
-pub use quinn_proto as proto;
+/// ringline-quic-proto, the fork of quinn-proto ringline-quic is built on, for
+/// [`QuicConfig::from_proto`]. Items reached through it follow
+/// ringline-quic-proto's version, not ringline-quic's.
+pub use ringline_quic_proto as proto;
 
 /// The TLS configuration crate, including its rustls re-export.
 pub use ringline_tls_config as tls_config;

@@ -25,12 +25,14 @@
 //! [`TlsConfig::rustls_config`], [`TlsClientConfig::rustls_config`],
 //! [`TlsClientConfig::quic_resumption`],
 //! [`TlsVersion::from_rustls`], [`CipherSuite::from_rustls`] and the
-//! [`rustls`] re-export name rustls types. They cover what the builders do
-//! not: custom certificate verifiers and resolvers, client certificates,
-//! session storage, key logs and other crypto providers. These items follow
-//! the version of the rustls crate this one is built on, and a release that
-//! moves to a new rustls version changes them. Every other item changes only
-//! in a breaking release of this crate.
+//! [`rustls`] re-export name types of `ringline-tls`, ringline's fork of
+//! rustls 0.23. They cover what the builders do not: custom certificate
+//! verifiers and resolvers, client certificates, session storage, key logs
+//! and other crypto providers. Build those values from the [`rustls`]
+//! re-export; types from upstream `rustls`, and crates that implement its
+//! traits, do not fit. These items follow `ringline-tls`'s version, and a
+//! release that moves to a new `ringline-tls` minor version changes them.
+//! Every other item changes only in a breaking release of this crate.
 //!
 //! [ringline]: https://docs.rs/ringline
 //! [ringline-quic]: https://docs.rs/ringline-quic
@@ -39,12 +41,14 @@ use std::sync::Arc;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor};
 
-/// The rustls crate the configurations are built on.
+/// `ringline-tls`, ringline's fork of rustls, which the configurations are
+/// built on.
 ///
-/// For use with [`TlsConfig::from_rustls`] and
-/// [`TlsClientConfig::from_rustls`]. Items reached through it follow
-/// rustls's version, not this crate's.
-pub use rustls;
+/// Build [`TlsConfig::from_rustls`] and [`TlsClientConfig::from_rustls`]
+/// configurations from this re-export; upstream `rustls` types do not fit.
+/// Items reached through it follow `ringline-tls`'s version, not this
+/// crate's.
+pub use ringline_tls as rustls;
 
 /// The largest `max_fragment_size` rustls accepts: 16384 bytes of plaintext
 /// plus the 5-byte header length.
@@ -94,18 +98,18 @@ impl TlsVersion {
     /// The `TlsVersion` for a rustls `ProtocolVersion`, or `None` for a
     /// version this enum does not name. Part of the escape hatches (see the
     /// crate docs).
-    pub fn from_rustls(version: rustls::ProtocolVersion) -> Option<Self> {
+    pub fn from_rustls(version: ringline_tls::ProtocolVersion) -> Option<Self> {
         match version {
-            rustls::ProtocolVersion::TLSv1_2 => Some(Self::Tls12),
-            rustls::ProtocolVersion::TLSv1_3 => Some(Self::Tls13),
+            ringline_tls::ProtocolVersion::TLSv1_2 => Some(Self::Tls12),
+            ringline_tls::ProtocolVersion::TLSv1_3 => Some(Self::Tls13),
             _ => None,
         }
     }
 
-    fn rustls_version(self) -> &'static rustls::SupportedProtocolVersion {
+    fn rustls_version(self) -> &'static ringline_tls::SupportedProtocolVersion {
         match self {
-            Self::Tls12 => &rustls::version::TLS12,
-            Self::Tls13 => &rustls::version::TLS13,
+            Self::Tls12 => &ringline_tls::version::TLS12,
+            Self::Tls13 => &ringline_tls::version::TLS13,
         }
     }
 }
@@ -179,7 +183,7 @@ impl CipherSuite {
 
     /// The suite rustls names. Part of the escape hatches (see the crate
     /// docs).
-    pub fn from_rustls(suite: rustls::CipherSuite) -> Self {
+    pub fn from_rustls(suite: ringline_tls::CipherSuite) -> Self {
         Self::from_iana_code(u16::from(suite))
     }
 }
@@ -190,7 +194,7 @@ impl CipherSuite {
 /// configuration is shared.
 #[derive(Clone)]
 pub struct TlsConfig {
-    inner: Arc<rustls::ServerConfig>,
+    inner: Arc<ringline_tls::ServerConfig>,
 }
 
 impl TlsConfig {
@@ -206,13 +210,13 @@ impl TlsConfig {
 
     /// Wrap a rustls server configuration built by the caller. Part of the
     /// escape hatches (see the crate docs).
-    pub fn from_rustls(config: Arc<rustls::ServerConfig>) -> Self {
+    pub fn from_rustls(config: Arc<ringline_tls::ServerConfig>) -> Self {
         Self { inner: config }
     }
 
     /// The rustls server configuration. Part of the escape hatches (see the
     /// crate docs).
-    pub fn rustls_config(&self) -> &Arc<rustls::ServerConfig> {
+    pub fn rustls_config(&self) -> &Arc<ringline_tls::ServerConfig> {
         &self.inner
     }
 
@@ -278,7 +282,7 @@ impl TlsConfigBuilder {
         }
         let versions = rustls_versions(&self.versions)?;
         check_fragment_size(self.max_fragment_size)?;
-        let mut config = rustls::ServerConfig::builder_with_provider(provider())
+        let mut config = ringline_tls::ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&versions)
             .map_err(tls_error)?
             .with_no_client_auth()
@@ -298,11 +302,11 @@ impl TlsConfigBuilder {
 /// configuration is shared.
 #[derive(Clone)]
 pub struct TlsClientConfig {
-    inner: Arc<rustls::ClientConfig>,
+    inner: Arc<ringline_tls::ClientConfig>,
     /// The session store QUIC connections use, separate from TCP's; see
     /// [`TlsClientConfig::quic_resumption`]. `None` for a `from_rustls`
     /// config.
-    quic_resumption: Option<rustls::client::Resumption>,
+    quic_resumption: Option<ringline_tls::client::Resumption>,
 }
 
 impl TlsClientConfig {
@@ -319,7 +323,7 @@ impl TlsClientConfig {
 
     /// Wrap a rustls client configuration built by the caller. Part of the
     /// escape hatches (see the crate docs).
-    pub fn from_rustls(config: Arc<rustls::ClientConfig>) -> Self {
+    pub fn from_rustls(config: Arc<ringline_tls::ClientConfig>) -> Self {
         Self {
             inner: config,
             quic_resumption: None,
@@ -328,7 +332,7 @@ impl TlsClientConfig {
 
     /// The rustls client configuration. Part of the escape hatches (see the
     /// crate docs).
-    pub fn rustls_config(&self) -> &Arc<rustls::ClientConfig> {
+    pub fn rustls_config(&self) -> &Arc<ringline_tls::ClientConfig> {
         &self.inner
     }
 
@@ -344,7 +348,7 @@ impl TlsClientConfig {
     /// created when the configuration is built and is shared by its clones.
     /// A `from_rustls` configuration keeps the caller's `resumption` for
     /// both.
-    pub fn quic_resumption(&self) -> Option<&rustls::client::Resumption> {
+    pub fn quic_resumption(&self) -> Option<&ringline_tls::client::Resumption> {
         self.quic_resumption.as_ref()
     }
 
@@ -413,14 +417,14 @@ impl TlsClientConfigBuilder {
     pub fn build(self) -> Result<TlsClientConfig, Error> {
         let versions = rustls_versions(&self.versions)?;
         check_fragment_size(self.max_fragment_size)?;
-        let mut roots = rustls::RootCertStore::empty();
+        let mut roots = ringline_tls::RootCertStore::empty();
         roots.extend(self.trust_anchors);
         for cert in self.root_certificates {
             roots
                 .add(cert)
                 .map_err(|e| Error::InvalidRootCertificate(e.to_string()))?;
         }
-        let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        let mut config = ringline_tls::ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&versions)
             .map_err(tls_error)?
             .with_root_certificates(roots)
@@ -429,7 +433,7 @@ impl TlsClientConfigBuilder {
         config.max_fragment_size = self.max_fragment_size;
         Ok(TlsClientConfig {
             inner: Arc::new(config),
-            quic_resumption: Some(rustls::client::Resumption::default()),
+            quic_resumption: Some(ringline_tls::client::Resumption::default()),
         })
     }
 }
@@ -442,13 +446,13 @@ fn default_versions() -> Vec<TlsVersion> {
 /// and the verifier builders panic when no process default provider is
 /// installed and rustls's features do not name exactly one provider (both
 /// `ring` and `aws_lc_rs`, or `custom-provider`).
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+fn provider() -> Arc<ringline_tls::crypto::CryptoProvider> {
+    Arc::new(ringline_tls::crypto::ring::default_provider())
 }
 
 fn rustls_versions(
     versions: &[TlsVersion],
-) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, Error> {
+) -> Result<Vec<&'static ringline_tls::SupportedProtocolVersion>, Error> {
     if versions.is_empty() {
         return Err(Error::NoVersions);
     }
@@ -464,7 +468,7 @@ fn check_fragment_size(size: Option<usize>) -> Result<(), Error> {
     }
 }
 
-fn tls_error(e: rustls::Error) -> Error {
+fn tls_error(e: ringline_tls::Error) -> Error {
     Error::Tls(e.to_string())
 }
 
@@ -478,10 +482,11 @@ mod tests {
         (vec![cert.cert.der().clone()], key)
     }
 
-    fn handshake(server: &TlsConfig, client: &TlsClientConfig) -> rustls::ClientConnection {
+    fn handshake(server: &TlsConfig, client: &TlsClientConfig) -> ringline_tls::ClientConnection {
         let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
-        let mut c = rustls::ClientConnection::new(client.rustls_config().clone(), name).unwrap();
-        let mut s = rustls::ServerConnection::new(server.rustls_config().clone()).unwrap();
+        let mut c =
+            ringline_tls::ClientConnection::new(client.rustls_config().clone(), name).unwrap();
+        let mut s = ringline_tls::ServerConnection::new(server.rustls_config().clone()).unwrap();
         while c.is_handshaking() || s.is_handshaking() {
             let mut buf = Vec::new();
             c.write_tls(&mut buf).unwrap();
@@ -576,8 +581,9 @@ mod tests {
             .unwrap();
         let (_, client12) = pair(&[TlsVersion::Tls12]);
         let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
-        let mut c = rustls::ClientConnection::new(client12.rustls_config().clone(), name).unwrap();
-        let mut s = rustls::ServerConnection::new(server.rustls_config().clone()).unwrap();
+        let mut c =
+            ringline_tls::ClientConnection::new(client12.rustls_config().clone(), name).unwrap();
+        let mut s = ringline_tls::ServerConnection::new(server.rustls_config().clone()).unwrap();
         let mut buf = Vec::new();
         c.write_tls(&mut buf).unwrap();
         s.read_tls(&mut buf.as_slice()).unwrap();
@@ -599,7 +605,7 @@ mod tests {
 
     #[test]
     fn every_ring_suite_is_named() {
-        for suite in rustls::crypto::ring::default_provider().cipher_suites {
+        for suite in ringline_tls::crypto::ring::default_provider().cipher_suites {
             let ours = CipherSuite::from_rustls(suite.suite());
             assert!(
                 !matches!(ours, CipherSuite::Unknown(_)),

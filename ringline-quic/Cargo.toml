@@ -6,18 +6,19 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "QUIC transport layer wrapping quinn-proto for ringline"
+description = "QUIC transport layer for ringline, wrapping ringline-quic-proto (a fork of quinn-proto)"
 
 [dependencies]
 bytes = { workspace = true }
-quinn-proto = { workspace = true }
+# ringline-rs/quinn, a fork of quinn-proto; see the workspace Cargo.toml.
+ringline-quic-proto = { workspace = true }
 ringline-tls-config = { workspace = true }
-# A version floor only (RUSTSEC-2026-0382); see the workspace Cargo.toml.
-rustls-webpki = { workspace = true }
 slab = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Upstream quinn-proto and rustls, for the tests' peers.
+quinn-proto = { workspace = true }
 rustls = { workspace = true, features = ["std", "ring"] }
 ringline = { workspace = true }
 rcgen = { workspace = true }

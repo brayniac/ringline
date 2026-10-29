@@ -38,12 +38,12 @@ impl VarInt {
         self.0
     }
 
-    pub(crate) fn to_proto(self) -> quinn_proto::VarInt {
+    pub(crate) fn to_proto(self) -> ringline_quic_proto::VarInt {
         // In range by construction.
-        quinn_proto::VarInt::from_u64(self.0).unwrap_or(quinn_proto::VarInt::MAX)
+        ringline_quic_proto::VarInt::from_u64(self.0).unwrap_or(ringline_quic_proto::VarInt::MAX)
     }
 
-    pub(crate) fn from_proto(v: quinn_proto::VarInt) -> Self {
+    pub(crate) fn from_proto(v: ringline_quic_proto::VarInt) -> Self {
         Self(v.into_inner())
     }
 }
@@ -100,17 +100,17 @@ pub enum Dir {
 }
 
 impl Dir {
-    pub(crate) fn to_proto(self) -> quinn_proto::Dir {
+    pub(crate) fn to_proto(self) -> ringline_quic_proto::Dir {
         match self {
-            Self::Bi => quinn_proto::Dir::Bi,
-            Self::Uni => quinn_proto::Dir::Uni,
+            Self::Bi => ringline_quic_proto::Dir::Bi,
+            Self::Uni => ringline_quic_proto::Dir::Uni,
         }
     }
 
-    pub(crate) fn from_proto(dir: quinn_proto::Dir) -> Self {
+    pub(crate) fn from_proto(dir: ringline_quic_proto::Dir) -> Self {
         match dir {
-            quinn_proto::Dir::Bi => Self::Bi,
-            quinn_proto::Dir::Uni => Self::Uni,
+            ringline_quic_proto::Dir::Bi => Self::Bi,
+            ringline_quic_proto::Dir::Uni => Self::Uni,
         }
     }
 }
@@ -170,16 +170,16 @@ impl StreamId {
         self.0
     }
 
-    pub(crate) fn to_proto(self) -> quinn_proto::StreamId {
+    pub(crate) fn to_proto(self) -> ringline_quic_proto::StreamId {
         let side = match self.initiator() {
-            Side::Client => quinn_proto::Side::Client,
-            Side::Server => quinn_proto::Side::Server,
+            Side::Client => ringline_quic_proto::Side::Client,
+            Side::Server => ringline_quic_proto::Side::Server,
         };
-        quinn_proto::StreamId::new(side, self.dir().to_proto(), self.index())
+        ringline_quic_proto::StreamId::new(side, self.dir().to_proto(), self.index())
     }
 
-    pub(crate) fn from_proto(id: quinn_proto::StreamId) -> Self {
-        Self(quinn_proto::VarInt::from(id).into_inner())
+    pub(crate) fn from_proto(id: ringline_quic_proto::StreamId) -> Self {
+        Self(ringline_quic_proto::VarInt::from(id).into_inner())
     }
 }
 
@@ -237,8 +237,8 @@ pub enum ConnectError {
 }
 
 impl ConnectError {
-    pub(crate) fn from_proto(e: quinn_proto::ConnectError) -> Self {
-        use quinn_proto::ConnectError as P;
+    pub(crate) fn from_proto(e: ringline_quic_proto::ConnectError) -> Self {
+        use ringline_quic_proto::ConnectError as P;
         match e {
             P::EndpointStopping => Self::EndpointStopping,
             P::CidsExhausted => Self::CidsExhausted,
@@ -299,8 +299,8 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
-    pub(crate) fn from_proto(e: quinn_proto::ConnectionError) -> Self {
-        use quinn_proto::ConnectionError as P;
+    pub(crate) fn from_proto(e: ringline_quic_proto::ConnectionError) -> Self {
+        use ringline_quic_proto::ConnectionError as P;
         match e {
             P::VersionMismatch => Self::VersionMismatch,
             P::TransportError(t) => Self::TransportError {
@@ -338,10 +338,10 @@ pub enum ReadError {
 }
 
 impl ReadError {
-    pub(crate) fn from_proto(e: quinn_proto::ReadError) -> Self {
+    pub(crate) fn from_proto(e: ringline_quic_proto::ReadError) -> Self {
         match e {
-            quinn_proto::ReadError::Blocked => Self::Blocked,
-            quinn_proto::ReadError::Reset(code) => Self::Reset(VarInt::from_proto(code)),
+            ringline_quic_proto::ReadError::Blocked => Self::Blocked,
+            ringline_quic_proto::ReadError::Reset(code) => Self::Reset(VarInt::from_proto(code)),
         }
     }
 }
@@ -359,10 +359,10 @@ pub enum ReadableError {
 }
 
 impl ReadableError {
-    pub(crate) fn from_proto(e: quinn_proto::ReadableError) -> Self {
+    pub(crate) fn from_proto(e: ringline_quic_proto::ReadableError) -> Self {
         match e {
-            quinn_proto::ReadableError::ClosedStream => Self::ClosedStream,
-            quinn_proto::ReadableError::IllegalOrderedRead => Self::IllegalOrderedRead,
+            ringline_quic_proto::ReadableError::ClosedStream => Self::ClosedStream,
+            ringline_quic_proto::ReadableError::IllegalOrderedRead => Self::IllegalOrderedRead,
         }
     }
 }
@@ -385,11 +385,13 @@ pub enum WriteError {
 }
 
 impl WriteError {
-    pub(crate) fn from_proto(e: quinn_proto::WriteError) -> Self {
+    pub(crate) fn from_proto(e: ringline_quic_proto::WriteError) -> Self {
         match e {
-            quinn_proto::WriteError::Blocked => Self::Blocked,
-            quinn_proto::WriteError::Stopped(code) => Self::Stopped(VarInt::from_proto(code)),
-            quinn_proto::WriteError::ClosedStream => Self::ClosedStream,
+            ringline_quic_proto::WriteError::Blocked => Self::Blocked,
+            ringline_quic_proto::WriteError::Stopped(code) => {
+                Self::Stopped(VarInt::from_proto(code))
+            }
+            ringline_quic_proto::WriteError::ClosedStream => Self::ClosedStream,
         }
     }
 }
@@ -426,7 +428,7 @@ macro_rules! stats_struct {
 
 stats_struct! {
     /// UDP traffic in one direction.
-    UdpStats from quinn_proto::UdpStats {
+    UdpStats from ringline_quic_proto::UdpStats {
         /// Datagrams.
         datagrams: u64,
         /// Payload bytes.
@@ -441,7 +443,7 @@ stats_struct! {
 
 stats_struct! {
     /// QUIC frames in one direction, counted by frame type.
-    FrameStats from quinn_proto::FrameStats {
+    FrameStats from ringline_quic_proto::FrameStats {
         /// ACK frames.
         acks: u64,
         /// ACK_FREQUENCY frames.
@@ -495,7 +497,7 @@ stats_struct! {
 
 stats_struct! {
     /// The network path's statistics.
-    PathStats from quinn_proto::PathStats {
+    PathStats from ringline_quic_proto::PathStats {
         /// The current smoothed round-trip time estimate.
         rtt: Duration,
         /// The smallest round-trip time measured.
@@ -534,7 +536,7 @@ pub struct ConnectionStats {
 }
 
 impl ConnectionStats {
-    pub(crate) fn from_proto(s: &quinn_proto::ConnectionStats) -> Self {
+    pub(crate) fn from_proto(s: &ringline_quic_proto::ConnectionStats) -> Self {
         Self {
             udp_tx: UdpStats::from_proto(&s.udp_tx),
             udp_rx: UdpStats::from_proto(&s.udp_rx),
@@ -585,7 +587,7 @@ mod tests {
                     assert_eq!(ours.index(), index);
                     let theirs = ours.to_proto();
                     assert_eq!(
-                        quinn_proto::VarInt::from(theirs).into_inner(),
+                        ringline_quic_proto::VarInt::from(theirs).into_inner(),
                         ours.into_inner()
                     );
                     assert_eq!(StreamId::from_proto(theirs), ours);
@@ -619,36 +621,42 @@ mod tests {
 
     #[test]
     fn connection_error_conversion() {
-        let transport = quinn_proto::TransportError {
-            code: quinn_proto::TransportErrorCode::crypto(0x2a),
+        let transport = ringline_quic_proto::TransportError {
+            code: ringline_quic_proto::TransportErrorCode::crypto(0x2a),
             frame: None,
             reason: "bad certificate".into(),
         };
         assert_eq!(
-            ConnectionError::from_proto(quinn_proto::ConnectionError::TransportError(transport)),
+            ConnectionError::from_proto(ringline_quic_proto::ConnectionError::TransportError(
+                transport
+            )),
             ConnectionError::TransportError {
                 code: 0x12a,
                 reason: "bad certificate".into(),
             }
         );
-        let close = quinn_proto::ConnectionClose {
-            error_code: quinn_proto::TransportErrorCode::crypto(0x28),
+        let close = ringline_quic_proto::ConnectionClose {
+            error_code: ringline_quic_proto::TransportErrorCode::crypto(0x28),
             frame_type: None,
             reason: Bytes::from_static(b"handshake"),
         };
         assert_eq!(
-            ConnectionError::from_proto(quinn_proto::ConnectionError::ConnectionClosed(close)),
+            ConnectionError::from_proto(ringline_quic_proto::ConnectionError::ConnectionClosed(
+                close
+            )),
             ConnectionError::ConnectionClosed {
                 code: 0x128,
                 reason: Bytes::from_static(b"handshake"),
             }
         );
-        let app = quinn_proto::ApplicationClose {
-            error_code: quinn_proto::VarInt::from_u32(0x99),
+        let app = ringline_quic_proto::ApplicationClose {
+            error_code: ringline_quic_proto::VarInt::from_u32(0x99),
             reason: Bytes::from_static(b"bye"),
         };
         assert_eq!(
-            ConnectionError::from_proto(quinn_proto::ConnectionError::ApplicationClosed(app)),
+            ConnectionError::from_proto(ringline_quic_proto::ConnectionError::ApplicationClosed(
+                app
+            )),
             ConnectionError::ApplicationClosed {
                 code: VarInt::from_u32(0x99),
                 reason: Bytes::from_static(b"bye"),
@@ -656,20 +664,23 @@ mod tests {
         );
         for (theirs, ours) in [
             (
-                quinn_proto::ConnectionError::VersionMismatch,
+                ringline_quic_proto::ConnectionError::VersionMismatch,
                 ConnectionError::VersionMismatch,
             ),
-            (quinn_proto::ConnectionError::Reset, ConnectionError::Reset),
             (
-                quinn_proto::ConnectionError::TimedOut,
+                ringline_quic_proto::ConnectionError::Reset,
+                ConnectionError::Reset,
+            ),
+            (
+                ringline_quic_proto::ConnectionError::TimedOut,
                 ConnectionError::TimedOut,
             ),
             (
-                quinn_proto::ConnectionError::LocallyClosed,
+                ringline_quic_proto::ConnectionError::LocallyClosed,
                 ConnectionError::LocallyClosed,
             ),
             (
-                quinn_proto::ConnectionError::CidsExhausted,
+                ringline_quic_proto::ConnectionError::CidsExhausted,
                 ConnectionError::CidsExhausted,
             ),
         ] {
@@ -681,7 +692,7 @@ mod tests {
     fn varint_bounds() {
         assert_eq!(VarInt::from_u64(VARINT_MAX).unwrap(), VarInt::MAX);
         assert_eq!(VarInt::from_u64(VARINT_MAX + 1), Err(VarIntBoundsExceeded));
-        assert_eq!(VarInt::MAX.to_proto(), quinn_proto::VarInt::MAX);
+        assert_eq!(VarInt::MAX.to_proto(), ringline_quic_proto::VarInt::MAX);
         assert_eq!(VarInt::from_u32(7).into_inner(), 7);
     }
 }

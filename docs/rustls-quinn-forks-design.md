@@ -1,10 +1,31 @@
 # Forking rustls and quinn-proto
 
-Status: proposal (2026-10-27). Nothing here is built. The owner decided on
-2026-10-26 that ringline maintains its own copies of rustls and quinn-proto,
-so that it can change the TLS record layer and the QUIC packet path itself,
-and on 2026-10-27 that each copy is a fork in its own repository under
-`ringline-rs`. This document says how, and what it costs.
+Status: steps 1 to 5 are done (2026-10-29): ringline-tls 0.1.0 and
+ringline-quic-proto 0.1.0 are published from ringline-rs/rustls and
+ringline-rs/quinn, and ringline, ringline-tls-config and ringline-quic use
+them. Steps 6 and 7 (the copy-removing patches) are not started.
+
+Apart from this status, "Security process" and the passages marked "Not
+built", this document is the proposal as written on 2026-10-27. Its "today"
+and its line references are to the tree at that time. What was built
+differs from it in three ways:
+
+- The update workflows do not open a pull request in ringline. A fork
+  release does not raise ringline's requirement; raise it in the workspace
+  `Cargo.toml` by hand.
+- The quinn fork's update does not read the rustls fork's release notes.
+  `admin/ringline-apply-rename` holds the rustls version the current
+  `ringline-tls` requirement contains (`RINGLINE_TLS_CONTAINS`) and stops with
+  an error when upstream quinn requires a newer rustls, so the workflow opens
+  an issue.
+- The update workflow does not run the fork's tests. They run as the pull
+  request's checks.
+
+The owner decided on 2026-10-26 that ringline maintains its own copies of
+rustls and quinn-proto, so that it can change the TLS record layer and the
+QUIC packet path itself, and on 2026-10-27 that each copy is a fork in its
+own repository under `ringline-rs`. This document says how, and what it
+costs.
 
 Related: `docs/ktls-design.md`, `docs/tls-unbuffered-design.md`,
 `docs/syscalls-and-copies.md`.
@@ -161,18 +182,20 @@ the fork keeps.
   published one only in build metadata, so `0.23.46+ringline.2` cannot follow
   `0.23.46+ringline.1`.
 - Each release's notes contain a line `Upstream: <tag>` naming the upstream
-  tag it contains, which the quinn fork's update workflow parses.
+  tag it contains. The quinn fork's update workflow was to parse it; not
+  built (see Status).
 
 ### Unchanged
 
 - `ringline-benchmarks` keeps upstream rustls, `tokio-rustls`, `quinn` and
-  `h3-quinn` for its tokio comparison clients. Those clients measure
-  upstream's code on purpose.
+  `h3-quinn` for its tokio comparison clients and its HTTP/2 benchmark
+  server. Those clients measure upstream's code on purpose. The HTTP/2
+  server is the peer both the ringline and the tokio clients connect to.
 - ringline's TLS tests keep upstream rustls as the peer. For example,
   `ringline/tests/tls_echo.rs` drives `rustls::ClientConnection` over a std
   socket. Every such test then checks the fork against upstream.
   ringline-quic's tests likewise use an upstream `quinn_proto::Endpoint` as
-  the peer (`ringline-quic/tests/echo.rs:207`). Step 5 says how both crates
+  the peer (`ringline-quic/tests/echo.rs`). Step 5 says how both crates
   name the fork and upstream side by side.
 - quinn-proto stays the protocol crate with no I/O under `ringline-quic`, the
   same split as `resp-proto` under `ringline-redis`.
@@ -446,9 +469,10 @@ upstream's traits does not port.
     raises its rustls requirement. It resolves by keeping the fork's
     package name, with the higher of the fork's current `ringline-tls`
     requirement and the lowest `ringline-tls` release that contains the
-    rustls version upstream now requires. The workflow reads that mapping
-    from the rustls fork's release notes (see "Versions"). If no such
-    release exists yet, it opens an issue instead of a pull request.
+    rustls version upstream now requires. The workflow was to read that
+    mapping from the rustls fork's release notes (see "Versions"). Not
+    built: it opens an issue whenever upstream requires a newer rustls (see
+    Status).
   - In the rustls fork, rustls takes webpki from the repository's root
     `[workspace.dependencies]` (`webpki = { workspace = true }`, rustls
     `Cargo.toml.orig:46`). Step 3 raises that line to 0.103.16, so it
@@ -478,24 +502,27 @@ A scheduled workflow on each fork's default branch runs daily:
    branch.
    - It resolves the `Cargo.toml`, `Cargo.lock`, quinn root `rustls`,
      quinn `proto` and rustls root `webpki` line conflicts described above.
-   - It runs the fork's tests.
+   - It runs the fork's tests. Not built: the tests run as the pull
+     request's checks (see Status).
 3. It opens a pull request naming the upstream release and any advisories it
    fixes. If any other file conflicts, it opens an issue naming those files
-   instead. If the quinn root `rustls` line needs a `ringline-tls` release
-   that does not exist yet, it opens an issue instead. It opens no second
+   instead. If upstream quinn requires a rustls newer than
+   `RINGLINE_TLS_CONTAINS` in `admin/ringline-apply-rename`, the script exits
+   and the workflow opens an issue instead. It opens no second
    issue for an upstream release that already has one open.
 4. If the advisory check (see "Security process") reports an advisory against
    the last merged release, the workflow runs at once, and the pull request is
    labelled as a security fix.
 
-The workflow authenticates as a GitHub App installed on the fork and on
-ringline. A pull request opened with the default `GITHUB_TOKEN` does not
-trigger `pull_request` workflows, so its checks would never run.
+The workflow authenticates as a GitHub App installed on the fork. A pull
+request opened with the default `GITHUB_TOKEN` does not trigger
+`pull_request` workflows, so its checks would never run.
 
 The pull request is reviewed and merged like any other, then the fork
-releases a patch version. The same workflow then opens a pull request in
-ringline that raises the fork's requirement in the workspace `Cargo.toml`
-and updates `Cargo.lock` (see "Security process"). ringline has no
+releases a patch version. The same workflow was then to open a pull
+request in ringline that raises the fork's requirement in the workspace
+`Cargo.toml` and updates `Cargo.lock` (see "Security process"). Not built:
+that pull request is opened by hand (see Status). ringline has no
 Dependabot configuration today.
 
 - The workflow iterates over a configured list of fork branches. A fork
@@ -506,11 +533,12 @@ Dependabot configuration today.
 
 ## Security process
 
-The workspace `Cargo.toml` (lines 52 to 85) records the advisories behind
-today's version floors.
+The comments on the `ringline-tls` and `ringline-quic-proto` requirements in
+the workspace `Cargo.toml` record the advisories behind the version floors.
 
 - Four set the rustls floor of 0.23.46: RUSTSEC-2026-0346 to 0349.
-- The same comment also lists RUSTSEC-2026-0285 (fixed in 0.23.45) and two
+- The same comment also lists RUSTSEC-2026-0382 (rustls-webpki, fixed by
+  the fork's webpki floor), RUSTSEC-2026-0285 (fixed in 0.23.45) and two
   2024 advisories.
 - Eight set the quinn-proto floor of 0.11.19: RUSTSEC-2026-0338 to 0343 and
   two GHSA advisories.
@@ -527,20 +555,23 @@ With the forks, ringline is responsible for shipping fixes like these.
     reported.
   - An advisory against the merged version fails the job and starts the
     update workflow.
-  - cargo-audit's flag for a lockfile path is unconfirmed. Confirm it before
-    writing this job.
+  - The job passes each lockfile to `cargo audit --file`
+    (`admin/ringline-advisory-check` in each fork).
+  - The job checks the upstream release merged on the fork's branch, not
+    the fork version ringline requires or locks. Once the fix is merged in
+    the fork, the job passes while ringline may still lock a vulnerable
+    release.
 - **Fix.**
   - Merge the fixed upstream release and release the fork as a patch
     version. A downstream `cargo update` picks it up at once.
-  - The ringline pull request raises the `ringline-tls` (or
-    `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to the
-    fixed version, with the advisory in the comment, as the rustls and
-    quinn-proto floors are recorded today. A patch release of each published
-    crate that declares the dependency carries the floor to downstream
-    resolvers: ringline and `ringline-tls-config` for `ringline-tls`, and
-    ringline-quic for `ringline-quic-proto`.
-  - A transitive requirement does not carry a floor (workspace
-    `Cargo.toml:82-84` says the same of `rustls-webpki` today). After a
+  - A pull request in ringline, opened by hand, raises the `ringline-tls`
+    (or `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to
+    the fixed version, with the advisory in the comment, as the current
+    floors are recorded. A patch release of each published crate that
+    declares the dependency carries the floor to downstream resolvers:
+    ringline and `ringline-tls-config` for `ringline-tls`, and ringline-quic
+    for `ringline-quic-proto`.
+  - A transitive requirement does not carry a floor. After a
     `ringline-tls` fix, `ringline-tls-config` takes a patch release that
     raises its `ringline-tls` requirement, and ringline-quic and
     `ringline-quic-proto` take patch releases that raise their
@@ -655,8 +686,9 @@ Each step is a separate pull request in the repository it changes.
      library.
    - Add the copy-count test, the advisory check and the update workflow.
      The workflow's ringline pull request is enabled at step 5, when
-     ringline first requires the fork.
-   - Install the workflow's GitHub App on the fork and on ringline.
+     ringline first requires the fork. Not built: no workflow opens a pull
+     request in ringline (see Status).
+   - Install the workflow's GitHub App on the fork.
    - Raise the root `webpki` requirement to 0.103.16 (RUSTSEC-2026-0382), so
      the fork carries the `rustls-webpki` floor that ringline,
      ringline-quic and `ringline-tls-config` carry today.

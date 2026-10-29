@@ -1344,8 +1344,8 @@ mod tests {
     #[cfg(test)]
     fn tls_server_config(max_fragment_size: Option<usize>) -> TlsConfig {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let key = ringline_tls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = ringline_tls::pki_types::CertificateDer::from(cert.cert);
         let mut builder = TlsConfig::builder().cert(vec![cert_der], key.into());
         if let Some(size) = max_fragment_size {
             builder = builder.max_fragment_size(size);

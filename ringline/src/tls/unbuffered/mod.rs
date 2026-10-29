@@ -40,10 +40,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
-use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
-use rustls::pki_types::ServerName;
-use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
-use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
+use ringline_tls::client::{ClientConnectionData, UnbufferedClientConnection};
+use ringline_tls::pki_types::ServerName;
+use ringline_tls::server::{ServerConnectionData, UnbufferedServerConnection};
+use ringline_tls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
 
 use super::TlsConn;
 use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MAX_SINGLE_APPEND, MIN_CIPHERTEXT_CAP};
@@ -78,14 +78,14 @@ impl UnbufferedKind {
         }
     }
 
-    pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+    pub fn negotiated_cipher_suite(&self) -> Option<ringline_tls::SupportedCipherSuite> {
         match self {
             UnbufferedKind::Server(c) => c.negotiated_cipher_suite(),
             UnbufferedKind::Client(c) => c.negotiated_cipher_suite(),
         }
     }
 
-    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+    pub fn protocol_version(&self) -> Option<ringline_tls::ProtocolVersion> {
         match self {
             UnbufferedKind::Server(c) => c.protocol_version(),
             UnbufferedKind::Client(c) => c.protocol_version(),
@@ -157,16 +157,18 @@ pub struct UnbufferedConn {
 }
 
 impl UnbufferedConn {
-    pub fn new_server(config: Arc<rustls::ServerConfig>) -> Result<Self, rustls::Error> {
+    pub fn new_server(
+        config: Arc<ringline_tls::ServerConfig>,
+    ) -> Result<Self, ringline_tls::Error> {
         Ok(Self::wrap(UnbufferedKind::Server(
             UnbufferedServerConnection::new(config)?,
         )))
     }
 
     pub fn new_client(
-        config: Arc<rustls::ClientConfig>,
+        config: Arc<ringline_tls::ClientConfig>,
         server_name: ServerName<'static>,
-    ) -> Result<Self, rustls::Error> {
+    ) -> Result<Self, ringline_tls::Error> {
         Ok(Self::wrap(UnbufferedKind::Client(
             UnbufferedClientConnection::new(config, server_name)?,
         )))
@@ -304,7 +306,7 @@ pub(crate) enum DriveOutcome {
     /// The peer sent close_notify, or the connection is fully closed.
     Closed,
     /// Fatal: the connection must be torn down.
-    Error(rustls::Error),
+    Error(ringline_tls::Error),
 }
 
 /// Drive the unbuffered state machine until it blocks.
@@ -356,13 +358,13 @@ fn drive_records(
     if let Some(s) = sink.as_deref_mut()
         && !drain_pending_plaintext(tls_conn, s, conn_index)
     {
-        return DriveOutcome::Error(rustls::Error::General(
+        return DriveOutcome::Error(ringline_tls::Error::General(
             "recv accumulator limit exceeded".into(),
         ));
     }
 
     let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
-        return DriveOutcome::Error(rustls::Error::General(
+        return DriveOutcome::Error(ringline_tls::Error::General(
             "connection not driven by the unbuffered TLS engine".into(),
         ));
     };
@@ -410,7 +412,7 @@ fn drive_inner<C: UnbufferedEngine>(
         // `blocked` means the machine cannot progress without more input from
         // the peer or another call from us; that is the loop's exit condition.
         let mut blocked = false;
-        let mut error: Option<rustls::Error> = None;
+        let mut error: Option<ringline_tls::Error> = None;
 
         match status.state {
             Err(e) => {
@@ -469,7 +471,7 @@ fn drive_inner<C: UnbufferedEngine>(
                         }
                         Err(e) => {
                             out.truncate(start);
-                            error = Some(rustls::Error::General(e.to_string()));
+                            error = Some(ringline_tls::Error::General(e.to_string()));
                             break;
                         }
                     }
@@ -497,7 +499,7 @@ fn drive_inner<C: UnbufferedEngine>(
             Ok(ConnectionState::ReadEarlyData(_)) => {
                 // Ringline exposes no 0-RTT API. Treated as a protocol error
                 // rather than silently dropped, per the design doc.
-                error = Some(rustls::Error::General(
+                error = Some(ringline_tls::Error::General(
                     "TLS early data received but not supported".into(),
                 ));
             }
@@ -505,7 +507,7 @@ fn drive_inner<C: UnbufferedEngine>(
             // introduce a state this loop does not know how to service.
             // Failing the connection beats spinning on it forever.
             Ok(_) => {
-                error = Some(rustls::Error::General(
+                error = Some(ringline_tls::Error::General(
                     "unhandled rustls unbuffered connection state".into(),
                 ));
             }
@@ -519,7 +521,7 @@ fn drive_inner<C: UnbufferedEngine>(
         }
         if sink_overflow {
             return (
-                DriveOutcome::Error(rustls::Error::General(
+                DriveOutcome::Error(ringline_tls::Error::General(
                     "recv accumulator limit exceeded".into(),
                 )),
                 peer_closed,
@@ -594,7 +596,7 @@ pub(crate) fn feed(
     for chunk in ciphertext.chunks(MAX_SINGLE_APPEND) {
         loop {
             let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
-                return DriveOutcome::Error(rustls::Error::General(
+                return DriveOutcome::Error(ringline_tls::Error::General(
                     "connection not driven by the unbuffered TLS engine".into(),
                 ));
             };
@@ -617,14 +619,14 @@ pub(crate) fn feed(
                         .expect("engine checked above")
                         .split_mut();
                     if incoming.len() >= before {
-                        return DriveOutcome::Error(rustls::Error::General(
+                        return DriveOutcome::Error(ringline_tls::Error::General(
                             "TLS ciphertext buffer full and undrainable".into(),
                         ));
                     }
                     last = fold_outcome(last, outcome);
                 }
                 Err(e) => {
-                    return DriveOutcome::Error(rustls::Error::General(e.to_string()));
+                    return DriveOutcome::Error(ringline_tls::Error::General(e.to_string()));
                 }
             }
         }
@@ -1130,14 +1132,14 @@ pub(crate) mod sni {
     /// with a default would get the default here, not the caller's.
     #[derive(Debug)]
     struct CaptureServerName {
-        inner: Arc<dyn rustls::server::ResolvesServerCert>,
+        inner: Arc<dyn ringline_tls::server::ResolvesServerCert>,
     }
 
-    impl rustls::server::ResolvesServerCert for CaptureServerName {
+    impl ringline_tls::server::ResolvesServerCert for CaptureServerName {
         fn resolve(
             &self,
-            client_hello: rustls::server::ClientHello<'_>,
-        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            client_hello: ringline_tls::server::ClientHello<'_>,
+        ) -> Option<Arc<ringline_tls::sign::CertifiedKey>> {
             let name = client_hello.server_name().map(str::to_owned);
             CAPTURED.with(|c| *c.borrow_mut() = name);
             self.inner.resolve(client_hello)
@@ -1150,8 +1152,8 @@ pub(crate) mod sni {
 
     /// A copy of `config` whose certificate resolver records the server name.
     pub(crate) fn capture_server_names(
-        config: &Arc<rustls::ServerConfig>,
-    ) -> Arc<rustls::ServerConfig> {
+        config: &Arc<ringline_tls::ServerConfig>,
+    ) -> Arc<ringline_tls::ServerConfig> {
         let mut config = (**config).clone();
         config.cert_resolver = Arc::new(CaptureServerName {
             inner: config.cert_resolver.clone(),

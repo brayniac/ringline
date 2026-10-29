@@ -1,10 +1,11 @@
 # ringline-quic
 
-**QUIC protocol support via quinn-proto.**
+**QUIC protocol support via ringline-quic-proto.**
 
-Wraps [quinn-proto](https://docs.rs/quinn-proto)'s sans-IO QUIC state machine
-and exposes an event-based [`QuicEndpoint`] API for use with ringline's UDP
-support.
+Wraps the sans-IO QUIC state machine of
+[ringline-quic-proto](https://docs.rs/ringline-quic-proto), ringline's fork of
+quinn-proto, and exposes an event-based [`QuicEndpoint`] API for use with
+ringline's UDP support.
 
 ## Quick Start
 
@@ -50,15 +51,15 @@ negotiates only TLS 1.3, and `build()` refuses a TLS configuration without
 it. `alpn` and `zero_rtt` set QUIC's ALPN list and 0-RTT on a copy of the
 TLS configuration, leaving the TCP one unchanged.
 
-`QuicConfig::from_proto` takes complete quinn-proto configurations, reached
-through `ringline_quic::proto`, for what the builder does not cover. Those
-types follow quinn-proto's version.
+`QuicConfig::from_proto` takes complete ringline-quic-proto configurations,
+reached through `ringline_quic::proto`, for what the builder does not cover.
+Those types follow ringline-quic-proto's version.
 
 ## Features
 
-- Event-driven API wrapping quinn-proto's sans-IO state machine
+- Event-driven API wrapping ringline-quic-proto's sans-IO state machine
 - Stream IDs, errors, events and statistics are ringline-quic types, so a
-  quinn-proto upgrade changes only `QuicConfig::from_proto` and the `proto`
-  re-export
+  ringline-quic-proto upgrade changes only `QuicConfig::from_proto` and the
+  `proto` re-export
 - Connection and stream management
 - Integrates with ringline's UDP support (`UdpCtx`)

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::BytesMut;
-use quinn_proto::{ClientConfig, ConnectionHandle, DatagramEvent, Event, StreamEvent};
+use ringline_quic_proto::{ClientConfig, ConnectionHandle, DatagramEvent, Event, StreamEvent};
 use slab::Slab;
 
 use crate::config::QuicConfig;
@@ -16,7 +16,7 @@ use crate::types::{
 
 /// A sans-IO QUIC endpoint.
 ///
-/// Wraps [`quinn_proto::Endpoint`] and exposes an event-queue API.
+/// Wraps [`ringline_quic_proto::Endpoint`] and exposes an event-queue API.
 /// This crate has no runtime dependency — callers are responsible for
 /// sending outgoing packets (via [`poll_send`](Self::poll_send)) and
 /// feeding incoming datagrams.
@@ -33,7 +33,7 @@ use crate::types::{
 /// 3. Poll application events via [`poll_event`](Self::poll_event).
 /// 4. Drain outgoing packets via [`poll_send`](Self::poll_send).
 pub struct QuicEndpoint {
-    endpoint: quinn_proto::Endpoint,
+    endpoint: ringline_quic_proto::Endpoint,
     connections: Slab<QuicConnection>,
     /// Maps `ConnectionHandle.0` → slab key.  Grows as needed.
     handle_map: Vec<Option<u32>>,
@@ -61,7 +61,7 @@ pub struct QuicEndpoint {
 
 struct QuicConnection {
     handle: ConnectionHandle,
-    conn: quinn_proto::Connection,
+    conn: ringline_quic_proto::Connection,
     established: bool,
     outbound: bool,
     /// Whether 0-RTT was possible at the time this connection was inserted.
@@ -144,7 +144,7 @@ impl QuicEndpoint {
     ///
     /// `local_addr` is the address of the UDP socket this endpoint is bound to.
     pub fn new(config: QuicConfig, local_addr: SocketAddr) -> Self {
-        let endpoint = quinn_proto::Endpoint::new(
+        let endpoint = ringline_quic_proto::Endpoint::new(
             config.endpoint_config,
             config.server_config,
             config.allow_mtud,
@@ -230,7 +230,7 @@ impl QuicEndpoint {
                         self.drain_transmits(key, now);
                         self.poll_connection(key, now);
                     }
-                    Err(quinn_proto::AcceptError {
+                    Err(ringline_quic_proto::AcceptError {
                         response: Some(t), ..
                     }) => {
                         // Quinn produced an explicit close response (e.g. a
@@ -353,7 +353,7 @@ impl QuicEndpoint {
         let c = self.get_conn_mut(conn)?;
         match c.conn.send_stream(stream.to_proto()).write(data) {
             Ok(n) => Ok(n),
-            Err(quinn_proto::WriteError::Blocked) if c.conn.is_closed() => {
+            Err(ringline_quic_proto::WriteError::Blocked) if c.conn.is_closed() => {
                 // quinn-proto's `write_source` short-circuits to `Blocked`
                 // once the connection is in Closed/Draining — but no
                 // `StreamWritable` event will ever fire to unblock us.
@@ -383,7 +383,7 @@ impl QuicEndpoint {
         let c = self.get_conn_mut(conn)?;
         match c.conn.send_stream(stream.to_proto()).write_chunks(chunks) {
             Ok(written) => Ok(written.bytes),
-            Err(quinn_proto::WriteError::Blocked) if c.conn.is_closed() => {
+            Err(ringline_quic_proto::WriteError::Blocked) if c.conn.is_closed() => {
                 Err(Error::ConnectionClosing)
             }
             Err(e) => Err(Error::Write(WriteError::from_proto(e))),
@@ -412,7 +412,7 @@ impl QuicEndpoint {
             .map_err(|e| Error::Readable(ReadableError::from_proto(e)))?;
         let mut total = 0;
         let mut finished = false;
-        let mut read_err: Option<quinn_proto::ReadError> = None;
+        let mut read_err: Option<ringline_quic_proto::ReadError> = None;
 
         while total < buf.len() {
             match chunks.next(buf.len() - total) {
@@ -425,7 +425,7 @@ impl QuicEndpoint {
                     finished = true;
                     break;
                 }
-                Err(quinn_proto::ReadError::Blocked) => break,
+                Err(ringline_quic_proto::ReadError::Blocked) => break,
                 Err(e) => {
                     read_err = Some(e);
                     break;
@@ -476,7 +476,7 @@ impl QuicEndpoint {
             .map_err(|e| Error::Readable(ReadableError::from_proto(e)))?;
         let mut total = 0;
         let mut finished = false;
-        let mut read_err: Option<quinn_proto::ReadError> = None;
+        let mut read_err: Option<ringline_quic_proto::ReadError> = None;
 
         while total < max {
             match chunks.next(max - total) {
@@ -488,7 +488,7 @@ impl QuicEndpoint {
                     finished = true;
                     break;
                 }
-                Err(quinn_proto::ReadError::Blocked) => break,
+                Err(ringline_quic_proto::ReadError::Blocked) => break,
                 Err(e) => {
                     read_err = Some(e);
                     break;
@@ -521,10 +521,10 @@ impl QuicEndpoint {
         let c = self.get_conn_mut(conn)?;
         match c.conn.send_stream(stream.to_proto()).finish() {
             Ok(()) => {}
-            Err(quinn_proto::FinishError::Stopped(code)) => {
+            Err(ringline_quic_proto::FinishError::Stopped(code)) => {
                 return Err(Error::StreamStopped(VarInt::from_proto(code)));
             }
-            Err(quinn_proto::FinishError::ClosedStream) => return Err(Error::StreamClosed),
+            Err(ringline_quic_proto::FinishError::ClosedStream) => return Err(Error::StreamClosed),
         }
         self.drain_transmits(key, now);
         Ok(())
@@ -551,7 +551,7 @@ impl QuicEndpoint {
             .stop(error_code.to_proto())
         {
             Ok(()) => {}
-            Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
+            Err(ringline_quic_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
         }
         self.drain_transmits(key, now);
         Ok(())
@@ -577,7 +577,7 @@ impl QuicEndpoint {
             .reset(error_code.to_proto())
         {
             Ok(()) => {}
-            Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
+            Err(ringline_quic_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
         }
         self.drain_transmits(key, now);
         Ok(())
@@ -590,7 +590,7 @@ impl QuicEndpoint {
         let c = self.get_conn_mut(conn)?;
         Ok(c.conn
             .streams()
-            .open(quinn_proto::Dir::Bi)
+            .open(ringline_quic_proto::Dir::Bi)
             .map(StreamId::from_proto))
     }
 
@@ -640,7 +640,7 @@ impl QuicEndpoint {
         let c = self.get_conn_mut(conn)?;
         Ok(c.conn
             .streams()
-            .open(quinn_proto::Dir::Uni)
+            .open(ringline_quic_proto::Dir::Uni)
             .map(StreamId::from_proto))
     }
 
@@ -720,12 +720,16 @@ impl QuicEndpoint {
         let c = self.get_conn_mut(conn)?;
         match c.conn.datagrams().send(data, drop_old_when_full) {
             Ok(()) => {}
-            Err(quinn_proto::SendDatagramError::Disabled) => return Err(Error::DatagramDisabled),
-            Err(quinn_proto::SendDatagramError::UnsupportedByPeer) => {
+            Err(ringline_quic_proto::SendDatagramError::Disabled) => {
+                return Err(Error::DatagramDisabled);
+            }
+            Err(ringline_quic_proto::SendDatagramError::UnsupportedByPeer) => {
                 return Err(Error::DatagramUnsupportedByPeer);
             }
-            Err(quinn_proto::SendDatagramError::TooLarge) => return Err(Error::DatagramTooLarge),
-            Err(quinn_proto::SendDatagramError::Blocked(b)) => {
+            Err(ringline_quic_proto::SendDatagramError::TooLarge) => {
+                return Err(Error::DatagramTooLarge);
+            }
+            Err(ringline_quic_proto::SendDatagramError::Blocked(b)) => {
                 return Err(Error::DatagramBlocked(b));
             }
         }
@@ -815,7 +819,7 @@ impl QuicEndpoint {
     fn insert_connection(
         &mut self,
         ch: ConnectionHandle,
-        conn: quinn_proto::Connection,
+        conn: ringline_quic_proto::Connection,
         outbound: bool,
     ) -> usize {
         // `has_0rtt()` returns whether 0-RTT keys were derived for this
@@ -987,7 +991,7 @@ impl QuicEndpoint {
                             self.events.push_back(QuicEvent::StreamOpened {
                                 conn: conn_id,
                                 stream,
-                                bidi: dir == quinn_proto::Dir::Bi,
+                                bidi: dir == ringline_quic_proto::Dir::Bi,
                             });
                             self.events.push_back(QuicEvent::StreamReadable {
                                 conn: conn_id,

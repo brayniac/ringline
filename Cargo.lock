@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.7.0-alpha.24"
+version = "0.7.0-alpha.25"
 dependencies = [
  "bytes",
  "criterion",
@@ -1656,10 +1656,10 @@ dependencies = [
  "pin-project-lite",
  "proptest",
  "rcgen",
+ "ringline-tls",
  "ringline-tls-config",
  "rustls",
  "rustls-pki-types",
- "rustls-webpki",
  "thiserror",
  "tokio",
 ]
@@ -1804,12 +1804,34 @@ dependencies = [
  "quinn-proto",
  "rcgen",
  "ringline",
+ "ringline-quic-proto",
  "ringline-tls-config",
  "rustls",
  "rustls-pki-types",
- "rustls-webpki",
  "slab",
  "thiserror",
+]
+
+[[package]]
+name = "ringline-quic-proto"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48d9420d73edc70d7e4083bb91e48e9dd2e3422a22d13ae4f1fb7df3b1bd0fdf"
+dependencies = [
+ "bytes",
+ "getrandom 0.4.3",
+ "lru-slab",
+ "rand 0.10.3",
+ "rand_pcg",
+ "ring",
+ "ringline-tls",
+ "rustc-hash",
+ "rustls-pki-types",
+ "slab",
+ "thiserror",
+ "tinyvec",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -1827,13 +1849,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ringline-tls"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fbbba02b113373064a19d4ae1a062912ae4e6565f1fd95085810b5724f70d0e"
+dependencies = [
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "ringline-tls-config"
 version = "0.1.0"
 dependencies = [
  "rcgen",
- "rustls",
+ "ringline-tls",
  "rustls-pki-types",
- "rustls-webpki",
  "thiserror",
 ]
 
