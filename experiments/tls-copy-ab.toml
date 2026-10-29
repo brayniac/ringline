@@ -16,6 +16,13 @@
 # uses less server CPU per op than tls by more than that spread; vlen 4096
 # lies between. A vlen 65536 difference inside the spread refutes the copy
 # being a measurable cost at this load.
+# Prediction for rustls patch 2 (next_record lends the decrypted record: no
+# copy inside rustls on receive), run with base = patch 1 and patch = patch
+# 1+2, written before running: the server receives values only on SETs (20%
+# of requests), so the saving is about a quarter of patch 1's. At vlen 65536
+# user CPU per op falls by roughly 2-3%; at vlen 64 and 4096 no difference
+# beyond the spread between the two tls arms. A vlen 65536 difference inside
+# that spread refutes the receive copy being measurable at this load.
 # Server bins: tls-copy-ab-build.toml (out/resp-server, out/resp-server-patch).
 # Client: the C8 cachecannon (client_bins); it runs TLS too, so client CPU
 # may limit throughput in the TLS arms. Per-op server CPU does not depend

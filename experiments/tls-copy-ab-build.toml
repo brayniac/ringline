@@ -1,15 +1,18 @@
 # Build resp-server twice for the TLS copy A/B (experiments/tls-copy-ab.toml):
-# out/resp-server against ringline-tls as locked (the published release), and
-# out/resp-server-patch against the ringline-rs/rustls commit {patch_rev},
+# out/resp-server against ringline-tls as locked (the published release), or
+# against the ringline-rs/rustls commit {base_rev} when that is set, and
+# out/resp-server-patch against the ringline-rs/rustls commit {patch_rev}, each
 # through a [patch.crates-io] entry. build.log records `cargo tree -i
 # ringline-tls` for both, so the run can confirm which source each binary
 # used. The client is the C8 cachecannon, passed to the run spec separately.
-name = "tls copy ab build ({ref}, rustls {patch_rev})"
+name = "tls copy ab build ({ref}, rustls {base_rev} vs {patch_rev})"
 
 [params]
 repo        = "https://github.com/brayniac/ringline"
 ref         = "exp/tls-copy-ab"
 rustls_repo = "https://github.com/ringline-rs/rustls"
+# Empty: the base is ringline-tls as locked.
+base_rev    = ""
 patch_rev   = "c03a514b118e0adbeb8cfb9b04ab47d841539f24"
 image       = "debian-13-ci"
 
@@ -39,9 +42,19 @@ cd /home/anvil
   echo "ringline: $(git -C src log --oneline -1)"
   rustc --version
   cd src
-  cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  cp Cargo.toml Cargo.toml.orig
+  cp Cargo.lock Cargo.lock.orig
+  if [ -n "{base_rev}" ]; then
+    printf '\n[patch.crates-io]\nringline-tls = { git = "%s", rev = "%s" }\n' '{rustls_repo}' '{base_rev}' >> Cargo.toml
+    cargo update -p ringline-tls || exit 1
+    cargo build --release -p ringline-bench --bin resp-server || exit 1
+  else
+    cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  fi
   echo "== base"; cargo tree -i ringline-tls -e normal --target all | head -3
   cp target/release/resp-server ../out/resp-server
+  cp Cargo.toml.orig Cargo.toml
+  cp Cargo.lock.orig Cargo.lock
   printf '\n[patch.crates-io]\nringline-tls = { git = "%s", rev = "%s" }\n' '{rustls_repo}' '{patch_rev}' >> Cargo.toml
   cargo update -p ringline-tls || exit 1
   cargo build --release -p ringline-bench --bin resp-server || exit 1
