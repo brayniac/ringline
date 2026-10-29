@@ -10,7 +10,7 @@ name = "tls copy ab build ({ref}, rustls {patch_rev})"
 repo        = "https://github.com/brayniac/ringline"
 ref         = "exp/tls-copy-ab"
 rustls_repo = "https://github.com/ringline-rs/rustls"
-patch_rev   = "REPLACE-WITH-FORK-COMMIT"
+patch_rev   = "c03a514b118e0adbeb8cfb9b04ab47d841539f24"
 image       = "debian-13-ci"
 
 [[jobs]]
