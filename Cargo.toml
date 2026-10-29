@@ -64,7 +64,11 @@ thiserror = "2"
 #   GHSA-wppq-2f6r-wfvm  long Retry token panics or exhausts client memory
 # `cargo audit` matches advisories by crate name and does not see this
 # crate. The fork's advisory check covers the fork's branch, not this
-# requirement; raising it after a fork security release is manual.
+# requirement. When the fork releases a later version on this requirement's
+# minor version, its release workflow opens a pull request into main raising
+# the requirement to it (admin/ringline-raise in ringline-rs/quinn). A move
+# to a new minor version, or a raise on a maintenance branch, is done by
+# hand.
 # Downstream resolvers respect this minimum even though the lockfile may
 # resolve higher.
 ringline-quic-proto = { version = "0.1.0", default-features = false, features = ["rustls-ring"] }
@@ -83,7 +87,11 @@ ringline-quic-proto = { version = "0.1.0", default-features = false, features = 
 # and RUSTSEC-2026-0285, RUSTSEC-2024-0399 and RUSTSEC-2024-0336.
 # `cargo audit` matches advisories by crate name and does not see this
 # crate. The fork's advisory check covers the fork's branch, not this
-# requirement; raising it after a fork security release is manual.
+# requirement. When the fork releases a later version on this requirement's
+# minor version, its release workflow opens a pull request into main raising
+# the requirement to it (admin/ringline-raise in ringline-rs/rustls). A move
+# to a new minor version, or a raise on a maintenance branch, is done by
+# hand.
 ringline-tls = { version = "0.1.0", default-features = false }
 # Upstream quinn-proto and rustls are used only by tests and the unpublished
 # benchmark crates: the tests check ringline against them, and
