@@ -1,0 +1,57 @@
+# Build resp-server twice for the TLS copy A/B (experiments/tls-copy-ab.toml):
+# out/resp-server against ringline-tls as locked (the published release), and
+# out/resp-server-patch against the ringline-rs/rustls commit {patch_rev},
+# through a [patch.crates-io] entry. build.log records `cargo tree -i
+# ringline-tls` for both, so the run can confirm which source each binary
+# used. The client is the C8 cachecannon, passed to the run spec separately.
+name = "tls copy ab build ({ref}, rustls {patch_rev})"
+
+[params]
+repo        = "https://github.com/brayniac/ringline"
+ref         = "exp/tls-copy-ab"
+rustls_repo = "https://github.com/ringline-rs/rustls"
+patch_rev   = "REPLACE-WITH-FORK-COMMIT"
+image       = "debian-13-ci"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  echo "kernel: $(uname -r)"
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref}
+  echo "ringline: $(git -C src log --oneline -1)"
+  rustc --version
+  cd src
+  cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  echo "== base"; cargo tree -i ringline-tls -e normal --target all | head -3
+  cp target/release/resp-server ../out/resp-server
+  printf '\n[patch.crates-io]\nringline-tls = { git = "%s", rev = "%s" }\n' '{rustls_repo}' '{patch_rev}' >> Cargo.toml
+  cargo update -p ringline-tls || exit 1
+  cargo build --release -p ringline-bench --bin resp-server || exit 1
+  echo "== patch"; cargo tree -i ringline-tls -e normal --target all | head -3
+  cp target/release/resp-server ../out/resp-server-patch
+  cd ..
+  ( cd out && sha256sum * )
+  tar czf bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''

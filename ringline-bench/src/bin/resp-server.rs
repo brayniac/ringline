@@ -102,17 +102,16 @@ fn main() {
 
 /// A server config with a self-signed certificate for "localhost", generated
 /// per process so no key material is stored.
-fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+fn self_signed_server_config() -> ringline::TlsConfig {
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("generate self-signed cert");
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let chain = vec![CertificateDer::from(cert.cert)];
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key.into())
-        .expect("valid server config");
-    std::sync::Arc::new(config)
+    ringline::TlsConfig::builder()
+        .cert(chain, key.into())
+        .build()
+        .expect("valid server config")
 }
 
 fn pin(core: usize) {
@@ -398,7 +397,7 @@ mod ringline_arm {
                 args.send_slot,
             );
         if args.tls {
-            builder = builder.tls(ringline::TlsConfig::new(self_signed_server_config()));
+            builder = builder.tls(self_signed_server_config());
         }
         let config = builder.build().expect("valid config");
         let (_shutdown, handles) = RinglineBuilder::new(config)
