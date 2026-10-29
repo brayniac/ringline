@@ -6,13 +6,14 @@ ringline-rs/quinn, and ringline, ringline-tls-config and ringline-quic use
 them. Steps 6 and 7 (the copy-removing patches) are not started.
 
 Apart from this status, "Security process" and the passages marked "Not
-built", this document is the proposal as written on 2026-10-27. Its "today"
-and its line references are to the tree at that time. What was built
-differs from it in three ways:
+built" or "Built", this document is the proposal as written on 2026-10-27.
+Its "today" and its line references are to the tree at that time. What was
+built differs from it in three ways:
 
-- The update workflows do not open a pull request in ringline. A fork
-  release does not raise ringline's requirement; raise it in the workspace
-  `Cargo.toml` by hand.
+- The pull request in ringline that raises the fork's requirement is opened
+  by each fork's release workflow (`ringline-release.yml`,
+  `admin/ringline-raise`), after the release is published, not by the
+  update workflow.
 - The quinn fork's update does not read the rustls fork's release notes.
   `admin/ringline-apply-rename` holds the rustls version the current
   `ringline-tls` requirement contains (`RINGLINE_TLS_CONTAINS`) and stops with
@@ -521,9 +522,11 @@ request opened with the default `GITHUB_TOKEN` does not trigger
 The pull request is reviewed and merged like any other, then the fork
 releases a patch version. The same workflow was then to open a pull
 request in ringline that raises the fork's requirement in the workspace
-`Cargo.toml` and updates `Cargo.lock` (see "Security process"). Not built:
-that pull request is opened by hand (see Status). ringline has no
-Dependabot configuration today.
+`Cargo.toml` and updates `Cargo.lock` (see "Security process"). Built in
+the release workflow instead: after publishing, `ringline-release.yml` runs
+`admin/ringline-raise`, which opens that pull request against ringline's
+main when main requires an earlier version on the same minor version (see
+Status). ringline has no Dependabot configuration today.
 
 - The workflow iterates over a configured list of fork branches. A fork
   minor version that a maintained ringline line (`release/X.Y.x`) still uses
@@ -560,17 +563,25 @@ With the forks, ringline is responsible for shipping fixes like these.
   - The job checks the upstream release merged on the fork's branch, not
     the fork version ringline requires or locks. Once the fix is merged in
     the fork, the job passes while ringline may still lock a vulnerable
-    release.
+    release, until the raise pull request (or a `cargo update`) moves the
+    lock.
 - **Fix.**
   - Merge the fixed upstream release and release the fork as a patch
     version. A downstream `cargo update` picks it up at once.
-  - A pull request in ringline, opened by hand, raises the `ringline-tls`
-    (or `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to
-    the fixed version, with the advisory in the comment, as the current
-    floors are recorded. A patch release of each published crate that
-    declares the dependency carries the floor to downstream resolvers:
-    ringline and `ringline-tls-config` for `ringline-tls`, and ringline-quic
-    for `ringline-quic-proto`.
+  - The fork's release workflow (`admin/ringline-raise`) opens a pull request
+    in ringline, when ringline's main requires an earlier version on the same
+    minor version (a move to a new minor version, or a raise on a maintenance
+    branch, is done by hand). It raises the `ringline-tls` (or
+    `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to the
+    fixed version and, in a comment above the requirement, names the RustSec
+    advisories against the upstream crate that the raise fixes. The person who
+    merges it adds to that comment any advisory the script does not find: one
+    against an upstream dependency such as `rustls-webpki`, one against the
+    fork's own changes, or a GitHub advisory (GHSA) against the upstream crate
+    that is not in the RustSec database. A patch release of each published
+    crate that declares the dependency carries the floor to downstream
+    resolvers: ringline and `ringline-tls-config` for `ringline-tls`, and
+    ringline-quic for `ringline-quic-proto`.
   - A transitive requirement does not carry a floor. After a
     `ringline-tls` fix, `ringline-tls-config` takes a patch release that
     raises its `ringline-tls` requirement, and ringline-quic and
@@ -686,8 +697,8 @@ Each step is a separate pull request in the repository it changes.
      library.
    - Add the copy-count test, the advisory check and the update workflow.
      The workflow's ringline pull request is enabled at step 5, when
-     ringline first requires the fork. Not built: no workflow opens a pull
-     request in ringline (see Status).
+     ringline first requires the fork. Built in the release workflow, not
+     the update workflow (see Status).
    - Install the workflow's GitHub App on the fork.
    - Raise the root `webpki` requirement to 0.103.16 (RUSTSEC-2026-0382), so
      the fork carries the `rustls-webpki` floor that ringline,
