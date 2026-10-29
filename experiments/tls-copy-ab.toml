@@ -23,7 +23,7 @@
 name = "tls copy ab v{vlen} d{depth} c{conns} rep{rep}"
 
 [params]
-bins_artifact  = "REPLACE-WITH-ARTIFACT-ID"
+bins_artifact  = "01a18968-a450-730c-ac51-a91f03154298"
 client_bins    = "01a159f3-e054-73af-bc3f-8b6ea08f60b1"
 image          = "debian-13-ci"
 rep            = "1"
