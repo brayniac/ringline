@@ -223,6 +223,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** TLS and QUIC use ringline's forks of rustls and quinn-proto:
+  `ringline-tls` 0.1 (ringline-rs/rustls, rustls 0.23.46 renamed) and
+  `ringline-quic-proto` 0.1 (ringline-rs/quinn, quinn-proto 0.11.19 on
+  ringline-tls). See `docs/rustls-quinn-forks-design.md`.
+  - The builders, `TlsInfo`, `QuicConfig::builder()` and the ringline-quic
+    types are unchanged.
+  - The escape hatches now name the forks' types:
+    `ringline::tls_config::rustls` (and `ringline_tls_config::rustls`) is
+    `ringline_tls`, and `ringline_quic::proto` is `ringline_quic_proto`.
+    `TlsConfig::from_rustls`, `TlsClientConfig::from_rustls` and
+    `QuicConfig::from_proto` take configs built from those. A config built
+    with upstream rustls or quinn-proto, or with a crate that implements
+    upstream rustls's traits such as `rustls-platform-verifier`, does not
+    fit; build it from the re-exported crate instead. `rustls_config()`
+    and `quic_resumption()` return `ringline_tls` types, which crates that
+    take upstream rustls types (tokio-rustls, quinn) do not accept.
+    `TlsVersion::from_rustls` and `CipherSuite::from_rustls` take
+    `ringline_tls` values.
+  - ringline-quic-proto has no `platform-verifier` feature.
+  - ringline, ringline-tls-config and ringline-quic no longer depend on
+    `rustls-webpki` directly: ringline-tls 0.1.0 requires 0.103.16 or later
+    (RUSTSEC-2026-0382) itself.
 - **Breaking:** `ringline-quic`'s public API names no quinn-proto type
   outside `QuicConfig::from_proto` and the `proto` re-export.
   - `QuicConfig::builder()` takes a `TlsConfig` (`server`), a

@@ -11,7 +11,7 @@ than work around it.
 
 ```bash
 # Build
-cargo build                          # includes TLS (rustls)
+cargo build                          # includes TLS (ringline-tls, a fork of rustls)
 cargo build --examples               # all examples
 
 # Lint — ALWAYS run all three before committing (CI runs clippy on both backends with -D warnings)
@@ -55,7 +55,7 @@ shuts the runtime down and fails the test if the workers have not exited
 within 30 s of the call, so a stuck handler fails the test instead of hanging
 `cargo test` (#447).
 
-`cargo build` succeeding is NOT sufficient verification — clippy `-D warnings` and fmt failures are CI failures. CI runs every cargo invocation with `--locked`; `Cargo.lock` is committed, so any dependency or version change must update the lockfile in the same commit or CI goes red. A daily `cargo audit --deny warnings` cron catches new advisories — security version pins live as comments in the workspace `Cargo.toml`.
+`cargo build` succeeding is NOT sufficient verification — clippy `-D warnings` and fmt failures are CI failures. CI runs every cargo invocation with `--locked`; `Cargo.lock` is committed, so any dependency or version change must update the lockfile in the same commit or CI goes red. A daily `cargo audit --deny warnings` cron catches new advisories — security version pins live as comments in the workspace `Cargo.toml`. It does not see `ringline-tls` or `ringline-quic-proto`. Each fork's `ringline-advisories.yml` checks the upstream release merged on the fork's branch, not the version ringline requires or locks; after a fork security release, raise the requirement in the workspace `Cargo.toml` by hand, since no workflow opens that pull request.
 
 ## Platform & Backend Matrix
 
@@ -133,10 +133,12 @@ This is a Cargo workspace. The core runtime is in `ringline/`; protocol client c
 - **ringline-h2** — Sans-IO HTTP/2 client framing (HPACK, streams), zero runtime deps
 - **ringline-h3** — Sans-IO HTTP/3 framing on `ringline-quic` (QPACK static-table only, control streams)
 - **ringline-tls-config** — `TlsConfig`/`TlsClientConfig` and their builders, the `TlsVersion`/`CipherSuite` enums, and the rustls escape hatch (`from_rustls`, `rustls_config`, the `rustls` re-export). ringline re-exports it as `ringline::tls_config`. Design: `docs/rustls-quinn-forks-design.md`
-- **ringline-quic** — Sans-IO QUIC wrapping `quinn-proto`'s state machine. Its API names no quinn-proto type outside `QuicConfig::from_proto` and the `proto` re-export: `QuicConfig::builder()` takes ringline-tls-config's `TlsConfig`/`TlsClientConfig`, and stream IDs, errors, events and stats are its own types (`types.rs`, `error.rs`, `event.rs`)
+- **ringline-quic** — Sans-IO QUIC wrapping the state machine of `ringline-quic-proto` (ringline-rs/quinn, a fork of quinn-proto). Its API names no quinn-proto type outside `QuicConfig::from_proto` and the `proto` re-export: `QuicConfig::builder()` takes ringline-tls-config's `TlsConfig`/`TlsClientConfig`, and stream IDs, errors, events and stats are its own types (`types.rs`, `error.rs`, `event.rs`)
 - **ringline-http** — Async HTTP/1.1 + HTTP/2 client bridging `ringline-h2` to `ConnCtx`
 - **ringline-grpc** — Sans-IO gRPC framing on `ringline-h2` (no protobuf dep; caller serializes)
 - **ringline-bench** / **ringline-benchmarks** — unpublished load-gen tools: `ringline-bench` is the echo/cache server comparison (ringline vs tokio); `ringline-benchmarks` is the multi-protocol harness (tcp/udp/redis/memcache/http1/2/3/quic) with a `force-mio` feature for backend A/B
+
+TLS and QUIC come from two forks maintained under `ringline-rs`: ringline-tls (ringline-rs/rustls, rustls 0.23 renamed; library `ringline_tls`) and ringline-quic-proto (ringline-rs/quinn, quinn-proto 0.11 on ringline-tls). ringline and ringline-tls-config import the TLS fork as `ringline_tls`; ringline-quic imports the QUIC fork as `ringline_quic_proto`. Integration tests use upstream `rustls` and `quinn_proto` as peers; ringline-bench's connect-bench client, ringline-benchmarks' tokio comparison clients and its HTTP/2 benchmark server use them too. A daily workflow in each fork checks for a newer upstream release on its line and opens a pull request merging it (or an issue when the merge needs a person); merge the pull request with a merge commit, then tag `v0.1.N` to publish. Design: `docs/rustls-quinn-forks-design.md`.
 
 Wire-protocol parsing/encoding lives in **external published proto crates** (`resp-proto`, `memcache-proto`, `ping-proto`, `ketama`), not in the client crates. The client crates own the runtime integration: `Client`/`ClientBuilder`, fire/recv + write coalescing, pooling, sharding/cluster routing, metrics. (The root `ketama/` directory is an orphaned source copy, not a workspace member — the published `ketama` crate is what's consumed.)
 

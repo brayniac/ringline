@@ -119,7 +119,7 @@ fn finish_unbuffered_feed(
     out_sends: &mut Vec<BuiltSend>,
 ) -> TlsRecvResult {
     if !ciphertext_to_sends(send_copy_pool, conn_index, generation, scratch, out_sends) {
-        return TlsRecvResult::Error(rustls::Error::General(
+        return TlsRecvResult::Error(ringline_tls::Error::General(
             "send pool exhausted during TLS output flush".into(),
         ));
     }

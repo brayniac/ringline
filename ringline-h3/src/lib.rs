@@ -14,7 +14,7 @@
 //!   UDP datagrams
 //!        │
 //!   ┌────▼────────┐
-//!   │ringline-quic│  QUIC transport (quinn-proto wrapper)
+//!   │ringline-quic│  QUIC transport (ringline-quic-proto wrapper)
 //!   │QuicEndpoint  │  QuicEvent: StreamReadable, StreamOpened, etc.
 //!   └────┬────────┘
 //!        │ stream_recv() / stream_send()

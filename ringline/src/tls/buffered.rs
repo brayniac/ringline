@@ -14,9 +14,9 @@ use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
 
 #[allow(unused_imports)]
-use rustls::pki_types::ServerName;
+use ringline_tls::pki_types::ServerName;
 #[allow(unused_imports)]
-use rustls::{ClientConnection, ServerConnection};
+use ringline_tls::{ClientConnection, ServerConnection};
 
 #[allow(unused_imports)]
 use crate::accumulator::AccumulatorTable;
@@ -58,21 +58,21 @@ impl BufferedKind {
         }
     }
 
-    pub fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+    pub fn process_new_packets(&mut self) -> Result<ringline_tls::IoState, ringline_tls::Error> {
         match self {
             BufferedKind::Server(c) => c.process_new_packets(),
             BufferedKind::Client(c) => c.process_new_packets(),
         }
     }
 
-    pub fn reader(&mut self) -> rustls::Reader<'_> {
+    pub fn reader(&mut self) -> ringline_tls::Reader<'_> {
         match self {
             BufferedKind::Server(c) => c.reader(),
             BufferedKind::Client(c) => c.reader(),
         }
     }
 
-    pub fn writer(&mut self) -> rustls::Writer<'_> {
+    pub fn writer(&mut self) -> ringline_tls::Writer<'_> {
         match self {
             BufferedKind::Server(c) => c.writer(),
             BufferedKind::Client(c) => c.writer(),
@@ -100,14 +100,14 @@ impl BufferedKind {
         }
     }
 
-    pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+    pub fn negotiated_cipher_suite(&self) -> Option<ringline_tls::SupportedCipherSuite> {
         match self {
             BufferedKind::Server(c) => c.negotiated_cipher_suite(),
             BufferedKind::Client(c) => c.negotiated_cipher_suite(),
         }
     }
 
-    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+    pub fn protocol_version(&self) -> Option<ringline_tls::ProtocolVersion> {
         match self {
             BufferedKind::Server(c) => c.protocol_version(),
             BufferedKind::Client(c) => c.protocol_version(),
@@ -191,7 +191,7 @@ pub(super) fn feed_tls_recv_buffered(
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
-                return TlsRecvResult::Error(rustls::Error::General(e.to_string()));
+                return TlsRecvResult::Error(ringline_tls::Error::General(e.to_string()));
             }
         }
         // Drive the state machine after each chunk so rustls can
@@ -218,7 +218,7 @@ pub(super) fn feed_tls_recv_buffered(
         if state.plaintext_bytes_to_read() > 0
             && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
         {
-            return TlsRecvResult::Error(rustls::Error::General(
+            return TlsRecvResult::Error(ringline_tls::Error::General(
                 "recv accumulator limit exceeded".into(),
             ));
         }
@@ -248,7 +248,7 @@ pub(super) fn feed_tls_recv_buffered(
     if state.plaintext_bytes_to_read() > 0
         && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
     {
-        return TlsRecvResult::Error(rustls::Error::General(
+        return TlsRecvResult::Error(ringline_tls::Error::General(
             "recv accumulator limit exceeded".into(),
         ));
     }
@@ -257,7 +257,7 @@ pub(super) fn feed_tls_recv_buffered(
     if tls_conn.conn.wants_write()
         && !take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out_sends)
     {
-        return TlsRecvResult::Error(rustls::Error::General(
+        return TlsRecvResult::Error(ringline_tls::Error::General(
             "send pool exhausted during TLS output flush".into(),
         ));
     }
@@ -544,7 +544,7 @@ pub(super) fn feed_tls_recv_mio_buffered(
     while !remaining.is_empty() {
         let mut cursor = io::Cursor::new(remaining);
         if let Err(e) = buffered_mut(tls_conn).read_tls(&mut cursor) {
-            return TlsRecvResult::Error(rustls::Error::General(e.to_string()));
+            return TlsRecvResult::Error(ringline_tls::Error::General(e.to_string()));
         }
         let consumed = cursor.position() as usize;
         if consumed == 0 {
@@ -570,7 +570,7 @@ pub(super) fn feed_tls_recv_mio_buffered(
         if state.plaintext_bytes_to_read() > 0
             && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
         {
-            return TlsRecvResult::Error(rustls::Error::General(
+            return TlsRecvResult::Error(ringline_tls::Error::General(
                 "recv accumulator limit exceeded".into(),
             ));
         }
@@ -732,12 +732,12 @@ pub(crate) mod test_support {
     use std::io::Cursor;
 
     pub(crate) fn test_certs() -> (
-        Vec<rustls::pki_types::CertificateDer<'static>>,
-        rustls::pki_types::PrivateKeyDer<'static>,
+        Vec<ringline_tls::pki_types::CertificateDer<'static>>,
+        ringline_tls::pki_types::PrivateKeyDer<'static>,
     ) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let key = ringline_tls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = ringline_tls::pki_types::CertificateDer::from(cert.cert);
         (vec![cert_der], key.into())
     }
 
@@ -763,36 +763,36 @@ pub(crate) mod test_support {
 
     /// A completed in-memory TLS session: (server, client), both past handshake.
     pub(crate) fn handshaked() -> (BufferedKind, BufferedKind) {
-        handshaked_with_versions(rustls::DEFAULT_VERSIONS)
+        handshaked_with_versions(ringline_tls::DEFAULT_VERSIONS)
     }
 
     /// As [`handshaked`], pinned to the given protocol versions.
     ///
-    /// `&[&rustls::version::TLS12]` is the reason this exists: the ciphertext
+    /// `&[&ringline_tls::version::TLS12]` is the reason this exists: the ciphertext
     /// bound budgets 29 bytes of per-record overhead for TLS 1.2 GCM's
     /// explicit nonce plus tag, against TLS 1.3's 22, and a worst case that is
     /// only ever asserted against the cheaper version is not a worst case.
     /// The builders enable TLS 1.2 by default, so connections reach it.
     pub(crate) fn handshaked_with_versions(
-        versions: &[&'static rustls::SupportedProtocolVersion],
+        versions: &[&'static ringline_tls::SupportedProtocolVersion],
     ) -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
         let server_config = Arc::new(
-            rustls::ServerConfig::builder_with_protocol_versions(versions)
+            ringline_tls::ServerConfig::builder_with_protocol_versions(versions)
                 .with_no_client_auth()
                 .with_single_cert(certs.clone(), key)
                 .unwrap(),
         );
-        let mut roots = rustls::RootCertStore::empty();
+        let mut roots = ringline_tls::RootCertStore::empty();
         for c in &certs {
             roots.add(c.clone()).unwrap();
         }
-        let client_config: Arc<rustls::ClientConfig> =
-            rustls::ClientConfig::builder_with_protocol_versions(versions)
+        let client_config: Arc<ringline_tls::ClientConfig> =
+            ringline_tls::ClientConfig::builder_with_protocol_versions(versions)
                 .with_root_certificates(roots)
                 .with_no_client_auth()
                 .into();
-        let server_name: rustls::pki_types::ServerName<'_> = "localhost".try_into().unwrap();
+        let server_name: ringline_tls::pki_types::ServerName<'_> = "localhost".try_into().unwrap();
 
         let mut server = BufferedKind::Server(ServerConnection::new(server_config).unwrap());
         let mut client =

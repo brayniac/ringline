@@ -40,8 +40,8 @@ impl AsyncEventHandler for TlsEcho {
 }
 
 fn load_tls_config() -> TlsConfig {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use ringline::tls_config::rustls::pki_types::pem::PemObject;
+    use ringline::tls_config::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let cert_pem = std::env::var("TLS_CERT").unwrap_or_else(|_| "cert.pem".into());
     let key_pem = std::env::var("TLS_KEY").unwrap_or_else(|_| "key.pem".into());

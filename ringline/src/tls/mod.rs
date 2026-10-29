@@ -33,11 +33,11 @@
 use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
+use ringline_tls::pki_types::ServerName;
 // Only the buffered engine constructs these directly; the unbuffered build
 // reaches rustls through `unbuffered::UnbufferedConn` instead.
 #[cfg(feature = "tls-buffered")]
-use rustls::{ClientConnection, ServerConnection};
+use ringline_tls::{ClientConnection, ServerConnection};
 
 #[allow(unused_imports)]
 use crate::accumulator::AccumulatorTable;
@@ -184,7 +184,7 @@ impl TlsConnKind {
         }
     }
 
-    pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+    pub fn negotiated_cipher_suite(&self) -> Option<ringline_tls::SupportedCipherSuite> {
         match self {
             Self::Buffered(k) => k.negotiated_cipher_suite(),
             #[cfg(not(feature = "tls-buffered"))]
@@ -192,7 +192,7 @@ impl TlsConnKind {
         }
     }
 
-    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+    pub fn protocol_version(&self) -> Option<ringline_tls::ProtocolVersion> {
         match self {
             Self::Buffered(k) => k.protocol_version(),
             #[cfg(not(feature = "tls-buffered"))]
@@ -337,7 +337,7 @@ pub(crate) fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
 #[cfg(not(feature = "tls-buffered"))]
 pub(crate) fn negotiated_record_overhead(conn: &TlsConnKind) -> usize {
     match conn.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_3) => TLS_RECORD_HEADER_LEN + 1 + 16,
+        Some(ringline_tls::ProtocolVersion::TLSv1_3) => TLS_RECORD_HEADER_LEN + 1 + 16,
         Some(_) => MAX_RECORD_OVERHEAD,
         None => MAX_RECORD_OVERHEAD,
     }
@@ -476,11 +476,11 @@ impl CiphertextCapacity {
 pub struct TlsTable {
     conns: Vec<Option<TlsConn>>,
     /// Process-wide fallback, used by any listener without its own config.
-    server_config: Option<Arc<rustls::ServerConfig>>,
+    server_config: Option<Arc<ringline_tls::ServerConfig>>,
     /// Per-listener configs indexed by `ListenerId`. A `None` entry, or an
     /// index past the end, falls back to `server_config`.
-    listener_configs: Vec<Option<Arc<rustls::ServerConfig>>>,
-    client_config: Option<Arc<rustls::ClientConfig>>,
+    listener_configs: Vec<Option<Arc<ringline_tls::ServerConfig>>>,
+    client_config: Option<Arc<ringline_tls::ClientConfig>>,
     /// Single shared ciphertext scratch buffer (one per worker thread).
     /// Only used synchronously — we process one connection at a time.
     /// io_uring builds write ciphertext directly into pool slots via
@@ -502,9 +502,9 @@ impl TlsTable {
     /// to `server_config`.
     pub fn with_listener_configs(
         max_connections: u32,
-        server_config: Option<Arc<rustls::ServerConfig>>,
-        client_config: Option<Arc<rustls::ClientConfig>>,
-        listener_configs: Vec<Option<Arc<rustls::ServerConfig>>>,
+        server_config: Option<Arc<ringline_tls::ServerConfig>>,
+        client_config: Option<Arc<ringline_tls::ClientConfig>>,
+        listener_configs: Vec<Option<Arc<ringline_tls::ServerConfig>>>,
     ) -> Self {
         let mut conns = Vec::with_capacity(max_connections as usize);
         conns.resize_with(max_connections as usize, || None);
@@ -536,7 +536,7 @@ impl TlsTable {
     fn server_config_for(
         &self,
         listener: Option<crate::ListenerId>,
-    ) -> Option<&Arc<rustls::ServerConfig>> {
+    ) -> Option<&Arc<ringline_tls::ServerConfig>> {
         listener
             .and_then(|l| self.listener_configs.get(l.index() as usize))
             .and_then(|slot| slot.as_ref())
@@ -563,7 +563,7 @@ impl TlsTable {
         &mut self,
         conn_index: u32,
         listener: Option<crate::ListenerId>,
-    ) -> Result<(), rustls::Error> {
+    ) -> Result<(), ringline_tls::Error> {
         let server_config = self
             .server_config_for(listener)
             .expect("create() called without a server config for this listener")
@@ -593,7 +593,7 @@ impl TlsTable {
         &mut self,
         conn_index: u32,
         server_name: ServerName<'static>,
-    ) -> Result<(), rustls::Error> {
+    ) -> Result<(), ringline_tls::Error> {
         let client_config = self
             .client_config
             .as_ref()
@@ -831,7 +831,7 @@ pub enum TlsRecvResult {
     HandshakeJustCompleted { peer_closed: bool },
     /// TLS error occurred.
     #[allow(dead_code)] // variant matched; inner value reserved for future error reporting
-    Error(rustls::Error),
+    Error(ringline_tls::Error),
     /// Peer sent close_notify or connection is cleanly closed.
     Closed,
 }
@@ -908,12 +908,12 @@ fn build_pool_send(
 mod tests {
     use super::*;
 
-    fn server_config() -> Arc<rustls::ServerConfig> {
+    fn server_config() -> Arc<ringline_tls::ServerConfig> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let key = ringline_tls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = ringline_tls::pki_types::CertificateDer::from(cert.cert);
         Arc::new(
-            rustls::ServerConfig::builder()
+            ringline_tls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(vec![cert_der], key.into())
                 .unwrap(),
@@ -947,16 +947,16 @@ mod tests {
 
     /// A server config whose `max_fragment_size` is overridden. 2048 is inside
     /// rustls' accepted `32..=16389`, so the connection still builds.
-    fn server_config_with_fragment(max_fragment_size: usize) -> Arc<rustls::ServerConfig> {
+    fn server_config_with_fragment(max_fragment_size: usize) -> Arc<ringline_tls::ServerConfig> {
         let mut config = Arc::try_unwrap(server_config()).expect("sole owner");
         config.max_fragment_size = Some(max_fragment_size);
         Arc::new(config)
     }
 
-    fn client_config() -> Arc<rustls::ClientConfig> {
+    fn client_config() -> Arc<ringline_tls::ClientConfig> {
         Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
+            ringline_tls::ClientConfig::builder()
+                .with_root_certificates(ringline_tls::RootCertStore::empty())
                 .with_no_client_auth(),
         )
     }
@@ -1021,7 +1021,7 @@ mod tests {
         config.max_fragment_size = Some(2048);
         let mut table =
             TlsTable::with_listener_configs(4, None, Some(Arc::new(config)), Vec::new());
-        let name: rustls::pki_types::ServerName<'static> = "localhost".try_into().unwrap();
+        let name: ringline_tls::pki_types::ServerName<'static> = "localhost".try_into().unwrap();
         table.create_client(1, name).expect("create a client");
         assert_eq!(table.get_mut(1).unwrap().max_plaintext_per_record, 2043);
     }
@@ -1111,7 +1111,7 @@ mod tests {
     /// Encrypt `plaintext` on a real handshaked session pinned to `versions`
     /// and return the ciphertext rustls actually emitted.
     fn real_ciphertext(
-        versions: &[&'static rustls::SupportedProtocolVersion],
+        versions: &[&'static ringline_tls::SupportedProtocolVersion],
         plaintext: &[u8],
     ) -> Vec<u8> {
         use std::io::Write as _;
@@ -1133,7 +1133,7 @@ mod tests {
         let table = table_with_server(None);
         for len in [1usize, 100, 16384, 16385, 16384 * 3 + 7] {
             let plaintext = vec![0xA5u8; len];
-            let cipher = real_ciphertext(&[&rustls::version::TLS12], &plaintext);
+            let cipher = real_ciphertext(&[&ringline_tls::version::TLS12], &plaintext);
             let bound = table.ciphertext_capacity(0, len).unwrap();
             assert!(
                 cipher.len() <= bound.bytes(),
@@ -1152,7 +1152,7 @@ mod tests {
         let table = table_with_server(None);
         for len in [1usize, 100, 16384, 16385, 16384 * 3 + 7] {
             let plaintext = vec![0xA5u8; len];
-            let cipher = real_ciphertext(&[&rustls::version::TLS13], &plaintext);
+            let cipher = real_ciphertext(&[&ringline_tls::version::TLS13], &plaintext);
             let bound = table.ciphertext_capacity(0, len).unwrap();
             assert!(
                 cipher.len() <= bound.bytes(),
@@ -1164,7 +1164,9 @@ mod tests {
     }
 
     /// Bytes rustls adds to one full-size record, measured.
-    fn measured_record_overhead(versions: &[&'static rustls::SupportedProtocolVersion]) -> usize {
+    fn measured_record_overhead(
+        versions: &[&'static ringline_tls::SupportedProtocolVersion],
+    ) -> usize {
         const ONE_RECORD: usize = DEFAULT_MAX_PLAINTEXT_PER_RECORD;
         let cipher = real_ciphertext(versions, &vec![0xA5u8; ONE_RECORD]);
         cipher.len() - ONE_RECORD
@@ -1178,18 +1180,18 @@ mod tests {
     #[test]
     fn max_record_overhead_is_the_measured_tls12_worst_case() {
         assert_eq!(
-            measured_record_overhead(&[&rustls::version::TLS12]),
+            measured_record_overhead(&[&ringline_tls::version::TLS12]),
             MAX_RECORD_OVERHEAD,
             "TLS 1.2 GCM: 5-byte header + 8-byte explicit nonce + 16-byte tag"
         );
         assert_eq!(
-            measured_record_overhead(&[&rustls::version::TLS13]),
+            measured_record_overhead(&[&ringline_tls::version::TLS13]),
             TLS_RECORD_HEADER_LEN + 17,
             "TLS 1.3: 5-byte header + content-type byte + 16-byte tag"
         );
         assert!(
-            measured_record_overhead(&[&rustls::version::TLS12])
-                > measured_record_overhead(&[&rustls::version::TLS13]),
+            measured_record_overhead(&[&ringline_tls::version::TLS12])
+                > measured_record_overhead(&[&ringline_tls::version::TLS13]),
             "the bound must budget for the more expensive version"
         );
     }
@@ -1199,8 +1201,8 @@ mod tests {
     #[test]
     fn tls12_records_are_larger_than_tls13_records() {
         let plaintext = vec![0xA5u8; 16384 * 2];
-        let twelve = real_ciphertext(&[&rustls::version::TLS12], &plaintext).len();
-        let thirteen = real_ciphertext(&[&rustls::version::TLS13], &plaintext).len();
+        let twelve = real_ciphertext(&[&ringline_tls::version::TLS12], &plaintext).len();
+        let thirteen = real_ciphertext(&[&ringline_tls::version::TLS13], &plaintext).len();
         assert!(
             twelve > thirteen,
             "TLS 1.2 produced {twelve} bytes, TLS 1.3 produced {thirteen}"

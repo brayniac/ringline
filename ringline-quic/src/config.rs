@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn_proto::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
+use ringline_quic_proto::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
 use ringline_tls_config::{TlsClientConfig, TlsConfig, rustls};
 
 use crate::types::VarInt;
@@ -10,8 +10,8 @@ use crate::types::VarInt;
 ///
 /// Build one with [`QuicConfig::builder`] from a ringline
 /// [`TlsConfig`] (to accept connections), a [`TlsClientConfig`] (to make
-/// them), or both. [`QuicConfig::from_proto`] takes complete quinn-proto
-/// configurations instead.
+/// them), or both. [`QuicConfig::from_proto`] takes complete
+/// ringline-quic-proto configurations instead.
 ///
 /// `Clone` lets the same configuration drive several per-worker endpoints
 /// (one `QuicEndpoint` per ringline worker, each bound to its own port
@@ -64,12 +64,13 @@ impl QuicConfig {
         QuicConfigBuilder::default()
     }
 
-    /// A configuration from complete quinn-proto configurations, for what
+    /// A configuration from complete ringline-quic-proto configurations
+    /// (from [`proto`](crate::proto), not upstream `quinn_proto`), for what
     /// the builder does not cover (a non-default [`EndpointConfig`], other
     /// crypto, per-side transport settings, and other transport settings
     /// such as keep-alive and datagram buffers). Part of the escape hatches:
     /// its arguments are [`proto`](crate::proto) types, which follow
-    /// quinn-proto's version.
+    /// ringline-quic-proto's version.
     ///
     /// The configuration is used as given. A rustls configuration without
     /// TLS 1.3 inside `server` or `client` cannot be detected here and
@@ -296,7 +297,7 @@ impl QuicConfigBuilder {
             Vec::new(),
         )
         .map_err(tls_error)?;
-        let crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+        let crypto = ringline_quic_proto::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|_| ConfigError::NoInitialCipherSuite)?;
         let mut config = ServerConfig::with_crypto(Arc::new(crypto));
         config.transport_config(Arc::new(self.transport()));
@@ -327,7 +328,7 @@ impl QuicConfigBuilder {
             Vec::new(),
         )
         .map_err(tls_error)?;
-        let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_config)
+        let crypto = ringline_quic_proto::crypto::rustls::QuicClientConfig::try_from(rustls_config)
             .map_err(|_| ConfigError::NoInitialCipherSuite)?;
         let mut config = ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(self.transport()));
@@ -371,6 +372,9 @@ fn tls_error(e: rustls::Error) -> ConfigError {
 mod tests {
     use super::*;
     use ringline_tls_config::TlsVersion;
+    // The fork's rustls, which QuicConfig takes; the dev-dependency `rustls`
+    // is upstream's, for the integration tests' peers.
+    use ringline_tls_config::rustls;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     fn cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {

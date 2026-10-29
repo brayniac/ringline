@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
+use ringline_tls::pki_types::ServerName;
 
 use super::{
     DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, encrypt_chunk, feed, queue_close_notify,
@@ -15,9 +15,9 @@ use crate::tls::{DEFAULT_MAX_PLAINTEXT_PER_RECORD, TlsConn, TlsConnKind};
 /// default-config value the tests below pin.
 const DEFAULT_RECORD_WIRE_LEN: usize = DEFAULT_MAX_PLAINTEXT_PER_RECORD + 5 + 1 + 16;
 
-fn empty_client_config() -> Arc<rustls::ClientConfig> {
-    rustls::ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore::empty())
+fn empty_client_config() -> Arc<ringline_tls::ClientConfig> {
+    ringline_tls::ClientConfig::builder()
+        .with_root_certificates(ringline_tls::RootCertStore::empty())
         .with_no_client_auth()
         .into()
 }
@@ -55,12 +55,12 @@ fn fresh_conn_has_empty_buffers() {
 }
 
 fn test_certs() -> (
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
+    Vec<ringline_tls::pki_types::CertificateDer<'static>>,
+    ringline_tls::pki_types::PrivateKeyDer<'static>,
 ) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+    let key = ringline_tls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let cert_der = ringline_tls::pki_types::CertificateDer::from(cert.cert);
     (vec![cert_der], key.into())
 }
 
@@ -75,21 +75,21 @@ fn conn_pair() -> (TlsConn, TlsConn) {
 /// subtracted value, exactly as `TlsTable::create` records it.
 fn conn_pair_with_fragment(max_fragment_size: Option<usize>) -> (TlsConn, TlsConn) {
     let (certs, key) = test_certs();
-    let mut server_config = rustls::ServerConfig::builder()
+    let mut server_config = ringline_tls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs.clone(), key)
         .unwrap();
     server_config.max_fragment_size = max_fragment_size;
     let server_config = Arc::new(server_config);
-    let mut roots = rustls::RootCertStore::empty();
+    let mut roots = ringline_tls::RootCertStore::empty();
     for c in &certs {
         roots.add(c.clone()).unwrap();
     }
-    let mut client_config = rustls::ClientConfig::builder()
+    let mut client_config = ringline_tls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_config.max_fragment_size = max_fragment_size;
-    let client_config: Arc<rustls::ClientConfig> = client_config.into();
+    let client_config: Arc<ringline_tls::ClientConfig> = client_config.into();
     let name: ServerName<'static> = "localhost".try_into().unwrap();
 
     let f = crate::tls::plaintext_per_record(max_fragment_size);
@@ -204,7 +204,7 @@ fn a_queued_key_update_reply_does_not_shrink_later_chunks() {
         };
         let status = super::UnbufferedEngine::process(c, incoming.pending());
         match status.state {
-            Ok(rustls::unbuffered::ConnectionState::WriteTraffic(wt)) => wt
+            Ok(ringline_tls::unbuffered::ConnectionState::WriteTraffic(wt)) => wt
                 .refresh_traffic_keys()
                 .expect("a TLS 1.3 connection can request a key update"),
             _ => panic!("a handshaked client with no input is in WriteTraffic"),

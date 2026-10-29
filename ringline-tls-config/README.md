@@ -21,11 +21,16 @@ let client = TlsClientConfig::builder()
 ```
 
 The builders use rustls's *ring* provider and accept TLS 1.2 and TLS 1.3.
-`TlsConfig::from_rustls` and `TlsClientConfig::from_rustls` wrap a rustls
+`TlsConfig::from_rustls` and `TlsClientConfig::from_rustls` wrap a
 configuration for what the builders do not cover, such as client
-certificates or a custom verifier. These, the `rustls_config` accessors, the
-enums' `from_rustls` conversions and the `rustls` re-export follow rustls's
-version; the rest of the crate follows its own semver.
+certificates or a custom verifier. Build it with
+`ringline_tls_config::rustls`, which re-exports `ringline-tls`, ringline's
+fork of rustls 0.23. Configurations from upstream `rustls`, and crates that
+implement upstream rustls's traits such as `rustls-platform-verifier`, do
+not fit. The `from_rustls` constructors, the `rustls_config` accessors,
+`quic_resumption`, the enums' `from_rustls` conversions and the `rustls`
+re-export follow `ringline-tls`'s version; the rest of the crate follows its
+own semver.
 
 The design is in
 [docs/rustls-quinn-forks-design.md](https://github.com/ringline-rs/ringline/blob/main/docs/rustls-quinn-forks-design.md).

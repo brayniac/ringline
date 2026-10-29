@@ -12,7 +12,7 @@ frame encoding/decoding, QPACK header compression, and control stream management
   UDP datagrams
        |
   +----v-----------+
-  | ringline-quic  |  QUIC transport (quinn-proto wrapper)
+  | ringline-quic  |  QUIC transport (ringline-quic-proto wrapper)
   | QuicEndpoint   |  QuicEvent: StreamReadable, StreamOpened, etc.
   +----+-----------+
        | stream_recv() / stream_send()
