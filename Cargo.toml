@@ -52,8 +52,8 @@ itoa = "1"
 libc = "0.2"
 thiserror = "2"
 # ringline-quic-proto (ringline-rs/quinn) is quinn-proto 0.11 renamed and
-# built on ringline-tls; ringline-quic depends on it. 0.1.0 is quinn-proto
-# 0.11.19, past these advisories:
+# built on ringline-tls; ringline-quic depends on it. The required version
+# is past these advisories:
 #   RUSTSEC-2026-0338    panic on zero-length STREAM frames during unordered reads
 #   RUSTSEC-2026-0339    unbounded pending connection ID retirements
 #   RUSTSEC-2026-0340    panic on a peer's minimum ACK delay with ACK_FREQUENCY
@@ -66,16 +66,17 @@ thiserror = "2"
 # crate. The fork's advisory check covers the fork's branch, not this
 # requirement. When the fork releases a later version on this requirement's
 # minor version, its release workflow opens a pull request into main raising
-# the requirement to it (admin/ringline-raise in ringline-rs/quinn). A move
-# to a new minor version, or a raise on a maintenance branch, is done by
-# hand.
+# the requirement to it (admin/ringline-raise in ringline-rs/quinn), and
+# rewrites the sentence directly above the requirement. A move to a new
+# minor version, or a raise on a maintenance branch, is done by hand.
 # Downstream resolvers respect this minimum even though the lockfile may
 # resolve higher.
+# 0.1.0 is based on quinn-proto 0.11.19.
 ringline-quic-proto = { version = "0.1.0", default-features = false, features = ["rustls-ring"] }
 # ringline-tls (ringline-rs/rustls) is a fork of rustls 0.23 under a new
 # name, with record-layer changes listed in its RINGLINE.md; ringline and
-# ringline-tls-config depend on it. It is based on rustls 0.23.46 and
-# requires rustls-webpki >= 0.103.16, past:
+# ringline-tls-config depend on it. It requires rustls-webpki >= 0.103.16.
+# The required version is past:
 #   RUSTSEC-2026-0346    Debug impls for client session values expose TLS secrets
 #   RUSTSEC-2026-0347    buffered application data sent to the outer server
 #                        after ECH rejection
@@ -90,11 +91,10 @@ ringline-quic-proto = { version = "0.1.0", default-features = false, features = 
 # crate. The fork's advisory check covers the fork's branch, not this
 # requirement. When the fork releases a later version on this requirement's
 # minor version, its release workflow opens a pull request into main raising
-# the requirement to it (admin/ringline-raise in ringline-rs/rustls). A move
-# to a new minor version, or a raise on a maintenance branch, is done by
-# hand.
-# Raised by ringline-rs/rustls's release workflow (admin/ringline-raise):
-# 0.1.1 is rustls 0.23.46.
+# the requirement to it (admin/ringline-raise in ringline-rs/rustls), and
+# rewrites the sentence directly above the requirement. A move to a new
+# minor version, or a raise on a maintenance branch, is done by hand.
+# 0.1.1 is based on rustls 0.23.46.
 ringline-tls = { version = "0.1.1", default-features = false }
 # Upstream quinn-proto and rustls are used only by tests and the unpublished
 # benchmark crates: the tests check ringline against them, and

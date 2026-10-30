@@ -487,13 +487,14 @@ one. Out of scope.
 > **Correction (this engine).** Three things above did not survive building it.
 >
 > **`EncodeTlsData` does not "encode into a pool slot" on io_uring.**
-> `EncodeTlsData::encode` needs one contiguous `&mut [u8]` and takes no
-> `io::Write`, so a full-size handshake record can outgrow a single
-> `send_copy_slot_size` slot before the code even knows how many slots it will
-> need. Handshake output is encoded into a scratch `Vec` instead, then chunked
-> across as many pool slots as it takes — one copy more than this row implies,
-> and one more than the buffered engine's `PoolWriter` pays for the same
-> record. Application data does not go through this: `WriteTraffic::encrypt`
+> `EncodeTlsData::encode` takes one contiguous `&mut [u8]` and no
+> `io::Write`. `drive` writes each handshake record into one output `Vec` on
+> both backends, and on io_uring `ciphertext_to_sends` copies that `Vec` into
+> pool slots, all of it or none. Every record would fit one slot
+> (`Config::validate`); the `Vec` is there because `drive` writes handshake
+> output into one buffer on both backends. That is one copy more than this
+> row implies, and one more than the buffered engine's `PoolWriter` pays for
+> the same record. Application data does not go through this: `WriteTraffic::encrypt`
 > (steady state, the `ReadTraffic`/`WriteTraffic` rows) still writes straight
 > into the slot. mio has no pool-slot step for either engine, so it is
 > unaffected. See `docs/journal/2026-09-unbuffered-tls.md`, "Plan 3".

@@ -587,15 +587,24 @@ With the forks, ringline is responsible for shipping fixes like these.
     minor version (a move to a new minor version, or a raise on a maintenance
     branch, is done by hand). It raises the `ringline-tls` (or
     `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to the
-    fixed version and, in a comment above the requirement, names the RustSec
-    advisories against the upstream crate that the raise fixes. The person who
-    merges it adds to that comment any advisory the script does not find: one
-    against an upstream dependency such as `rustls-webpki`, one against the
-    fork's own changes, or a GitHub advisory (GHSA) against the upstream crate
-    that is not in the RustSec database. A patch release of each published
-    crate that declares the dependency carries the floor to downstream
-    resolvers: ringline and `ringline-tls-config` for `ringline-tls`, and
-    ringline-quic for `ringline-quic-proto`.
+    fixed version and rewrites the sentence directly above the requirement,
+    `# X.Y.Z is based on UPSTREAM A.B.C[ and is also past IDS].`, which names
+    the RustSec advisories against the upstream crate that raises have fixed.
+    The script does not find an advisory against an upstream dependency such
+    as `rustls-webpki`, one the fork's own changes fix (including a fix
+    backported ahead of upstream), or a GitHub advisory (GHSA) against the
+    upstream crate that is not in the RustSec database. The person who merges
+    the pull request adds those to the hand-written list above that sentence.
+    A RUSTSEC id against the upstream crate that the fork fixes ahead of
+    upstream must go in that list too: the next raise removes it from the
+    sentence while cargo-audit reports it against the new upstream release.
+    In the sentence, the next raise carries forward only RUSTSEC-YYYY-NNNN ids
+    and `GHSA-xxxx-xxxx-xxxx` ids with a lowercase suffix. If the sentence is
+    in any other form, the next raise leaves that line in place and does not
+    carry its ids. A patch release of each published crate that declares the
+    dependency carries the floor to downstream resolvers: ringline and
+    `ringline-tls-config` for `ringline-tls`, and ringline-quic for
+    `ringline-quic-proto`.
   - A transitive requirement does not carry a floor. After a
     `ringline-tls` fix, `ringline-tls-config` takes a patch release that
     raises its `ringline-tls` requirement, and ringline-quic and

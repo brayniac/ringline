@@ -154,7 +154,7 @@ pub fn encrypt_for_send_mio(
         let tls_conn = conn_slot.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
         })?;
-        let mut out = Vec::with_capacity(plaintext.len() + 128);
+        let mut out = Vec::new();
         unbuffered::encrypt_to_vec(tls_conn, plaintext, &mut out)?;
         Ok(out)
     }
