@@ -20,7 +20,7 @@
 name = "tls provider ab v{vlen} d{depth} c{conns} rep{rep}"
 
 [params]
-bins_artifact  = "01a18968-a450-730c-ac51-a91f03154298"
+bins_artifact  = "01a18e50-34ee-736e-e65e-40a552d37480"
 client_bins    = "01a159f3-e054-73af-bc3f-8b6ea08f60b1"
 image          = "debian-13-ci"
 rep            = "1"
