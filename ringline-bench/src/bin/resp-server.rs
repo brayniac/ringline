@@ -17,6 +17,12 @@ use clap::{Parser, ValueEnum};
 use ringline_bench::resp;
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum, Debug)]
+enum TlsProvider {
+    Ring,
+    AwsLcRs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum, Debug)]
 enum Runtime {
     /// ringline's current API: `with_data` (lend path) and `send_nowait`.
     Ringline,
@@ -45,6 +51,12 @@ struct Args {
     /// `ringline/tls-buffered`).
     #[arg(long)]
     tls: bool,
+    /// ringline only, with `--tls`: the rustls crypto provider. `ring` uses
+    /// ringline's `TlsConfig` builder; `aws-lc-rs` builds the same server
+    /// config with the aws-lc-rs provider and passes it in through
+    /// `TlsConfig::from_rustls`.
+    #[arg(long, value_enum, default_value = "ring")]
+    tls_provider: TlsProvider,
     /// ringline only: send-pool slot size in bytes. The slot count keeps the
     /// pool at 256 MiB per worker.
     #[arg(long, default_value_t = 16384)]
@@ -102,16 +114,30 @@ fn main() {
 
 /// A server config with a self-signed certificate for "localhost", generated
 /// per process so no key material is stored.
-fn self_signed_server_config() -> ringline::TlsConfig {
+fn self_signed_server_config(provider: TlsProvider) -> ringline::TlsConfig {
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("generate self-signed cert");
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let chain = vec![CertificateDer::from(cert.cert)];
-    ringline::TlsConfig::builder()
-        .cert(chain, key.into())
-        .build()
-        .expect("valid server config")
+    match provider {
+        TlsProvider::Ring => ringline::TlsConfig::builder()
+            .cert(chain, key.into())
+            .build()
+            .expect("valid server config"),
+        TlsProvider::AwsLcRs => {
+            use ringline::tls_config::rustls;
+            let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .expect("aws-lc-rs supports TLS 1.2 and 1.3")
+            .with_no_client_auth()
+            .with_single_cert(chain, key.into())
+            .expect("valid server config");
+            ringline::TlsConfig::from_rustls(std::sync::Arc::new(config))
+        }
+    }
 }
 
 fn pin(core: usize) {
@@ -397,7 +423,7 @@ mod ringline_arm {
                 args.send_slot,
             );
         if args.tls {
-            builder = builder.tls(self_signed_server_config());
+            builder = builder.tls(self_signed_server_config(args.tls_provider));
         }
         let config = builder.build().expect("valid config");
         let (_shutdown, handles) = RinglineBuilder::new(config)

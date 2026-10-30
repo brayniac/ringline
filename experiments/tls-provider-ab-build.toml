@@ -1,0 +1,50 @@
+# Build resp-server for the TLS provider A/B (experiments/tls-provider-ab.toml).
+# One binary serves both arms: `--tls-provider ring` uses ringline's TlsConfig
+# builder, `--tls-provider aws-lc-rs` the same server config on the aws-lc-rs
+# provider. build.log records `cargo tree -i ringline-tls` so the run can confirm
+# the ringline-tls version. The client is the C8 cachecannon, passed to the run
+# spec separately.
+name = "tls provider ab build ({ref})"
+
+[params]
+repo  = "https://github.com/brayniac/ringline"
+ref   = "exp/tls-provider-ab"
+image = "debian-13-ci"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  echo "kernel: $(uname -r)"
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref}
+  echo "ringline: $(git -C src log --oneline -1)"
+  rustc --version
+  cd src
+  cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  cargo tree -i ringline-tls -e normal --target all | head -3
+  cp target/release/resp-server ../out/resp-server
+  cd ..
+  ( cd out && sha256sum * )
+  tar czf bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''
