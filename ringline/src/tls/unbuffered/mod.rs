@@ -1,26 +1,30 @@
 //! Unbuffered TLS record layer, built on rustls' `UnbufferedConnectionCommon`.
 //!
 //! Encrypts via `WriteTraffic::encrypt` rather than
-//! `writer()`/`write_tls()`. **This engine does not reduce the send-side copy
-//! count.** It was built believing it removed a copy into rustls'
-//! `sendable_plaintext`; measurement and rustls 0.23.41's source say
-//! otherwise, on two counts: `CommonState::send_plain` buffers into
-//! `sendable_plaintext` only while `!may_send_application_data` (i.e. before
-//! the handshake completes), and `CommonState::write_fragments` seals each
-//! record into a freshly allocated `PrefixedPayload` before copying it into
-//! the destination. Application data costs 2 copies on either engine. See
-//! `docs/tls-unbuffered-design.md`'s top correction block and
-//! `docs/journal/2026-09-unbuffered-tls.md` ("Plan 4 — measurement").
+//! `writer()`/`write_tls()`. With ringline-tls's ring or aws-lc-rs provider,
+//! a TLS 1.3 application-data record costs one copy:
+//! `CommonState::write_fragments` hands the destination to
+//! `MessageEncrypter::encrypt_into`, which copies the plaintext into it and
+//! seals it there. TLS 1.2 records go through a per-record `PrefixedPayload`
+//! and are copied into the destination, 2 copies. The buffered engine pays 2
+//! copies on both versions. On receive, on TLS 1.2 and 1.3,
+//! `ReadTraffic::next_record` lends each record from the
+//! [`super::ciphertext::CiphertextBuf`] it was decrypted in, and [`drive`]
+//! copies it into the recv accumulator (or, with no accumulator, a pending
+//! `Vec`).
 //!
-//! What the engine is still for: it is the prerequisite for kTLS. rustls'
+//! The engine is also the prerequisite for kTLS. rustls'
 //! `dangerous_into_kernel_connection` — which yields both the extracted
 //! secrets and a `KernelConnection` that can still rekey and absorb session
 //! tickets — is public only on `UnbufferedClientConnection` and
 //! `UnbufferedServerConnection`. (The older `dangerous_extract_secrets`, which
 //! earlier revisions of this comment cited, is `#[deprecated]` and exists on
-//! the buffered types too, so it never justified this engine.) It also
-//! measures ~4-8% faster on the recv path, which is not a copy-count effect
-//! and is not yet explained.
+//! the buffered types too, so it never justified this engine.) With rustls
+//! 0.23.41 the engine measured ~4-8% faster than the buffered engine on the
+//! recv path (`docs/journal/2026-09-unbuffered-tls.md`). ringline-tls 0.1.1
+//! lends each decrypted record from `incoming_tls` instead of copying it into
+//! `received_plaintext`, on this engine only; the gap has not been measured
+//! since.
 //!
 //! The default engine, selected per connection in `TlsTable::create` unless the
 //! `tls-buffered` feature is on, and driven end-to-end on both backends through
@@ -422,17 +426,18 @@ fn drive_inner<C: UnbufferedEngine>(
                 while let Some(record) = rt.next_record() {
                     match record {
                         Ok(r) => {
-                            // rustls' contract: this is *additional* discard on
-                            // top of `UnbufferedStatus::discard`. Zero in
-                            // 0.23.41; honoured so an in-place-decryption
-                            // release does not silently desynchronise us.
+                            // The record's own bytes in `incoming`: ringline-tls
+                            // lends the record from where it was decrypted, so
+                            // they are counted here, on top of
+                            // `UnbufferedStatus::discard`. Leaving them out
+                            // fails the next `process` with `DecryptError`.
                             discard += r.discard;
                             // Overflow drops this record where the `None` arm
-                            // below would stash it: `status.discard` was fixed
-                            // before the loop, so the ciphertext is gone either
-                            // way, and overflow returns `Error` — teardown, no
-                            // retry. Stashing would only defer bytes nobody
-                            // will read.
+                            // below would stash it: its `r.discard` is already
+                            // counted above, so its bytes leave `incoming`
+                            // either way, and overflow returns `Error` —
+                            // teardown, no retry. Stashing would only defer
+                            // bytes nobody will read.
                             match sink.as_deref_mut() {
                                 Some(accs) => {
                                     if !accs.append(conn_index, r.payload) {
@@ -658,15 +663,10 @@ pub(crate) const MIN_ENCRYPT_DST: usize = 64;
 /// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
 ///
-/// This was believed to remove a copy relative to the buffered engine. **It
-/// does not.** rustls 0.23.41's `write_fragments` seals every fragment into a
-/// freshly allocated `PrefixedPayload` and then `copy_from_slice`s the record
-/// into `dst`, so this path is plaintext -> per-record buffer -> `dst`, the
-/// same two passes the buffered engine pays. The `sendable_plaintext` copy it
-/// was meant to skip does not happen on an established connection either:
-/// `CommonState::send_plain` buffers there only while
-/// `!may_send_application_data`. See `docs/tls-unbuffered-design.md`'s top
-/// correction block.
+/// With the ring or aws-lc-rs provider, a TLS 1.3 record is sealed in `dst`:
+/// the plaintext is copied once, into `dst`, and encrypted there
+/// (`MessageEncrypter::encrypt_into`). A TLS 1.2 record is sealed in a
+/// per-record buffer and then copied into `dst`.
 ///
 /// `encrypt` is all-or-nothing on its output: too small a buffer writes
 /// nothing and reports `required_size` for the payload it was handed. The
@@ -679,8 +679,8 @@ pub(crate) const MIN_ENCRYPT_DST: usize = 64;
 /// `dst` also carries any TLS records rustls had queued for sending — a
 /// TLS 1.3 `key_update`, most notably: `write_plaintext` drains `sendable_tls`
 /// into the front of `outgoing_tls` ahead of the application-data fragments,
-/// and sizes `required_size` to include them (verified against rustls
-/// 0.23.41's `CommonState::{check_required_size, write_fragments}`). So the
+/// and sizes `required_size` to include them (verified against ringline-tls
+/// 0.1.1's `CommonState::{check_required_size, write_fragments}`). So the
 /// caller need only transmit `dst` in order; there is no second stream to
 /// interleave, and `ciphertext_written` can exceed what this chunk's own
 /// records account for.

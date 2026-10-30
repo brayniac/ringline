@@ -223,8 +223,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- ringline requires `ringline-tls` 0.1.1. On the unbuffered engine (the
+  default), with the ring or aws-lc-rs provider, a TLS 1.3 send through
+  `send`, `send_nowait` or `send_backpressured` costs 1 copy instead of 2:
+  rustls seals the record in the send-pool slot (io_uring) or the queued
+  buffer (mio). `send_parts` and `send_chain` gather their parts first and
+  cost 2 instead of 3. On receive, rustls lends each decrypted record from
+  ringline's ciphertext buffer instead of copying it out, on either TLS
+  version and with any provider. On the unbuffered engine, TLS 1.2, or TLS
+  1.3 with another provider, still costs 2 copies through `send` and 3 through
+  `send_parts` and `send_chain`. The buffered engine is unchanged.
 - **Breaking:** TLS and QUIC use ringline's forks of rustls and quinn-proto:
-  `ringline-tls` 0.1 (ringline-rs/rustls, rustls 0.23.46 renamed) and
+  `ringline-tls` 0.1 (ringline-rs/rustls, a fork of rustls 0.23.46) and
   `ringline-quic-proto` 0.1 (ringline-rs/quinn, quinn-proto 0.11.19 on
   ringline-tls). See `docs/rustls-quinn-forks-design.md`.
   - The builders, `TlsInfo`, `QuicConfig::builder()` and the ringline-quic
@@ -302,7 +312,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `RECV` of up to `recv_direct_region` bytes, instead of through the
   provided-buffer ring. With the default (unbuffered) engine the receive
   writes into the buffer rustls processes records in, which removes one copy
-  per received byte; a TLS receive costs 2 copies instead of 3. With
+  per received byte; with `ringline-tls` 0.1.1 a TLS receive costs 1 copy
+  per received byte, from that buffer into the recv accumulator, plus
+  `CiphertextBuf::compact`'s move of partial records. With
   `tls-buffered` it writes into a worker buffer that `read_tls` copies from,
   as from a provided buffer before. `ringline/recv_direct` counts TLS
   receives and their bytes. With `tls-buffered`, each TLS receive in flight
@@ -312,8 +324,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
   default on both backends. The new `tls-buffered` feature selects the
   buffered engine; `tls-unbuffered` has no effect and is kept so builds that
-  name it still resolve. Application data costs the same copies on both
-  engines. The unbuffered engine now reports the SNI hostname
+  name it still resolve. The unbuffered engine now reports the SNI hostname
   (`TlsInfo::sni_hostname`): ringline clones each server config and wraps
   its certificate resolver to record the name the ClientHello carries, so a
   `ServerConfig` passed in is not the one the connection uses. On the

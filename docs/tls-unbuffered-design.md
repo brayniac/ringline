@@ -19,7 +19,8 @@ records where *measuring* it did.
 > **This design's goal — "remove one of the two copies TLS pays on every send"
 > — cannot be met by switching to rustls' unbuffered API, and the shipped
 > feature does not meet it.** Application-data sends cost 2 copies on both
-> engines. Everything below that reasons from a 2 → 1 copy reduction is wrong,
+> engines (with upstream rustls; see the 2026-10-30 update at the end of this
+> block). Everything below that reasons from a 2 → 1 copy reduction is wrong,
 > including *Goal*, the copy table in *Design target*, *Motivation*, the
 > copy-count line in *Testing*, and the framing in *Why this is the stepping
 > stone to kTLS*. The rest of the document — `CiphertextBuf`, the state
@@ -95,6 +96,13 @@ records where *measuring* it did.
 > reachable from ringline. See
 > [`journal/2026-09-unbuffered-tls.md`](journal/2026-09-unbuffered-tls.md) for
 > the GO/NO-GO verdict.
+>
+> **Update (2026-10-30).** ringline-tls 0.1.1, ringline's fork of rustls, makes
+> `write_fragments` encrypt TLS 1.3 records in place in `outgoing_tls` with the
+> ring and aws-lc-rs providers (`MessageEncrypter::encrypt_into`). On this
+> engine a TLS 1.3 application-data send now costs 1 copy; TLS 1.2 sends and
+> the buffered engine still cost 2. See
+> [`rustls-quinn-forks-design.md`](rustls-quinn-forks-design.md).
 
 ## Goal
 
