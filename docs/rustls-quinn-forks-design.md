@@ -1,17 +1,35 @@
 # Forking rustls and quinn-proto
 
-Status: steps 1 to 5 are done, and step 6 is built. ringline-tls 0.1.0 and
-ringline-quic-proto 0.1.0 are published from ringline-rs/rustls and
-ringline-rs/quinn, and ringline, ringline-tls-config and ringline-quic use
-them (2026-10-29). ringline-tls 0.1.1 carries rustls patches 1 and 2, and
-ringline requires it (2026-10-30). Patch 1 was measured on the two-host rig,
-one run per size: server user CPU per operation fell 10% at 64 KiB values,
-2% at 4 KiB, and did not change at 64 B. Patch 2 was measured only in
-rustls-bench, on one pinned core (`rustls-bench --api unbuffered bulk
-TLS13_AES_256_GCM_SHA384 <size>`, 11-15 interleaved pairs per size):
-unbuffered receive throughput rose 11-12% at 4 KiB and 16 KiB records, and
-did not change at 64 B. Its server CPU per operation measurement has not
-been run. Step 7 is not started.
+Status: steps 1 to 6 are done. ringline-tls 0.1.0 and ringline-quic-proto
+0.1.0 are published from ringline-rs/rustls and ringline-rs/quinn, and
+ringline, ringline-tls-config and ringline-quic use them (2026-10-29).
+ringline-tls 0.1.1 carries rustls patches 1 and 2, and ringline requires it
+(2026-10-30). Each patch was measured on the two-host rig against the build
+without it (patch 2 against patch 1 alone), one run per value size. Each run
+measures both builds twice; the noise floor is the larger gap between two
+measurements of the same build. Server user CPU per operation is the
+statistic. At 4 KiB values and above, total CPU per operation differed by
+4.0-5.5% between the two measurements of one build in three of the eight
+pairs, mostly in softirq. That is larger than every change reported below
+except patch 1's at 64 KiB.
+
+- Patch 1 lowered user CPU per operation 10.4% at 64 KiB values (noise
+  floor 1.2%), 2.1% at 4 KiB (0.2%) and 1.1% at 64 B (0.7%).
+- Patch 2 lowered it 2.1% at 64 B (noise floor 0.8%) and 2.0% at 4 KiB
+  (0.6%). At 64 KiB the two measurements without it differed by 6%, and the
+  difference between the builds (0.2%) is inside that, so the run does not
+  resolve patch 2 at 64 KiB. The prediction written before the run was a 2-3%
+  fall at 64 KiB and none at 64 B or 4 KiB; the 64 B and 4 KiB results
+  refute it, and the run cannot test it at 64 KiB. The `Payload::into_vec`
+  call that patch 2 removes from each received record both allocated and
+  copied (`to_vec` on the decrypted slice); which of the two accounts for the
+  change at 64 B has not been measured.
+- In rustls-bench on one pinned core (`rustls-bench --api unbuffered bulk
+  TLS13_AES_256_GCM_SHA384 <size>`, 11-15 interleaved pairs per size), patch
+  2 raised unbuffered receive throughput 11-12% at 4 KiB and 16 KiB records
+  and did not change it at 64 B.
+
+Step 7 is not started.
 
 Apart from this status, "Security process" and the passages marked "Not
 built" or "Built", this document is the proposal as written on 2026-10-27.
