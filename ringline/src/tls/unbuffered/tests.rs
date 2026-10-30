@@ -668,8 +668,8 @@ fn encrypt_round_trips_multi_record_plaintext() {
 
 // `encrypt_to_vec` sizes each destination to the ciphertext it will hold, so
 // `out` is allocated once per send. A destination of 32 KiB per record, as
-// before, grew `out` part-way through a multi-record send, and growing a `Vec`
-// can copy the ciphertext already written.
+// before, could grow `out` part-way through a multi-record send, and growing
+// a `Vec` can copy the ciphertext already written.
 #[test]
 fn encrypt_to_vec_allocates_its_ciphertext_once() {
     let (mut server, mut client) = conn_pair();

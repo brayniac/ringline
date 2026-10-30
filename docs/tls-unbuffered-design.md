@@ -490,10 +490,11 @@ one. Out of scope.
 > `EncodeTlsData::encode` takes one contiguous `&mut [u8]` and no
 > `io::Write`. `drive` writes each handshake record into one output `Vec` on
 > both backends, and on io_uring `ciphertext_to_sends` copies that `Vec` into
-> pool slots, all of it or none. `Config::validate` makes every record fit one
-> slot, so record size is not why the `Vec` exists. That is one copy more than this row implies,
-> and one more than the buffered engine's `PoolWriter` pays for the same
-> record. Application data does not go through this: `WriteTraffic::encrypt`
+> pool slots, all of it or none. Every record would fit one slot
+> (`Config::validate`); the `Vec` is there because `drive` writes handshake
+> output into one buffer on both backends. That is one copy more than this
+> row implies, and one more than the buffered engine's `PoolWriter` pays for
+> the same record. Application data does not go through this: `WriteTraffic::encrypt`
 > (steady state, the `ReadTraffic`/`WriteTraffic` rows) still writes straight
 > into the slot. mio has no pool-slot step for either engine, so it is
 > unaffected. See `docs/journal/2026-09-unbuffered-tls.md`, "Plan 3".

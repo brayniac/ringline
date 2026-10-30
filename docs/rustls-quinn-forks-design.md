@@ -595,11 +595,13 @@ With the forks, ringline is responsible for shipping fixes like these.
     backported ahead of upstream), or a GitHub advisory (GHSA) against the
     upstream crate that is not in the RustSec database. The person who merges
     the pull request adds those to the hand-written list above that sentence.
-    A RUSTSEC id against the upstream crate must go in that list: the next
-    raise removes it from the sentence while cargo-audit reports it against
-    the new upstream release. In the sentence, the next raise carries forward
-    only RUSTSEC-YYYY-NNNN ids and `GHSA-xxxx-xxxx-xxxx` ids with a lowercase
-    suffix. A patch release of each published crate that declares the
+    A RUSTSEC id against the upstream crate that the fork fixes ahead of
+    upstream must go in that list too: the next raise removes it from the
+    sentence while cargo-audit reports it against the new upstream release.
+    In the sentence, the next raise carries forward only RUSTSEC-YYYY-NNNN ids
+    and `GHSA-xxxx-xxxx-xxxx` ids with a lowercase suffix. If the sentence is
+    in any other form, the next raise leaves that line in place and does not
+    carry its ids. A patch release of each published crate that declares the
     dependency carries the floor to downstream resolvers: ringline and
     `ringline-tls-config` for `ringline-tls`, and ringline-quic for
     `ringline-quic-proto`.
