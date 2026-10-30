@@ -587,12 +587,15 @@ With the forks, ringline is responsible for shipping fixes like these.
     minor version (a move to a new minor version, or a raise on a maintenance
     branch, is done by hand). It raises the `ringline-tls` (or
     `ringline-quic-proto`) requirement in the workspace `Cargo.toml` to the
-    fixed version and, in a comment above the requirement, names the RustSec
-    advisories against the upstream crate that the raise fixes. The person who
-    merges it adds to that comment any advisory the script does not find: one
+    fixed version and rewrites the sentence directly above the requirement,
+    `# X.Y.Z is based on UPSTREAM A.B.C[ and is also past IDS].`, which names
+    the RustSec advisories against the upstream crate that raises have fixed.
+    The person who merges it adds any advisory the script does not find (one
     against an upstream dependency such as `rustls-webpki`, one against the
     fork's own changes, or a GitHub advisory (GHSA) against the upstream crate
-    that is not in the RustSec database. A patch release of each published
+    that is not in the RustSec database) to the hand-written list above that
+    sentence, or to the sentence as a RUSTSEC-YYYY-NNNN or lowercase GHSA id.
+    A patch release of each published
     crate that declares the dependency carries the floor to downstream
     resolvers: ringline and `ringline-tls-config` for `ringline-tls`, and
     ringline-quic for `ringline-quic-proto`.

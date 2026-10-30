@@ -195,24 +195,7 @@ fn a_queued_key_update_reply_does_not_shrink_later_chunks() {
     let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
     handshake(&mut server, &mut client, &mut accs);
 
-    // The client requests a key update; the server reads it and queues its
-    // own key_update in reply.
-    {
-        let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
-        let super::UnbufferedKind::Client(c) = kind else {
-            panic!("the client side is a client connection");
-        };
-        let status = super::UnbufferedEngine::process(c, incoming.pending());
-        match status.state {
-            Ok(ringline_tls::unbuffered::ConnectionState::WriteTraffic(wt)) => wt
-                .refresh_traffic_keys()
-                .expect("a TLS 1.3 connection can request a key update"),
-            _ => panic!("a handshaked client with no input is in WriteTraffic"),
-        }
-    }
-    let (_, key_update) = pump(&mut client, &[], &mut accs);
-    assert!(!key_update.is_empty(), "the client emits its key_update");
-    pump(&mut server, &key_update, &mut accs);
+    queue_key_update_reply(&mut server, &mut client, &mut accs);
 
     let plaintext = vec![0xC3u8; 64 * 1024];
     let mut dst = vec![0u8; dst_len];
@@ -238,6 +221,28 @@ fn a_queued_key_update_reply_does_not_shrink_later_chunks() {
         cached == 0 || cached >= f,
         "the cache keeps {cached} plaintext bytes per slot, under one {f}-byte record"
     );
+}
+
+/// The client requests a key update; the server reads it and queues its own
+/// key_update in reply, which rustls writes in front of the server's next
+/// application data.
+fn queue_key_update_reply(server: &mut TlsConn, client: &mut TlsConn, accs: &mut AccumulatorTable) {
+    {
+        let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+        let super::UnbufferedKind::Client(c) = kind else {
+            panic!("the client side is a client connection");
+        };
+        let status = super::UnbufferedEngine::process(c, incoming.pending());
+        match status.state {
+            Ok(ringline_tls::unbuffered::ConnectionState::WriteTraffic(wt)) => wt
+                .refresh_traffic_keys()
+                .expect("a TLS 1.3 connection can request a key update"),
+            _ => panic!("a handshaked client with no input is in WriteTraffic"),
+        }
+    }
+    let (_, key_update) = pump(client, &[], accs);
+    assert!(!key_update.is_empty(), "the client emits its key_update");
+    pump(server, &key_update, accs);
 }
 
 /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its
@@ -657,6 +662,86 @@ fn encrypt_round_trips_multi_record_plaintext() {
 
     let mut out = Vec::new();
     let outcome = feed(&mut server, Some(&mut accs), &mut out, &cipher, 0);
+    assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
+    assert_eq!(accs.data(0), &plaintext[..]);
+}
+
+// `encrypt_to_vec` sizes each destination to the ciphertext it will hold, so
+// `out` is allocated once per send. A destination of 32 KiB per record, as
+// before, grew `out` part-way through a multi-record send, and growing a `Vec`
+// can copy the ciphertext already written.
+#[test]
+fn encrypt_to_vec_allocates_its_ciphertext_once() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 4 * 1024 * 1024);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+
+    let f = DEFAULT_MAX_PLAINTEXT_PER_RECORD;
+    let mut sent = Vec::new();
+    let mut wire = Vec::new();
+    for len in [
+        1,
+        64,
+        4096,
+        f,
+        f + 1,
+        2 * f - 1,
+        4 * f,
+        4 * f + 100,
+        300_000,
+    ] {
+        let plaintext: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut out = Vec::new();
+        super::encrypt_to_vec(&mut client, &plaintext, &mut out).expect("encrypt");
+        assert_eq!(
+            out.len(),
+            len + len.div_ceil(f) * (DEFAULT_RECORD_WIRE_LEN - f),
+            "{len} bytes of plaintext in full-size TLS 1.3 records"
+        );
+        assert!(
+            out.capacity() <= out.len() + 2 * super::QUEUED_RECORD_ROOM,
+            "{len} bytes: capacity {} for {} bytes of ciphertext, more than the \
+             ciphertext plus the room `encrypt_to_vec` reserves",
+            out.capacity(),
+            out.len()
+        );
+        sent.extend_from_slice(&plaintext);
+        wire.extend_from_slice(&out);
+    }
+
+    let mut out = Vec::new();
+    let outcome = feed(&mut server, Some(&mut accs), &mut out, &wire, 0);
+    assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
+    assert_eq!(accs.data(0), &sent[..]);
+}
+
+// A key_update rustls has queued rides in front of the next send's records,
+// inside the room `encrypt_to_vec` leaves for it: the send still takes one
+// allocation, and the peer reads the reply and the data in order.
+#[test]
+fn encrypt_to_vec_carries_a_queued_key_update() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 4 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+    queue_key_update_reply(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+    accs.reset(1);
+
+    let plaintext: Vec<u8> = (0..3 * DEFAULT_MAX_PLAINTEXT_PER_RECORD + 7)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let mut out = Vec::new();
+    super::encrypt_to_vec(&mut server, &plaintext, &mut out).expect("encrypt");
+    assert!(
+        out.capacity() <= out.len() + 2 * super::QUEUED_RECORD_ROOM,
+        "capacity {} for {} bytes of ciphertext",
+        out.capacity(),
+        out.len()
+    );
+
+    let mut back = Vec::new();
+    let outcome = feed(&mut client, Some(&mut accs), &mut back, &out, 0);
     assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
     assert_eq!(accs.data(0), &plaintext[..]);
 }

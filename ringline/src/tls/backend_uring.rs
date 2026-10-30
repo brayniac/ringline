@@ -16,10 +16,12 @@
 //! at the peer.
 //!
 //! Handshake output takes a scratch `Vec` on the way to those slots.
-//! `EncodeTlsData::encode` is all-or-nothing on one contiguous buffer, and a
-//! full-size handshake record (`5 + 16384 + overhead`) does not fit the default
-//! 16384-byte `send_copy_slot_size` — so the engine writes it to a `Vec` and
-//! [`ciphertext_to_sends`] chunks it across slots. Application data does not
+//! `unbuffered::drive` writes each record rustls hands out as `EncodeTlsData`
+//! into one output buffer, on both backends, and [`ciphertext_to_sends`]
+//! copies that buffer into slots, all of it or none. Each of those records
+//! would fit one slot: `Config::validate` refuses a `send_copy_slot_size`
+//! smaller than one worst-case record for the configured fragment size.
+//! Application data does not
 //! come through that scratch: `WriteTraffic::encrypt` writes into the slot
 //! directly. With the ring or aws-lc-rs provider, on TLS 1.3 that is one copy
 //! of the plaintext, against two on the buffered engine; TLS 1.2 costs two on

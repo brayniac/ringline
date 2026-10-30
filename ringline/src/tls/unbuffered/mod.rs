@@ -459,9 +459,10 @@ fn drive_inner<C: UnbufferedEngine>(
                 }
             }
             Ok(ConnectionState::EncodeTlsData(mut enc)) => {
-                // `encode` is all-or-nothing and needs one contiguous buffer,
-                // which can exceed a send-pool slot — hence the scratch `Vec`.
-                // Handshake-only; the data path never comes through here.
+                // `encode` is all-or-nothing on one contiguous buffer. The
+                // record goes into `out`, which io_uring copies into pool
+                // slots and mio queues as it is. Handshake-only; the data path
+                // never comes through here.
                 let start = out.len();
                 let mut room = out.capacity().saturating_sub(start).max(1024);
                 loop {
@@ -898,37 +899,47 @@ fn encrypt_with<C: UnbufferedEngine>(
     (result, peer_closed)
 }
 
+/// Room [`encrypt_to_vec`] leaves in each destination beyond the ciphertext of
+/// the plaintext it hands rustls, for records rustls has queued and writes in
+/// front of that plaintext: a TLS 1.3 `key_update` record is 27 bytes and an
+/// alert record 24. If more is queued, `encrypt_chunk` takes less plaintext and
+/// the loop makes another call.
+pub(crate) const QUEUED_RECORD_ROOM: usize = 64;
+
 /// Encrypt all of `plaintext`, appending ciphertext to `out`. The mio backend
 /// and the unit tests use this; io_uring drives [`encrypt_chunk`] directly
-/// against a pool slot instead (`super::backend_uring::encrypt_to_sends`) —
-/// which is the whole point of the engine, so an io_uring lib build has no
-/// non-test caller for this and the allow is scoped to exactly that.
+/// against a pool slot instead (`super::backend_uring::encrypt_to_sends`), so
+/// an io_uring lib build has no non-test caller for this and the allow is
+/// scoped to exactly that.
+///
+/// `out` is reserved once, for the ciphertext of `plaintext` in records of the
+/// connection's size plus twice [`QUEUED_RECORD_ROOM`]. Each call's destination
+/// is the ciphertext of the remaining plaintext plus [`QUEUED_RECORD_ROOM`], so
+/// the zero-fill covers about one pass over the ciphertext. When the remaining
+/// plaintext ends in a partial record, `encrypt_chunk` takes the whole records
+/// first and the partial record on a second call; the reservation covers both
+/// calls and up to [`QUEUED_RECORD_ROOM`] of queued records, so `out` does not
+/// grow part-way through the send.
 #[cfg_attr(has_io_uring, allow(dead_code))]
 pub(crate) fn encrypt_to_vec(
     tls_conn: &mut TlsConn,
     plaintext: &[u8],
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // One record's worth of destination per call: large enough that the
-    // fragmenter amortizes its per-call setup, small enough that a failed
-    // shrink is cheap. Chunk size is an internal knob by design — see
-    // docs/tls-unbuffered-design.md, open question 1.
-    const DST: usize = 32 * 1024;
+    let fragment_len = tls_conn.max_plaintext_per_record.max(1);
+    let record_overhead = crate::tls::negotiated_record_overhead(&tls_conn.conn);
+    let ciphertext_len = |len: usize| len + len.div_ceil(fragment_len) * record_overhead;
+    out.reserve(ciphertext_len(plaintext.len()) + 2 * QUEUED_RECORD_ROOM);
     let mut offset = 0;
     while offset < plaintext.len() {
+        let rest = plaintext.len() - offset;
+        let dst_len = (ciphertext_len(rest) + QUEUED_RECORD_ROOM).max(MIN_ENCRYPT_DST);
         let start = out.len();
-        // The zero-fill is redundant work: rustls writes the whole `used_ct`
-        // prefix before anything reads it, and the tail is truncated away. It
-        // costs roughly one extra pass over the payload, on a path whose point
-        // is removing a pass over the payload — but this function backs the
-        // mio path and the tests only. io_uring encrypts into pool slots and
-        // never comes through here, so the backend this effort targets does
-        // not pay it. Removing it means `reserve` + `set_len` and an
-        // accompanying safety argument; that trade is not worth taking on an
-        // unmeasured cost on the non-target backend. The chunk-size sweep in
-        // `docs/tls-unbuffered-design.md`'s open questions is what would
-        // measure it.
-        out.resize(start + DST, 0);
+        // rustls writes the whole `used_ct` prefix before anything reads it,
+        // and the tail is truncated away, so the zero-fill is not needed for
+        // correctness. Removing it means `reserve` + `set_len` and a safety
+        // argument, for a cost of one pass on the mio backend only.
+        out.resize(start + dst_len, 0);
         // Every exit below trims `out` back: on failure the caller must not be
         // handed the zeroed scratch this resize appended.
         let (used_pt, used_ct) =
