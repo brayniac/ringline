@@ -67,7 +67,7 @@ thiserror = "2"
 # requirement. When the fork releases a later version on this requirement's
 # minor version, its release workflow opens a pull request into main raising
 # the requirement to it (admin/ringline-raise in ringline-rs/quinn), and
-# rewrites the comment line directly above the requirement. A move to a new
+# rewrites the sentence directly above the requirement. A move to a new
 # minor version, or a raise on a maintenance branch, is done by hand.
 # Downstream resolvers respect this minimum even though the lockfile may
 # resolve higher.
@@ -92,7 +92,7 @@ ringline-quic-proto = { version = "0.1.0", default-features = false, features = 
 # requirement. When the fork releases a later version on this requirement's
 # minor version, its release workflow opens a pull request into main raising
 # the requirement to it (admin/ringline-raise in ringline-rs/rustls), and
-# rewrites the comment line directly above the requirement. A move to a new
+# rewrites the sentence directly above the requirement. A move to a new
 # minor version, or a raise on a maintenance branch, is done by hand.
 # 0.1.1 is based on rustls 0.23.46.
 ringline-tls = { version = "0.1.1", default-features = false }

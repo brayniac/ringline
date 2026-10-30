@@ -750,6 +750,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio, unbuffered TLS engine (the default): a send reserves its buffer once,
+  for its ciphertext plus 128 bytes. Each record used to be encrypted into a
+  32 KiB destination, so a send over about 32 KiB grew the buffer part-way,
+  which can copy the ciphertext already written, and peaked at about twice
+  the ciphertext.
 - io_uring: `send_chain` and `send_chain_nowait` did not check the
   handle's generation when the handle's slot held a plaintext connection. A
   stale handle (its connection closed, with or without TLS, and the slot

@@ -19,10 +19,10 @@
 //! `unbuffered::drive` writes each record rustls hands out as `EncodeTlsData`
 //! into one output buffer, on both backends, and [`ciphertext_to_sends`]
 //! copies that buffer into slots, all of it or none. Each of those records
-//! would fit one slot: `Config::validate` refuses a `send_copy_slot_size`
-//! smaller than one worst-case record for the configured fragment size.
-//! Application data does not
-//! come through that scratch: `WriteTraffic::encrypt` writes into the slot
+//! would fit one slot: with the unbuffered engine (the default),
+//! `Config::validate` refuses a `send_copy_slot_size` smaller than one
+//! worst-case record for the configured fragment size. Application data does
+//! not come through that scratch: `WriteTraffic::encrypt` writes into the slot
 //! directly. With the ring or aws-lc-rs provider, on TLS 1.3 that is one copy
 //! of the plaintext, against two on the buffered engine; TLS 1.2 costs two on
 //! both (see the `unbuffered` module docs).

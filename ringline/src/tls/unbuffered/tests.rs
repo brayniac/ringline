@@ -733,6 +733,16 @@ fn encrypt_to_vec_carries_a_queued_key_update() {
         .collect();
     let mut out = Vec::new();
     super::encrypt_to_vec(&mut server, &plaintext, &mut out).expect("encrypt");
+    // A TLS 1.3 key_update record: 5-byte header, 4-byte handshake header, 1
+    // byte of request, content type and tag.
+    const KEY_UPDATE_RECORD: usize = 5 + 4 + 1 + 1 + 16;
+    assert_eq!(
+        out.len(),
+        plaintext.len()
+            + 4 * (DEFAULT_RECORD_WIRE_LEN - DEFAULT_MAX_PLAINTEXT_PER_RECORD)
+            + KEY_UPDATE_RECORD,
+        "the key_update reply rides in front of the four data records"
+    );
     assert!(
         out.capacity() <= out.len() + 2 * super::QUEUED_RECORD_ROOM,
         "capacity {} for {} bytes of ciphertext",

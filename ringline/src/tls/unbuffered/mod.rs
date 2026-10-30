@@ -916,10 +916,11 @@ pub(crate) const QUEUED_RECORD_ROOM: usize = 64;
 /// connection's size plus twice [`QUEUED_RECORD_ROOM`]. Each call's destination
 /// is the ciphertext of the remaining plaintext plus [`QUEUED_RECORD_ROOM`], so
 /// the zero-fill covers about one pass over the ciphertext. When the remaining
-/// plaintext ends in a partial record, `encrypt_chunk` takes the whole records
-/// first and the partial record on a second call; the reservation covers both
-/// calls and up to [`QUEUED_RECORD_ROOM`] of queued records, so `out` does not
-/// grow part-way through the send.
+/// plaintext ends in a partial record more than [`QUEUED_RECORD_ROOM`] short
+/// of a full one, `encrypt_chunk` takes the whole records first and the
+/// partial record on a second call; the reservation covers both calls and up
+/// to [`QUEUED_RECORD_ROOM`] of queued records, so `out` does not grow
+/// part-way through the send.
 #[cfg_attr(has_io_uring, allow(dead_code))]
 pub(crate) fn encrypt_to_vec(
     tls_conn: &mut TlsConn,
@@ -933,12 +934,12 @@ pub(crate) fn encrypt_to_vec(
     let mut offset = 0;
     while offset < plaintext.len() {
         let rest = plaintext.len() - offset;
-        let dst_len = (ciphertext_len(rest) + QUEUED_RECORD_ROOM).max(MIN_ENCRYPT_DST);
+        let dst_len = ciphertext_len(rest) + QUEUED_RECORD_ROOM;
         let start = out.len();
         // rustls writes the whole `used_ct` prefix before anything reads it,
         // and the tail is truncated away, so the zero-fill is not needed for
-        // correctness. Removing it means `reserve` + `set_len` and a safety
-        // argument, for a cost of one pass on the mio backend only.
+        // correctness. It costs one pass over the ciphertext, on mio only;
+        // removing it needs `reserve` + `set_len` and a safety argument.
         out.resize(start + dst_len, 0);
         // Every exit below trims `out` back: on failure the caller must not be
         // handed the zeroed scratch this resize appended.
