@@ -5,8 +5,9 @@
 # server records /proc/stat deltas and a system-wide perf profile (no call
 # graphs); after it, an 8 s DWARF call-graph profile of the server process.
 # Reports are generated after the last arm. perf comes from
-# perf-bundle-build.toml's perf.tgz; libc6-dbg is installed if the guest
-# reaches the Debian mirror, so libc's memmove variants resolve by name.
+# perf-bundle-build.toml's perf.tgz. The guest's apt sources have no
+# libc6-dbg, so libc's internal memmove variants appear as addresses; their
+# callers in resp-server identify them.
 # Question: how much server CPU do the two copies left on the TLS 1.3 path
 # cost (send: plaintext into the pool slot inside encrypt_into; receive:
 # decrypted plaintext into the accumulator)? An out-of-place AEAD on aws-lc-rs
@@ -79,7 +80,6 @@ if ! command -v perf >/dev/null && [ -x out/perf/perf ]; then
   sudo chmod +x /usr/local/bin/perf
 fi
 command -v perf >/dev/null && echo "perf: $(perf --version)" || echo "perf: unavailable"
-timeout 180 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libc6-dbg >/dev/null 2>&1 && echo "libc6-dbg: installed" || echo "libc6-dbg: unavailable"
 mkdir -p prof
 nproc; uname -r
 ( cd out && sha256sum resp-server )
