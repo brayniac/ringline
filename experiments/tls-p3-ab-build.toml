@@ -1,0 +1,63 @@
+# Build resp-server twice for the patch 3 send A/B (experiments/tls-p3-ab.toml):
+# out/resp-server against ringline-tls as locked (0.1.1, the published release),
+# and out/resp-server-p3 against the ringline-rs/rustls commit {patch_rev}
+# (exp/patch3-send: aws-lc-rs seals single-slice TLS 1.3 records out of place),
+# through a [patch.crates-io] entry. Both use the locked aws-lc-rs. build.log
+# records `cargo tree -i ringline-tls` and `-i aws-lc-rs` for both, so the run
+# can confirm which source each binary used. The client is the C8 cachecannon,
+# passed to the run spec separately.
+name = "tls p3 ab build ({ref}, rustls {patch_rev})"
+
+[params]
+repo        = "https://github.com/brayniac/ringline"
+ref         = "exp/tls-provider-ab"
+rustls_repo = "https://github.com/ringline-rs/rustls"
+patch_rev   = "d9555fa58574cd6558f72a005c548e9a179f9e82"
+image       = "debian-13-ci"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  echo "kernel: $(uname -r)"
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref}
+  echo "ringline: $(git -C src log --oneline -1)"
+  rustc --version
+  cd src
+  cp Cargo.toml Cargo.toml.orig
+  cp Cargo.lock Cargo.lock.orig
+  cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  echo "== base"; cargo tree -i ringline-tls -e normal --target all | head -3; cargo tree -i aws-lc-rs -e normal --target all | head -2
+  cp target/release/resp-server ../out/resp-server
+  cp Cargo.toml.orig Cargo.toml
+  cp Cargo.lock.orig Cargo.lock
+  printf '\n[patch.crates-io]\nringline-tls = { git = "%s", rev = "%s" }\n' '{rustls_repo}' '{patch_rev}' >> Cargo.toml
+  cargo update -p ringline-tls || exit 1
+  cargo build --release -p ringline-bench --bin resp-server || exit 1
+  echo "== p3"; cargo tree -i ringline-tls -e normal --target all | head -3; cargo tree -i aws-lc-rs -e normal --target all | head -2
+  cp target/release/resp-server ../out/resp-server-p3
+  cd ..
+  ( cd out && sha256sum * )
+  tar czf bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''
