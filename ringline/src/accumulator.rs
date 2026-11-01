@@ -62,6 +62,10 @@ pub struct RecvAccumulator {
     /// (`note_consumed`), until `reset` or `release`. Sizes direct receives
     /// (`detach_for_recv`).
     largest_message: usize,
+    /// The largest `buf.capacity()` after an `append`, until `reset` or
+    /// `release`. `compact_at_message_start` restores this capacity ahead of
+    /// a message that has just started.
+    grown: usize,
     /// The last frozen view of a direct connection's buffer that a parser
     /// consumed whole (`keep_spent`). `detach_for_recv` takes the allocation
     /// back from it when no slice of it is alive, instead of allocating a
@@ -98,6 +102,7 @@ impl RecvAccumulator {
             max_size,
             reserve_target: 0,
             largest_message: 0,
+            grown: 0,
             #[cfg(has_io_uring)]
             spent: None,
             #[cfg(has_io_uring)]
@@ -130,7 +135,30 @@ impl RecvAccumulator {
         }
         self.buf.extend_from_slice(data);
         note_copied(data.len() + moved(&self.buf, before, kept));
+        self.grown = self.grown.max(self.buf.capacity());
         true
+    }
+
+    /// Called when a parser stops at an incomplete message. When less than
+    /// half the capacity in `grown` remains from the start of the contents
+    /// and at most a quarter of it is filled, the contents move to the front
+    /// of the allocation, if it is not shared. The message that has just
+    /// started then has that capacity ahead of it. Without the move, a
+    /// message that starts near the end of the allocation reaches the end
+    /// with most of its bytes received, and `append` moves all of them to
+    /// make room. Does nothing while a frozen remainder is held.
+    pub fn compact_at_message_start(&mut self) {
+        if self.frozen.is_some() {
+            return;
+        }
+        let live = self.buf.len();
+        if self.buf.capacity() >= self.grown / 2 || live > self.grown / 4 {
+            return;
+        }
+        let before = self.buf.as_ptr();
+        if self.buf.try_reclaim(self.grown - live) {
+            note_copied(moved(&self.buf, before, live));
+        }
     }
 
     /// Total buffered bytes: held frozen remainder + mutable tail.
@@ -277,6 +305,7 @@ impl RecvAccumulator {
         self.buf.clear();
         self.reserve_target = 0;
         self.largest_message = 0;
+        self.grown = 0;
         #[cfg(has_io_uring)]
         {
             self.spent = None;
@@ -297,6 +326,7 @@ impl RecvAccumulator {
         self.buf = BytesMut::with_capacity(self.initial_capacity);
         self.reserve_target = 0;
         self.largest_message = 0;
+        self.grown = 0;
         #[cfg(has_io_uring)]
         {
             self.spent = None;
@@ -493,6 +523,11 @@ impl AccumulatorTable {
     /// (clamped to the accumulator's `max_size`).
     pub fn reserve(&mut self, index: u32, additional: usize) {
         self.accumulators[index as usize].reserve(additional);
+    }
+
+    /// See [`RecvAccumulator::compact_at_message_start`].
+    pub fn compact_at_message_start(&mut self, index: u32) {
+        self.accumulators[index as usize].compact_at_message_start();
     }
 
     /// Reset the accumulator at the given index.
@@ -1483,5 +1518,112 @@ mod tests {
         assert!(table.append(0, b"existing"));
         table.prepend(0, b"");
         assert_eq!(table.data(0), b"existing");
+    }
+
+    /// Pipelined RESP commands, four GETs then one SET of `vlen` value
+    /// bytes, repeated `sets` times. Returns the stream and each command's
+    /// length.
+    fn resp_stream(vlen: usize, sets: usize) -> (Vec<u8>, Vec<usize>) {
+        let get = b"*2\r\n$3\r\nGET\r\n$16\r\nkkkkkkkkkkkkkkkk\r\n";
+        let set = format!("*3\r\n$3\r\nSET\r\n$16\r\nkkkkkkkkkkkkkkkk\r\n${vlen}\r\n");
+        let mut stream = Vec::new();
+        let mut lens = Vec::new();
+        for _ in 0..sets {
+            for _ in 0..4 {
+                stream.extend_from_slice(get);
+                lens.push(get.len());
+            }
+            stream.extend_from_slice(set.as_bytes());
+            stream.resize(stream.len() + vlen, b'v');
+            stream.extend_from_slice(b"\r\n");
+            lens.push(set.len() + vlen + 2);
+        }
+        (stream, lens)
+    }
+
+    /// Bytes moved per SET value byte when `stream` arrives in 16 KiB
+    /// appends, the plaintext of a full TLS record, and a parser consumes
+    /// each whole command and stops at an incomplete one, as `with_data`
+    /// does.
+    fn moved_per_value_byte(vlen: usize, compact: bool) -> f64 {
+        let sets = 50;
+        let (stream, lens) = resp_stream(vlen, sets);
+        let mut acc = RecvAccumulator::new_with_max(4096, usize::MAX);
+        let start = test_bytes_copied();
+        let mut next = 0;
+        for chunk in stream.chunks(16384) {
+            assert!(acc.append(chunk));
+            while next < lens.len() && acc.len() >= lens[next] {
+                acc.consume(lens[next]);
+                next += 1;
+            }
+            if compact {
+                acc.compact_at_message_start();
+            }
+        }
+        assert_eq!(next, lens.len());
+        let moved = test_bytes_copied() - start - stream.len() as u64;
+        moved as f64 / (sets * vlen) as f64
+    }
+
+    /// A SET larger than a record arrives over several appends. Without the
+    /// move at its start, the buffer runs out near the end of most SETs
+    /// and `append` moves nearly the whole command: 0.93 bytes moved per
+    /// value byte at 64 KiB and 0.98 at 1 MiB in this test.
+    #[test]
+    fn compact_at_message_start_moves_few_bytes() {
+        for (vlen, max) in [(65536, 0.2), (256 * 1024, 0.05), (1 << 20, 0.02)] {
+            let moved = moved_per_value_byte(vlen, true);
+            assert!(
+                moved <= max,
+                "{vlen}-byte SETs: {moved:.3} bytes moved per value byte, above {max}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_at_message_start_keeps_the_contents() {
+        let mut acc = RecvAccumulator::new_with_max(64, usize::MAX);
+        let data: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        assert!(acc.append(&data));
+        let grown = acc.capacity();
+        acc.consume(4000);
+        acc.compact_at_message_start();
+        assert_eq!(acc.data(), &data[4000..]);
+        assert_eq!(
+            acc.capacity(),
+            grown,
+            "the grown capacity is available again"
+        );
+    }
+
+    #[test]
+    fn compact_at_message_start_leaves_a_full_or_roomy_buffer() {
+        let mut acc = RecvAccumulator::new_with_max(64, usize::MAX);
+        assert!(acc.append(&[1u8; 4096]));
+        let grown = acc.capacity();
+        // More than a quarter of the grown capacity is live.
+        acc.consume(4096 - grown / 4 - 1);
+        let ptr = acc.buf.as_ptr();
+        acc.compact_at_message_start();
+        assert_eq!(acc.buf.as_ptr(), ptr);
+        // Half the grown capacity or more remains ahead.
+        let mut acc = RecvAccumulator::new_with_max(64, usize::MAX);
+        assert!(acc.append(&[1u8; 4096]));
+        acc.consume(16);
+        let ptr = acc.buf.as_ptr();
+        acc.compact_at_message_start();
+        assert_eq!(acc.buf.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn compact_at_message_start_leaves_a_frozen_remainder() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.append(0, &[1u8; 4096]));
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen.slice(4000..));
+        drop(frozen);
+        table.compact_at_message_start(0);
+        assert_eq!(table.data(0), &[1u8; 96][..]);
     }
 }

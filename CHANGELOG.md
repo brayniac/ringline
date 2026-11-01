@@ -223,6 +223,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- When a `with_data` parser stops at an incomplete message, an accumulator
+  that grows through `append`, as every TLS connection's does, moves its
+  contents to the front of its allocation if few bytes are buffered and
+  little room is left. Before, a message that started near the end of the
+  allocation was moved once most of it had arrived: for pipelined commands
+  larger than a TLS record, about one extra copy of every byte (0.93 bytes
+  moved per value byte at 64 KiB in `compact_at_message_start_moves_few_bytes`,
+  under 0.2 after).
 - ringline requires `ringline-tls` 0.1.1. On the unbuffered engine (the
   default), with the ring or aws-lc-rs provider, a TLS 1.3 send through
   `send`, `send_nowait` or `send_backpressured` costs 1 copy instead of 2:
