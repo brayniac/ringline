@@ -19,7 +19,17 @@
 # the AEAD; no cut beyond the floor at 1 MiB means it all does, and patch 3's
 # send half buys nothing. p3 against ring decides the provider question: at 64 B
 # I expect p3 to stay about 4% behind ring, as awslc was.
-name = "tls p3 ab v{vlen} d{depth} c{conns} rep{rep}"
+# Fixed-rate mode: {rate} above 0 sets cachecannon's workload.rate_limit, so
+# every arm serves the same request rate. Closed loop (rate 0), p3 raised
+# throughput 3-4% at 64 KiB and 1 MiB while system and softirq CPU per op rose
+# 3-7%, leaving user+system+softirq per op flat. Prediction for p3 against
+# awslc at a rate both sustain: if the kernel rise came from the higher
+# throughput, system and softirq per op match within the floor and total CPU
+# per op falls about 4% at 1 MiB and 3% at 64 KiB. If system and softirq per op
+# still rise by more than the floor, patch 3 moves cost into the kernel. A
+# client that cannot hold the rate (throughput below rate by more than 1%)
+# voids the arm. Statistic: user+system+softirq per op.
+name = "tls p3 ab v{vlen} d{depth} c{conns} r{rate} rep{rep}"
 
 [params]
 bins_artifact  = "01a1922e-046a-7319-2b65-c825c1d7473c"
@@ -33,6 +43,7 @@ depth          = "16"
 conns          = "2048"
 keys           = "20000"
 client_threads = "16"
+rate           = "0"
 
 [[jobs]]
 name = "server"
@@ -160,6 +171,7 @@ sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.
 ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
 ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
 echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+rl=""; [ "{rate}" != "0" ] && rl="rate_limit = {rate}"
 for arm in plain ring awslc p3; do
   tls=true; [ $arm = plain ] && tls=false
   cat > cell-$arm.toml <<CFG
@@ -180,6 +192,7 @@ connect_timeout = "10s"
 request_timeout = "60s"
 [workload]
 backfill_on_miss = true
+$rl
 [workload.keyspace]
 length = 16
 count = {keys}
