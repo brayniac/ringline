@@ -1,0 +1,56 @@
+# Build resp-server twice for the receive-buffer compaction A/B
+# (experiments/tls-acc-ab.toml): out/resp-server at {base_ref}, and
+# out/resp-server-fix at {fix_ref}, which adds one commit to {base_ref}
+# (RecvAccumulator::compact_at_message_start, called when with_data's parser
+# stops at an incomplete message). Both use ringline-tls as locked. build.log
+# records each ref's head and the diff between them. The client is the C8
+# cachecannon, passed to the run spec separately.
+name = "tls acc ab build ({base_ref} vs {fix_ref})"
+
+[params]
+repo        = "https://github.com/brayniac/ringline"
+base_ref    = "exp/tls-provider-ab"
+fix_ref     = "exp/acc-compact-ab"
+image       = "debian-13-ci"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  echo "kernel: $(uname -r)"
+  mkdir -p out
+  git clone -q {repo} src && cd src
+  git checkout -q {base_ref} || exit 1
+  echo "base: $(git log --oneline -1)"
+  rustc --version
+  cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  cp target/release/resp-server ../out/resp-server
+  git checkout -q {fix_ref} || exit 1
+  echo "fix: $(git log --oneline -1)"
+  echo "== diff base..fix"; git diff --stat {base_ref} HEAD
+  cargo build --release --locked -p ringline-bench --bin resp-server || exit 1
+  cp target/release/resp-server ../out/resp-server-fix
+  cd ..
+  ( cd out && sha256sum * )
+  tar czf bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''

@@ -1,0 +1,207 @@
+# Receive-buffer compaction A/B: server CPU per operation with resp-server
+# built at the base (arm base) and with RecvAccumulator::compact_at_message_start
+# added (arm fix), both TLS 1.3 on the ring provider and ringline-tls 0.1.1.
+# Binaries from tls-acc-ab-build.toml. The server parses every SET in place
+# (stream_sets 0), so a SET waits in the accumulator until all of it has
+# arrived. Arms run in sequence on one VM pair in the order of {arms}; the
+# spread of one arm's repeats is the noise floor. {rate} above 0 sets
+# cachecannon's workload.rate_limit so both arms serve the same request rate.
+# Per-op CPU = core-seconds in the 20 s window / 20 s / the client's rate.
+# Prediction, written before running. In the closed-loop aws-lc-rs profile at
+# 64 KiB, BytesMut::reserve_inner under AccumulatorTable::append was 2.3% of
+# all server samples (roughly 4-5% of user CPU); at 1 MiB it was 0.15%. A unit
+# test of the change moves 0.93 bytes per SET value byte before and under 0.2
+# after. I expect fix to cut user CPU per op against base by 2-5% at 64 KiB
+# and total (user+system+softirq) by 1-2.5%, and to change neither beyond the
+# noise floor at 1 MiB (the control). No cut beyond the floor at 64 KiB means
+# the move is not where the profile put the cost, or the runtime does not
+# reach compact_at_message_start the way the unit test does.
+name = "tls acc ab v{vlen} d{depth} c{conns} r{rate} rep{rep}"
+
+[params]
+bins_artifact  = "SET-ME"
+client_bins    = "01a159f3-e054-73af-bc3f-8b6ea08f60b1"
+image          = "debian-13-ci"
+rep            = "1"
+port           = "6379"
+arms           = "base fix fix base base fix fix base"
+vlen           = "4096"
+depth          = "16"
+conns          = "2048"
+keys           = "20000"
+client_threads = "16"
+rate           = "0"
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "auto:1"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "barrier"
+name = "vms-up"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/profile.tgz"]
+payload_timeout = 3600
+inputs = [
+  { artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" },
+]
+payload = '''
+set -uo pipefail
+# anvil's auto: data address is a /24 derived from the experiment id; the
+# server is .1 and the client .2 in it.
+NET=$(sed -n 's/.*"data_address": "\([0-9.]*\)\.[0-9]*\/24".*/\1/p' /etc/anvil-instance.json)
+: "${NET:?no /24 data_address}"
+SERVER="$NET.1"
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/resp-server out/resp-server-fix
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728 >/dev/null
+# The guest's hard nofile limit is below 1048576, so `ulimit -n` alone
+# leaves the soft limit at 1024.
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "server-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+mkdir -p prof
+nproc; uname -r
+( cd out && sha256sum resp-server resp-server-fix )
+conns() { ss -Htn state established "( sport = :{port} )" | wc -l; }
+i=0
+for arm in {arms}; do
+  i=$((i+1))
+  case $arm in
+    base) bin=resp-server;     args="--runtime ringline --send-slot 16448 --tls --tls-provider ring" ;;
+    fix)  bin=resp-server-fix; args="--runtime ringline --send-slot 16448 --tls --tls-provider ring" ;;
+    *) echo "BAD ARM $arm"; exit 1 ;;
+  esac
+  ./out/$bin $args --addr $SERVER:{port} --workers 8 > prof/$i-$arm.server.log 2>&1 &
+  pid=$!
+  for j in $(seq 1 600); do [ "$(conns)" -ge {conns} ] && break; sleep 0.5; done
+  # past the client's 10 s warmup
+  sleep 15
+  cat /proc/stat > prof/$i-$arm.stat0
+  sleep 20
+  cat /proc/stat > prof/$i-$arm.stat1
+  echo "== $i $arm conns=$(conns)"
+  for j in $(seq 1 600); do [ "$(conns)" -eq 0 ] && break; sleep 0.5; done
+  kill $pid; wait $pid 2>/dev/null
+  sleep 2
+done
+python3 - <<'PY'
+import os
+hz=os.sysconf("SC_CLK_TCK"); W=20.0
+for i,arm in enumerate("{arms}".split(), 1):
+    def stat(f):
+        for l in open(f"prof/{i}-{arm}.{f}"):
+            if l.startswith("cpu "): return list(map(int,l.split()[1:9]))
+    a,b=stat("stat0"),stat("stat1")
+    names=["user","nice","system","idle","iowait","irq","softirq","steal"]
+    d={n:(y-x)/hz/W for n,x,y in zip(names,a,b)}
+    busy=d["user"]+d["system"]+d["softirq"]
+    print(f"== {i} {arm}: busy={busy:.3f} cores " + " ".join(f"{n}={d[n]:.2f}" for n in names if n!="idle"))
+PY
+sudo chown -R anvil prof
+tar czf /home/anvil/profile.tgz prof
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "auto:2"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "barrier"
+name = "vms-up"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 3600
+inputs = [{ artifact = "{client_bins}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+# anvil's auto: data address is a /24 derived from the experiment id; the
+# server is .1 and the client .2 in it.
+NET=$(sed -n 's/.*"data_address": "\([0-9.]*\)\.[0-9]*\/24".*/\1/p' /etc/anvil-instance.json)
+: "${NET:?no /24 data_address}"
+SERVER="$NET.1"
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535" >/dev/null
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+rl=""; [ "{rate}" != "0" ] && rl="rate_limit = {rate}"
+for arm in base fix; do
+  tls=true
+  cat > cell-$arm.toml <<CFG
+[general]
+duration = "50s"
+warmup = "10s"
+threads = {client_threads}
+[target]
+endpoints = ["$SERVER:{port}"]
+protocol = "resp"
+tls = $tls
+tls_verify = false
+tls_hostname = "localhost"
+[connection]
+connections = {conns}
+pipeline_depth = {depth}
+connect_timeout = "10s"
+request_timeout = "60s"
+[workload]
+backfill_on_miss = true
+$rl
+[workload.keyspace]
+length = 16
+count = {keys}
+distribution = "uniform"
+[workload.commands]
+get = 80
+set = 20
+[workload.values]
+length = {vlen}
+[admin]
+format = "json"
+CFG
+done
+i=0
+for arm in {arms}; do
+  i=$((i+1))
+  for j in $(seq 1 300); do (exec 3<>/dev/tcp/$SERVER/{port}) 2>/dev/null && { exec 3>&-; break; }; sleep 1; done
+  ./out/cachecannon-a cell-$arm.toml > $i-$arm.json 2> $i-$arm.log
+  echo "== $i $arm"; grep '"type":"result"' $i-$arm.json || { echo "NO RESULT"; tail -20 $i-$arm.log; }
+  sleep 8
+done
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
