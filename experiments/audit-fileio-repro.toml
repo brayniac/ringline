@@ -1,0 +1,71 @@
+# Reproduction run for the 2026-11 file I/O audit, on the io_uring backend.
+# `ringline/tests/audit_fileio_repro.rs` asserts the behaviour the audit says
+# should hold; each failure is a finding reproduced. Not a red-then-green
+# run: nothing is fixed on this branch.
+#
+# Prediction: three tests fail on io_uring.
+# - a_write_issued_before_close_in_the_same_poll_lands: `fs_close` runs a
+#   synchronous FILES_UPDATE(-1) before the loop flushes the write's SQE, so
+#   the write completes with `-EBADF` (on mio it passes: the fd closes after
+#   queued operations).
+# - stat_of_a_symlink_reports_is_symlink: statx without AT_SYMLINK_NOFOLLOW
+#   follows the link, so `is_symlink` is false (fails on mio too).
+# - a_nul_path_does_not_leak_a_direct_io_slot: the slot is allocated before
+#   the path is converted and not released on the error (fails on mio too).
+# A pass of the first test would mean the kernel resolved the fixed file
+# before the unregister, which would refute that finding's kernel-side half.
+#
+#   systemslab submit experiments/audit-fileio-repro.toml
+name = "ringline file I/O audit repro ({branch})"
+
+[params]
+branch = "audit-fileio-repro"
+repo   = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "repro"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/repro.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; cargo --version
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+  ulimit -Sn 65536
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  got=$(./target/debug/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
+  echo "gate_backend=0 (backend=$got)"
+  df -T /tmp | tail -1
+  cargo test --locked -p ringline --test audit_fileio_repro -- --test-threads=1 --nocapture > /home/anvil/tests.out 2>&1
+  echo "repro_rc=$?"
+  grep -E '^test |close=|is_symlink=|nul open|panicked|^test result' /home/anvil/tests.out
+  echo "repro_summary=$(grep -E '^test result' /home/anvil/tests.out | head -1)"
+} 2>&1 | tee /home/anvil/repro.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+fail=0
+grep -q "^gate_backend=0" repro.log || { echo "FAIL gate_backend"; fail=1; }
+grep -oE "^repro_summary=.*" repro.log
+for t in a_write_issued_before_close_in_the_same_poll_lands stat_of_a_symlink_reports_is_symlink a_nul_path_does_not_leak_a_direct_io_slot; do
+  if grep -qE "^test $t \.\.\. FAILED" repro.log; then echo "reproduced $t"; else echo "NOT reproduced $t"; fail=1; fi
+done
+exit $fail
+'''
