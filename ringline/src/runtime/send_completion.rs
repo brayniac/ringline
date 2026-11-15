@@ -1081,8 +1081,7 @@ impl SendCompletions {
             if older == id {
                 break;
             }
-            if let Some((required_slots, _)) =
-                self.could_pass(older, head, head_needs, left, idle, false)
+            if let Some((required_slots, _)) = self.could_pass(older, head, head_needs, left, idle)
             {
                 left.free -= required_slots;
                 left.passing += required_slots;
@@ -1093,18 +1092,19 @@ impl SendCompletions {
 
     /// If `id` is a waiter with an owner that could pass `head` with
     /// `left`, its `required_slots` and owner. The test the scan applies to
-    /// each waiter it might wake (`from_scan`), and that an admission applies
-    /// to the waiters older than itself. A waiter with no owner
-    /// ([`NO_OWNER`]) is left out: no task would poll it, and its holder's
-    /// first poll checks it.
+    /// each waiter it might wake, and that an admission applies to the
+    /// waiters older than itself. A waiter with no owner ([`NO_OWNER`]) is
+    /// left out: no task would poll it, and its holder's first poll checks
+    /// it.
     ///
-    /// A waiter a scan woke that has not polled since is left out of the
-    /// scan, which would only wake the same task again; its task was woken,
-    /// and polls it whenever it next awaits it. An admission still counts it
-    /// while it was woken by the latest scan, which gives it the iteration
-    /// that wake is polled in, and not after: a waiter its task does not poll
-    /// would otherwise hold its room for as long as the task does not poll
-    /// it, and every newer waiter behind it.
+    /// So is a waiter a scan before the latest one woke that has not polled
+    /// since. An admission still counts one the latest scan woke, which
+    /// gives it the iteration that wake is polled in, and not after: a waiter
+    /// its task does not poll would otherwise hold its room, and every newer
+    /// waiter behind it, for as long as the task does not poll it. A scan
+    /// raises `scan_epoch` before it walks, so it leaves out every waiter an
+    /// earlier scan woke, rather than wake the same task again; that task was
+    /// woken, and polls it whenever it next awaits it.
     fn could_pass(
         &self,
         id: SendId,
@@ -1112,7 +1112,6 @@ impl SendCompletions {
         head_needs: usize,
         left: PoolView,
         idle: &impl Fn(u32) -> bool,
-        from_scan: bool,
     ) -> Option<(usize, u32)> {
         let Some(Entry {
             conn_index,
@@ -1128,11 +1127,7 @@ impl SendCompletions {
         else {
             return None;
         };
-        let woken_earlier = if from_scan {
-            *woken_in != 0
-        } else {
-            *woken_in != 0 && *woken_in != self.scan_epoch
-        };
+        let woken_earlier = *woken_in != 0 && *woken_in != self.scan_epoch;
         let passes = *task_id != NO_OWNER
             && !woken_earlier
             && self.may_pass(head, head_needs, *conn_index, *required_slots, *seq, left)
@@ -1350,7 +1345,7 @@ impl SendCompletions {
         for position in 1..self.waiting.len() {
             let id = self.waiting[position];
             if let Some((required_slots, task_id)) =
-                self.could_pass(id, head, head_needs, left, &idle, true)
+                self.could_pass(id, head, head_needs, left, &idle)
             {
                 wakes.push(task_id);
                 left.free -= required_slots;
@@ -3379,5 +3374,22 @@ mod tests {
             }
         }
         assert!(admitted, "the newer waiter passed");
+    }
+
+    /// A scan that wakes passers asks for the next: here both waiters parked
+    /// before the slot came back, so nothing else would ask, and only the
+    /// next scan finds the older one's claim gone and wakes the newer one.
+    #[test]
+    fn a_scan_that_woke_passers_asks_for_the_next() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::FirstFit);
+        q.enqueue(1, 0, 6, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(q.admit(older, pool(0, 0, 8), true, idle), Admit::Wait);
+        assert_eq!(q.admit(newer, pool(0, 0, 8), true, idle), Admit::Wait);
+        assert!(!q.scan_due(), "first polls ask for nothing");
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
+        assert!(q.scan_due(), "the next scan is due");
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(3)]);
     }
 }
