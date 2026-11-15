@@ -112,6 +112,18 @@ pub(crate) struct ConnSendState {
     /// io_uring only.
     #[cfg(has_io_uring)]
     pub disconnect: Disconnect,
+    /// The connection's most recent send waited for room in the socket, so
+    /// `SendAdmissionOrder::BoundedIdle` and `BudgetIdle` let no send on it
+    /// pass a waiting head. Set when a send waits (io_uring's `wait_for_room`, a mio write
+    /// that returns `WouldBlock`) and cleared when a send completes without
+    /// having waited. Kept only while the driver's `track_room_waits` is set.
+    pub room_waited: bool,
+    /// The send in progress has waited for room. On io_uring that is the
+    /// send in the kernel or waiting for `POLLOUT`, since it was first
+    /// submitted; on mio, any send queued since the queue was last empty.
+    /// Copied into `room_waited` when a send completes. Kept only while the
+    /// driver's `track_room_waits` is set.
+    pub send_waited: bool,
 }
 
 /// The `IORING_OP_CONNECT` with an `AF_UNSPEC` address that `abort` submits
@@ -171,6 +183,8 @@ impl ConnSendState {
             aborted: false,
             #[cfg(has_io_uring)]
             disconnect: Disconnect::None,
+            room_waited: false,
+            send_waited: false,
         }
     }
 

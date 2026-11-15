@@ -279,13 +279,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let udp_queue_capacity = config
             .udp_recv_queue_capacity
             .min(config.udp_recv_buffer.ring_size as usize);
-        let executor = Executor::new(
+        let mut executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
             crate::runtime::TIMER_SLOTS,
             config.udp_bind.len() as u32,
             udp_queue_capacity,
         );
+        executor.set_send_admission_order(config.send_admission_order);
         // A waker woken off this thread rings the worker's own wake fd.
         if let Some(handle) = config
             .wake_keep_alive
@@ -3090,6 +3091,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let generation = self.driver.connections.generation(conn_index);
         let state = &mut self.driver.send_queues[conn_index as usize];
         state.waiting_send = Some(ud.raw());
+        // Under `BoundedIdle` and `BudgetIdle` this send, and so the
+        // connection's most recent one, waited for room
+        // (`ConnSendState::room_waited`).
+        if self.driver.track_room_waits {
+            state.room_waited = true;
+            state.send_waited = true;
+        }
         if !state.on_send_backstop {
             state.on_send_backstop = true;
             self.driver
@@ -3393,11 +3401,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// run loop; see the call site for why that point.
     ///
     /// Separate from the loop body so tests can drive it directly.
+    ///
+    /// Under an order other than `Strict` it also runs when the admission
+    /// queue asks for a scan (`Executor::send_scan_due`): a waiter can become
+    /// able to pass the head without any slot coming back.
     fn wake_capacity_if_released(&mut self) {
-        if self.driver.capacity_released {
+        if self.driver.capacity_released || self.executor.send_scan_due() {
             self.driver.capacity_released = false;
+            let driver = &self.driver;
             self.executor
-                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+                .wake_send_capacity_in(&driver.send_copy_pool, |conn| driver.send_idle(conn));
         }
     }
 

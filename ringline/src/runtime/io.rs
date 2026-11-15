@@ -15,7 +15,7 @@ use bytes::Bytes;
 use crate::backend::Driver;
 use crate::error::TimerExhausted;
 use crate::handler::ConnId;
-use crate::runtime::send_completion::SendId;
+use crate::runtime::send_completion::{Admit, PoolView, SendAdmissionOrder, SendId};
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::{STANDALONE_BIT, pending};
 use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
@@ -4068,7 +4068,9 @@ enum AdmissionState {
 /// As for [`BackpressuredSend`]: nothing happens until the first poll, the
 /// message's worst-case pool cost is computed then, and the future is
 /// admitted when it reaches the head of the FIFO and the pool covers that
-/// cost. The entry at the head submits only when its task polls the future,
+/// cost. (A worker configured with an experimental `SendAdmissionOrder`
+/// other than the default may admit it earlier, ahead of a head that does
+/// not fit.) The entry at the head submits only when its task polls the future,
 /// so poll or drop it promptly, and bound the wait: an unbounded waiter at
 /// the head holds back every bounded send on the worker for as long as it
 /// waits.
@@ -4211,8 +4213,10 @@ impl Future for Admission<'_> {
                     this.state = AdmissionState::Waiting(id);
                     // Fall through: the pool is usually free, and costing the
                     // common case a wake-up round-trip would be a poor
-                    // default for the API reached for under load.
-                    this.poll_waiting(driver, executor, id, cx)
+                    // default for the API reached for under load. Under an
+                    // order that lets a send pass, this is also where a new
+                    // waiter that can pass is admitted without a wake.
+                    this.poll_waiting(driver, executor, id, true, cx)
                 }
 
                 AdmissionState::Waiting(id) => {
@@ -4235,7 +4239,7 @@ impl Future for Admission<'_> {
                     if driver.connections.generation(this.conn_index) != this.generation {
                         return this.abandon(executor, id);
                     }
-                    this.poll_waiting(driver, executor, id, cx)
+                    this.poll_waiting(driver, executor, id, false, cx)
                 }
             }
         })
@@ -4243,30 +4247,65 @@ impl Future for Admission<'_> {
 }
 
 impl Admission<'_> {
-    /// The waiting half of `poll`, shared by the first poll and later ones.
+    /// The waiting half of `poll`, shared by the first poll (`first_poll`)
+    /// and later ones.
+    ///
+    /// Under `Strict` the queue's [`turn`](Executor::send_capacity_turn)
+    /// decides, as it always has. Under the other orders
+    /// [`admit`](Executor::send_capacity_admit) decides, and a send it lets
+    /// pass the head is submitted with the pool marking what it takes
+    /// (`SendCopyPool::begin_passing`), so B counts those slots until they
+    /// return.
     fn poll_waiting(
         &mut self,
         driver: &mut Driver,
         executor: &mut Executor,
         id: SendId,
+        first_poll: bool,
         cx: &Context<'_>,
     ) -> Poll<io::Result<SendCompletion>> {
-        let free = driver.send_copy_pool.free_count();
-        if !executor.send_capacity_turn(id, free) {
-            return pending(cx);
-        }
+        let passing = if executor.send_admission_order() == SendAdmissionOrder::Strict {
+            let free = driver.send_copy_pool.free_count();
+            if !executor.send_capacity_turn(id, free) {
+                return pending(cx);
+            }
+            None
+        } else {
+            let pool = PoolView::of(&driver.send_copy_pool);
+            let conn_index = self.conn_index;
+            match executor
+                .send_capacity_admit(id, pool, first_poll, || driver.send_idle(conn_index))
+            {
+                Admit::Wait => return pending(cx),
+                Admit::Head => None,
+                Admit::Pass { slots } => Some(slots),
+            }
+        };
         let token = ConnId::new(self.conn_index, self.generation);
         let submit = {
             let mut ctx = driver.make_ctx();
-            ctx.send_bounded(token, self.data, id)
+            if passing.is_some() {
+                ctx.send_copy_pool.begin_passing();
+            }
+            let submit = ctx.send_bounded(token, self.data, id);
+            if passing.is_some() {
+                ctx.send_copy_pool.end_passing();
+            }
+            submit
         };
         match submit {
             Ok(()) => {
                 // Promotes this id to `InFlight` and wakes the new head. From
                 // here the `SendCompletion` owns the id, and its `Drop`
                 // cancels it.
-                executor.mark_send_submitted(id);
-                let sent = SendCompletion::pending(self.conn_index, self.generation, id);
+                let mut sent = SendCompletion::pending(self.conn_index, self.generation, id);
+                match passing {
+                    None => executor.mark_send_submitted(id),
+                    Some(slots) => {
+                        executor.mark_send_passed(id, slots);
+                        sent.passed_head = true;
+                    }
+                }
                 self.finish(Ok(sent))
             }
             Err(e) => {
@@ -4328,7 +4367,9 @@ enum BackpressuredState<'a> {
 /// poll the message's worst-case pool cost is computed and the future joins
 /// the FIFO; it is released when it reaches the head *and* the pool can cover
 /// that cost. Admission is strictly first-come-first-served per worker, so a
-/// large message cannot be starved by a stream of small ones.
+/// large message cannot be starved by a stream of small ones. (A worker
+/// configured with an experimental `SendAdmissionOrder` other than the
+/// default may admit a waiter ahead of a head that does not fit.)
 ///
 /// The entry at the head submits only when its task polls the future, so a
 /// head entry whose task is woken but does not poll holds every bounded send
@@ -4453,6 +4494,9 @@ pub struct SendCompletion {
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
     state: SendCompletionState,
+    /// The send was admitted past a waiting head; see
+    /// [`passed_head`](Self::passed_head).
+    passed_head: bool,
     /// Makes the type `!Send`: a poll on another worker would index that
     /// worker's table.
     _not_send: PhantomData<*const ()>,
@@ -4472,6 +4516,7 @@ impl SendCompletion {
             conn_index,
             generation,
             state: SendCompletionState::Pending(id),
+            passed_head: false,
             _not_send: PhantomData,
         }
     }
@@ -4482,8 +4527,18 @@ impl SendCompletion {
             conn_index,
             generation,
             state: SendCompletionState::Ready(Some(result)),
+            passed_head: false,
             _not_send: PhantomData,
         }
+    }
+
+    /// Whether the send was admitted past a waiting head: a `send_admitted`
+    /// that a worker's experimental `SendAdmissionOrder` let pass a head that
+    /// did not fit. False for every other send, and always under the default
+    /// order.
+    #[doc(hidden)]
+    pub fn passed_head(&self) -> bool {
+        self.passed_head
     }
 }
 

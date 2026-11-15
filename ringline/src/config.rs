@@ -244,6 +244,9 @@ pub struct Config {
     /// one per CQE instead. Guard sends fail with `Other("send slab
     /// exhausted")` while it is full. Default: 512.
     pub(crate) send_slab_slots: u16,
+    /// The order in which each worker's admission FIFO admits bounded sends.
+    /// An experiment option; see [`ConfigBuilder::send_admission_order`].
+    pub(crate) send_admission_order: crate::SendAdmissionOrder,
     /// Deadline-based flush interval in microseconds during CQE processing.
     /// When non-SQPOLL, if this many microseconds elapse since the last submit
     /// while processing a CQE batch, pending SQEs are flushed mid-iteration.
@@ -522,6 +525,7 @@ impl Default for Config {
             send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
             send_slab_slots: 512,
+            send_admission_order: crate::SendAdmissionOrder::Strict,
             flush_interval_us: 100,
             tick_timeout_us: 10_000,
             tls: None,
@@ -1302,6 +1306,19 @@ impl ConfigBuilder {
     /// Set the number of scatter-gather send slab slots.
     pub fn send_slab_slots(mut self, n: u16) -> Self {
         self.config.send_slab_slots = n;
+        self
+    }
+
+    /// Set the order in which each worker admits bounded sends
+    /// ([`SendAdmissionOrder`](crate::SendAdmissionOrder)): whether a
+    /// `send_admitted` or `send_backpressured` waiting behind a head that does
+    /// not fit may be admitted first. An experiment option, outside semver,
+    /// for measuring the orders of `docs/send-admission-design.md`, section 4.
+    ///
+    /// Default: `Strict`, in which only the head is admitted.
+    #[doc(hidden)]
+    pub fn send_admission_order(mut self, order: crate::SendAdmissionOrder) -> Self {
+        self.config.send_admission_order = order;
         self
     }
 
