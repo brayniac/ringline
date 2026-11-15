@@ -199,6 +199,47 @@ pub(crate) enum Admit {
     Pass { slots: usize },
 }
 
+/// What the admission orders did on one worker, for the Experiment C server
+/// (`docs/send-admission-design.md`, section 4). Read with
+/// [`send_admission_counters`]. Every count starts at zero when the worker
+/// starts and only grows, except `passing_held`; under `Strict` all stay
+/// zero.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendAdmissionCounters {
+    /// Sends admitted past a waiting head.
+    pub passing_admissions: u64,
+    /// The copy-pool slots those sends were admitted against (each one's
+    /// worst-case cost, as the FIFO counts it), summed.
+    pub passing_slots: u64,
+    /// The slots sends that passed a head hold now (B).
+    pub passing_held: u64,
+    /// The largest `passing_held` has been.
+    pub passing_held_max: u64,
+    /// Under `Bounded` and `BoundedIdle`, the heads whose latch closed while
+    /// they did not fit: F < H <= F + B, the slots of passing sends making
+    /// the difference. A latch that closes while its head fits is not
+    /// counted.
+    pub latch_closings: u64,
+    /// Wake scans that looked behind a head that did not fit.
+    pub wake_scans: u64,
+    /// The waiters those scans woke.
+    pub scan_wakes: u64,
+}
+
+/// The admission counters of the worker this runs on: see
+/// [`SendAdmissionCounters`].
+///
+/// # Panics
+///
+/// Outside a task or handler callback on a ringline worker.
+#[doc(hidden)]
+pub fn send_admission_counters() -> SendAdmissionCounters {
+    super::io::with_state(|driver, executor| {
+        executor.send_admission_counters(&driver.send_copy_pool)
+    })
+}
+
 /// Whether arrival number `a` came before `b`. Arrival numbers wrap; the
 /// waiters in the FIFO at any one time span far fewer than 2^31 of them.
 fn arrived_before(a: u32, b: u32) -> bool {
@@ -322,6 +363,10 @@ pub(crate) struct SendCompletions {
     /// [`Executor::wake_send_capacity_in`] so that a scan allocates only
     /// when it wakes more tasks than any scan before it.
     wake_scratch: Vec<u32>,
+    /// The counts the FIFO keeps; `passing_held` and `passing_held_max`
+    /// stay zero here and are read from the pool
+    /// ([`Executor::send_admission_counters`]).
+    counters: SendAdmissionCounters,
 }
 
 /// Record `index` under `key`.
@@ -892,6 +937,9 @@ impl SendCompletions {
             && pool.free + pool.passing >= head_needs
         {
             self.latched_head = Some(head);
+            if pool.free < head_needs {
+                self.counters.latch_closings += 1;
+            }
         }
     }
 
@@ -968,6 +1016,8 @@ impl SendCompletions {
         {
             return;
         }
+        self.counters.wake_scans += 1;
+        let woken_before = wakes.len();
         let mut left = pool;
         // `front` left the head at the front of `waiting`.
         for &id in self.waiting.iter().skip(1) {
@@ -994,6 +1044,16 @@ impl SendCompletions {
             left.free -= *required_slots;
             left.passing += *required_slots;
         }
+        self.counters.scan_wakes += (wakes.len() - woken_before) as u64;
+    }
+
+    /// `id`, a waiter [`admit`](Self::admit) let pass the head with
+    /// `slots`, was submitted: count the pass, then
+    /// [`mark_submitted`](Self::mark_submitted).
+    pub(crate) fn mark_passed(&mut self, id: SendId, slots: usize) -> Option<u32> {
+        self.counters.passing_admissions += 1;
+        self.counters.passing_slots += slots as u64;
+        self.mark_submitted(id)
     }
 
     /// The connection at `conn_index` is released (any generation): the
@@ -1367,6 +1427,24 @@ impl Executor {
         idle: impl FnOnce() -> bool,
     ) -> Admit {
         self.send_completions.admit(id, pool, first_poll, idle)
+    }
+
+    /// [`SendCompletions::mark_passed`]. `Admission`, after submitting a
+    /// send that passed the head. `id` was behind the head, so the head does
+    /// not change and nothing is woken.
+    pub(crate) fn mark_send_passed(&mut self, id: SendId, slots: usize) {
+        let next = self.send_completions.mark_passed(id, slots);
+        debug_assert!(next.is_none(), "a send that passed was the head");
+    }
+
+    /// The worker's [`SendAdmissionCounters`]: the FIFO's counts, with B and
+    /// its largest value from `pool`.
+    pub(crate) fn send_admission_counters(&self, pool: &SendCopyPool) -> SendAdmissionCounters {
+        SendAdmissionCounters {
+            passing_held: pool.passing_held() as u64,
+            passing_held_max: pool.passing_peak() as u64,
+            ..self.send_completions.counters
+        }
     }
 
     /// [`SendCompletions::scan_due`]. The event loops' end-of-iteration
@@ -2158,6 +2236,7 @@ mod tests {
         q.mark_submitted(head);
         q.remove_connection(2);
         assert!(!q.scan_due());
+        assert_eq!(q.counters, SendAdmissionCounters::default());
     }
 
     /// Each order lets a waiter that fits pass a head that does not, and
@@ -2509,5 +2588,59 @@ mod tests {
         q.scan(pool(0, 0, 8), |_| true, &mut Vec::new());
         q.mark_submitted(head);
         assert!(q.scan_due(), "the head was admitted");
+    }
+
+    /// The FIFO's counts: a pass and its slots, a latch that closes while
+    /// its head does not fit (counted once), and a scan that looks behind
+    /// the head, with the waiters it wakes. Neither a latch that closes
+    /// while its head fits nor a scan that stops at a head that fits or at a
+    /// closed latch is counted.
+    #[test]
+    fn counters_record_passes_latch_closings_and_scans() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let a = q.enqueue(2, 0, 2, task(2));
+        let b = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(a, pool(4, 0, 8), true, idle),
+            Admit::Pass { slots: 2 }
+        );
+        assert_eq!(q.mark_passed(a, 2), None);
+        assert_eq!(scanned(&mut q, pool(2, 2, 8)), vec![task(3)]);
+        assert_eq!(q.admit(b, pool(2, 4, 8), true, idle), Admit::Wait);
+        assert_eq!(q.admit(b, pool(2, 4, 8), true, idle), Admit::Wait);
+        assert!(scanned(&mut q, pool(2, 4, 8)).is_empty(), "latched");
+        assert_eq!(
+            q.counters,
+            SendAdmissionCounters {
+                passing_admissions: 1,
+                passing_slots: 2,
+                latch_closings: 1,
+                wake_scans: 1,
+                scan_wakes: 1,
+                ..SendAdmissionCounters::default()
+            }
+        );
+
+        q.cancel(head);
+        assert_eq!(scanned(&mut q, pool(6, 0, 8)), vec![task(3)], "b fits");
+        assert_eq!(q.counters.latch_closings, 1, "b's latch closed as it fit");
+        assert_eq!(q.counters.wake_scans, 1);
+    }
+
+    /// The executor's counters take B and its largest value from the pool.
+    #[test]
+    fn executor_counters_take_passing_slots_from_the_pool() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.set_send_admission_order(SendAdmissionOrder::FirstFit);
+        let mut copy_pool = SendCopyPool::new(8, 8);
+        copy_pool.track_passing();
+        copy_pool.begin_passing();
+        let (first, _p, _l) = copy_pool.copy_in(b"p").unwrap();
+        copy_pool.copy_in(b"q").unwrap();
+        copy_pool.end_passing();
+        copy_pool.release(first);
+        let counters = exec.send_admission_counters(&copy_pool);
+        assert_eq!((counters.passing_held, counters.passing_held_max), (1, 2));
     }
 }

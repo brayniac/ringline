@@ -4269,7 +4269,7 @@ impl Admission<'_> {
             if !executor.send_capacity_turn(id, free) {
                 return pending(cx);
             }
-            false
+            None
         } else {
             let pool = PoolView::of(&driver.send_copy_pool);
             let conn_index = self.conn_index;
@@ -4277,18 +4277,18 @@ impl Admission<'_> {
                 .send_capacity_admit(id, pool, first_poll, || driver.send_idle(conn_index))
             {
                 Admit::Wait => return pending(cx),
-                Admit::Head => false,
-                Admit::Pass { .. } => true,
+                Admit::Head => None,
+                Admit::Pass { slots } => Some(slots),
             }
         };
         let token = ConnId::new(self.conn_index, self.generation);
         let submit = {
             let mut ctx = driver.make_ctx();
-            if passing {
+            if passing.is_some() {
                 ctx.send_copy_pool.begin_passing();
             }
             let submit = ctx.send_bounded(token, self.data, id);
-            if passing {
+            if passing.is_some() {
                 ctx.send_copy_pool.end_passing();
             }
             submit
@@ -4298,8 +4298,14 @@ impl Admission<'_> {
                 // Promotes this id to `InFlight` and wakes the new head. From
                 // here the `SendCompletion` owns the id, and its `Drop`
                 // cancels it.
-                executor.mark_send_submitted(id);
-                let sent = SendCompletion::pending(self.conn_index, self.generation, id);
+                let mut sent = SendCompletion::pending(self.conn_index, self.generation, id);
+                match passing {
+                    None => executor.mark_send_submitted(id),
+                    Some(slots) => {
+                        executor.mark_send_passed(id, slots);
+                        sent.passed_head = true;
+                    }
+                }
                 self.finish(Ok(sent))
             }
             Err(e) => {
@@ -4488,6 +4494,9 @@ pub struct SendCompletion {
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
     state: SendCompletionState,
+    /// The send was admitted past a waiting head; see
+    /// [`passed_head`](Self::passed_head).
+    passed_head: bool,
     /// Makes the type `!Send`: a poll on another worker would index that
     /// worker's table.
     _not_send: PhantomData<*const ()>,
@@ -4507,6 +4516,7 @@ impl SendCompletion {
             conn_index,
             generation,
             state: SendCompletionState::Pending(id),
+            passed_head: false,
             _not_send: PhantomData,
         }
     }
@@ -4517,8 +4527,18 @@ impl SendCompletion {
             conn_index,
             generation,
             state: SendCompletionState::Ready(Some(result)),
+            passed_head: false,
             _not_send: PhantomData,
         }
+    }
+
+    /// Whether the send was admitted past a waiting head: a `send_admitted`
+    /// that a worker's experimental `SendAdmissionOrder` let pass a head that
+    /// did not fit. False for every other send, and always under the default
+    /// order.
+    #[doc(hidden)]
+    pub fn passed_head(&self) -> bool {
+        self.passed_head
     }
 }
 

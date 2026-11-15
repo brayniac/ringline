@@ -86,6 +86,8 @@ pub struct SendCopyPool {
     // marked slots in use plus the unfilled remainder of passing
     // reservations. Never more than the slots in use (`debug_assert`ed).
     passing_held: usize,
+    // The largest `passing_held` has been.
+    passing_peak: usize,
     // Set between `begin_passing` and `end_passing`: every slot and
     // reservation taken meanwhile is marked as passing.
     marking: bool,
@@ -117,6 +119,7 @@ impl SendCopyPool {
             reserved: 0,
             passing: Vec::new(),
             passing_held: 0,
+            passing_peak: 0,
             marking: false,
         }
     }
@@ -155,11 +158,18 @@ impl SendCopyPool {
         self.passing_held
     }
 
+    /// The largest [`passing_held`](Self::passing_held) has been since the
+    /// pool was created.
+    pub(crate) fn passing_peak(&self) -> usize {
+        self.passing_peak
+    }
+
     /// Count `n` more slots as held by passing sends. The slots are already
     /// taken (popped or reserved), so the count stays within the slots in
     /// use.
     fn take_passing(&mut self, n: usize) {
         self.passing_held += n;
+        self.passing_peak = self.passing_peak.max(self.passing_held);
         debug_assert!(
             self.passing_held <= self.slot_count() - self.free_count(),
             "passing sends hold {} slots but only {} are in use",
@@ -1055,6 +1065,7 @@ mod tests {
         pool.release(b);
         pool.release(c);
         assert_eq!(pool.passing_held(), 0);
+        assert_eq!(pool.passing_peak(), 3);
 
         // The marks were cleared: the slots come back unmarked.
         let (again, _p, _l) = pool.copy_in(b"x").unwrap();
@@ -1107,6 +1118,7 @@ mod tests {
         assert_eq!(pool.passing_held(), 1);
         pool.release_reservation(r);
         assert_eq!(pool.passing_held(), 0);
+        assert_eq!(pool.passing_peak(), 4);
     }
 
     #[test]
