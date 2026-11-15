@@ -1,0 +1,75 @@
+name = "send-admission C test on {image} ({ref})"
+
+# Runs ringline's whole test suite and its io_uring lint and doc gates on one
+# kernel, for a commit of Experiment C's work branches (the admission orders
+# of docs/send-admission-design.md, section 4, which macOS can test only on
+# mio). The build is checked to be io_uring first: a mio build would run none
+# of the io_uring code.
+#   systemslab submit experiments/send-admission-c-test.toml -p ref=<commit>
+
+[params]
+image = "debian-13-6.12"
+ref = "exp/send-admission-c-orders"
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "vm"
+tags = ["hypervisor", "x86_64"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = 7200
+artifacts = ["/tmp/job/run.log", "/tmp/job/full.out", "/tmp/job/clippy.out"]
+payload = '''
+set -o pipefail
+mkdir -p /tmp/job
+echo 1 > /tmp/job/status
+{
+  echo "== guest =="; uname -r; nproc; grep PRETTY /etc/os-release
+  if ! command -v cc >/dev/null || ! command -v git >/dev/null; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git curl >/dev/null
+  fi
+  if ! command -v cargo >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal -c clippy -c rustfmt
+    . "$HOME/.cargo/env"
+  fi
+  cargo --version
+  ulimit -Sn 65536
+  echo "memlock=$(ulimit -l)"
+  # On disk, not in /tmp: /tmp is tmpfs on these images. Eight jobs keep the
+  # build inside the guest's 8 GiB.
+  export CARGO_BUILD_JOBS=8
+  git clone -q {repo} "$HOME/src" || exit 1
+  cd "$HOME/src" && git checkout -q {ref} || exit 1
+  git log --oneline -1
+
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  backend=$(./target/debug/bench-server --print-backend)
+  echo "backend=$backend"
+
+  cargo test --locked -p ringline > /tmp/job/full.out 2>&1
+  echo "full_rc=$?" | tee -a /tmp/job/rc.txt
+  grep -E "^test result|FAILED|panicked" /tmp/job/full.out | sort | uniq -c | sort -rn | head -30
+  cargo fmt --all --check; echo "gate_fmt=$?" | tee -a /tmp/job/rc.txt
+  cargo clippy --locked -p ringline --all-targets -- -D warnings > /tmp/job/clippy.out 2>&1; echo "gate_clippy=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/clippy.out
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline > /tmp/job/doc.out 2>&1; echo "gate_doc=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/doc.out
+
+  fail=0
+  [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
+  for gate in full_rc gate_fmt gate_clippy gate_doc; do
+    grep -q "^$gate=0" /tmp/job/rc.txt && echo "ok   $gate" || { echo "FAIL $gate"; fail=1; }
+  done
+  echo "verdict_fail=$fail"
+  echo $fail > /tmp/job/status
+} 2>&1 | tee /tmp/job/run.log
+exit "$(cat /tmp/job/status)"
+'''

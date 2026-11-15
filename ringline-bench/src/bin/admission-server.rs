@@ -126,10 +126,15 @@ enum Order {
     Budget,
     /// O7w, with R = `--budget`.
     BudgetIdle,
+    /// O5: a small region of `--small-slots` slots of `--small-slot-size`
+    /// bytes beside the `--pool-slots` main slots, each with its own strict
+    /// FIFO.
+    SplitPool,
 }
 
 impl Order {
-    fn runtime(self, budget: u16) -> ringline::SendAdmissionOrder {
+    fn runtime(self, a: &Args) -> ringline::SendAdmissionOrder {
+        let budget = a.budget;
         match self {
             Order::Strict => ringline::SendAdmissionOrder::Strict,
             Order::FirstFit => ringline::SendAdmissionOrder::FirstFit,
@@ -137,6 +142,10 @@ impl Order {
             Order::BoundedIdle => ringline::SendAdmissionOrder::BoundedIdle,
             Order::Budget => ringline::SendAdmissionOrder::Budget(budget),
             Order::BudgetIdle => ringline::SendAdmissionOrder::BudgetIdle(budget),
+            Order::SplitPool => ringline::SendAdmissionOrder::SplitPool {
+                small_slots: a.small_slots,
+                small_slot_size: a.small_slot_size,
+            },
         }
     }
 
@@ -148,6 +157,7 @@ impl Order {
             Order::BoundedIdle => "bounded-idle",
             Order::Budget => "budget",
             Order::BudgetIdle => "budget-idle",
+            Order::SplitPool => "split-pool",
         }
     }
 }
@@ -171,6 +181,12 @@ struct Args {
     /// R, in slots, for `--order budget` and `budget-idle`.
     #[arg(long, default_value_t = 32)]
     budget: u16,
+    /// The small region's slots, for `--order split-pool`.
+    #[arg(long, default_value_t = 256)]
+    small_slots: u16,
+    /// The small region's slot size in bytes, for `--order split-pool`.
+    #[arg(long, default_value_t = 4096)]
+    small_slot_size: u32,
     #[arg(long, default_value_t = 4096)]
     small_max: u32,
     #[arg(long)]
@@ -910,6 +926,9 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
             "passing_slots": c.passing_slots,
             "passing_held": c.passing_held,
             "passing_held_max": c.passing_held_max,
+            "main_free": c.main_free,
+            "small_free": c.small_free,
+            "small_admissions": c.small_admissions,
             "latch_closings": c.latch_closings,
             "wake_scans": c.wake_scans,
             "scan_wakes": c.scan_wakes,
@@ -937,7 +956,7 @@ fn main() {
         .core_offset(args.cpu)
         .max_connections(4096)
         .send_pool(args.pool_slots, args.slot_size)
-        .send_admission_order(args.order.runtime(args.budget))
+        .send_admission_order(args.order.runtime(&args))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -986,6 +1005,8 @@ fn main() {
             "small_send": small_send,
             "order": args.order.name(),
             "budget": args.budget,
+            "small_slots": args.small_slots,
+            "small_slot_size": args.small_slot_size,
             "admit_limit_ms": args.admit_limit_ms,
             "settle_limit_ms": args.settle_limit_ms,
             "pipeline": args.pipeline,

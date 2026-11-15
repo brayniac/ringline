@@ -19,8 +19,11 @@
 #   order           the runtime's admission order for send_admitted, from
 #                   the work branch exp/send-admission-c-orders: strict (O0),
 #                   first-fit (O2), bounded (O3), bounded-idle (O4), budget
-#                   (O7) or budget-idle (O7w)
+#                   (O7), budget-idle (O7w) or split-pool (O5)
 #   budget          R in slots, for the budget orders
+#   small_slots     the small region's slots, for split-pool, beside
+#                   pool_slots main slots
+#   small_slot_size the small region's slot bytes, for split-pool
 #   host            the hypervisor the guest runs on
 #   admit_ms        the server's bound on a wait for admission, and the
 #                   latency the load counts as delivered within the limit
@@ -82,6 +85,8 @@ workload       = "W1"
 small_send     = "admitted"
 order          = "strict"
 budget         = "32"
+small_slots    = "256"
+small_slot_size = "4096"
 host           = "hv03"
 admit_ms       = "1000"
 settle_ms      = "1000"
@@ -141,13 +146,13 @@ ulimit -n 65536
 sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 {tcp_wmem_max}"
 sysctl net.ipv4.tcp_rmem
 last=$(($(nproc) - 1))
-./out/admission-server --addr 127.0.0.1:7979 --small-send {small_send} --order {order} --budget {budget} --admit-limit-ms {admit_ms} --settle-limit-ms {settle_ms} --pipeline {pipeline} --pool-slots {pool_slots} --slot-size {slot_size} --cpu 0 > results/server.json 2> results/server.log &
+./out/admission-server --addr 127.0.0.1:7979 --small-send {small_send} --order {order} --budget {budget} --small-slots {small_slots} --small-slot-size {small_slot_size} --admit-limit-ms {admit_ms} --settle-limit-ms {settle_ms} --pipeline {pipeline} --pool-slots {pool_slots} --slot-size {slot_size} --cpu 0 > results/server.json 2> results/server.log &
 srv=$!
 for i in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/7979) 2>/dev/null && { exec 3>&-; break; }; sleep 0.1; done
 taskset -c 2-$last ./out/admission-load --addr 127.0.0.1:7979 --duration {duration} --warmup {warmup} --within-ms {admit_ms} --episode-ms {episode_ms} --small-conns {small_conns} --small-rate {small_rate} --small-size {small_size} --stall-peers {stall_peers} --stall-size {stall_size} --large-size {large_size} --large-delay-ms {large_delay_ms} --slow-conns {slow_conns} --slow-rate {slow_rate} --slow-size {slow_size} --slow-read-bps {slow_read_bps} --slow-rcvbuf {slow_rcvbuf} --drainers {drainers} --drain-size {drain_size} --drain-read-bps {drain_read_bps} --drain-rcvbuf {drain_rcvbuf} --outside-conns {outside_conns} --outside-rate {outside_rate} --outside-size {outside_size} > results/load.json 2> results/load.log
 rc=$?
 kill -INT $srv; wait $srv
-echo "RUN workload={workload} small_send={small_send} order={order} budget={budget} host={host} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} pool_slots={pool_slots} slot_size={slot_size} rep={rep} load_rc=$rc"
+echo "RUN workload={workload} small_send={small_send} order={order} budget={budget} small_slots={small_slots} small_slot_size={small_slot_size} host={host} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} pool_slots={pool_slots} slot_size={slot_size} rep={rep} load_rc=$rc"
 echo "LOAD $(cat results/load.json)"
 echo "SERVER $(cat results/server.json)"
 tail -3 results/server.log results/load.log
