@@ -68,6 +68,10 @@ struct EchoCfg {
     tick_timeout_us: u64,
     /// Simulated per-request application work, microseconds.
     service_time_us: u64,
+    /// `bytes-admitted-timeout`: the bound on the wait for admission.
+    admit_limit_ms: u64,
+    /// `bytes-admitted-timeout`: the bound on the wait for settlement.
+    settle_limit_ms: u64,
 }
 
 /// Simulated per-request application work, nanoseconds. Same reason as
@@ -166,6 +170,17 @@ enum EchoMode {
     Copy,
     /// `with_data` + `forward_recv_buf`.
     Forward,
+    /// `with_bytes`, then `send_nowait` after the closure returns. The
+    /// baseline of Experiment B (`docs/send-admission-design.md`, section 4):
+    /// the three `bytes-*` arms differ only in the send call.
+    BytesNowait,
+    /// `with_bytes`, then `send_admitted` after the closure returns, with the
+    /// `SendCompletion` dropped once the send is admitted.
+    BytesAdmitted,
+    /// `with_bytes`, then `send_admitted` bounded by `--admit-limit-ms` and
+    /// its `SendCompletion` bounded by `--settle-limit-ms`, as in section 2's
+    /// example. A connection past either limit is closed.
+    BytesAdmittedTimeout,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -287,6 +302,16 @@ struct Args {
     /// socket -> pipe -> socket without entering user memory. Linux only.
     #[arg(long, value_enum, default_value_t = TokioEcho::Copy)]
     tokio_echo: TokioEcho,
+
+    /// (ringline, `--echo-mode bytes-admitted-timeout`) How long a reply may
+    /// wait for admission to the send pool before its connection is closed.
+    #[arg(long, default_value_t = 1000)]
+    admit_limit_ms: u64,
+
+    /// (ringline, `--echo-mode bytes-admitted-timeout`) How long an admitted
+    /// reply may stay unsettled before its connection is closed.
+    #[arg(long, default_value_t = 1000)]
+    settle_limit_ms: u64,
 
     /// (ringline) Run as a one-way proxy to this backend instead of echoing:
     /// every accepted connection is forwarded to a fresh connection to
@@ -484,7 +509,7 @@ fn main() {
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: args.echo_mode.unwrap_or_else(|| {
                 // No default: a spec must name the loop it measures.
-                eprintln!("bench-server: --runtime ringline needs --echo-mode copy or forward");
+                eprintln!("bench-server: --runtime ringline needs --echo-mode");
                 std::process::exit(2);
             }),
             conn_chunk_size: args.conn_chunk_size,
@@ -495,6 +520,8 @@ fn main() {
             tls: args.tls,
             tick_timeout_us: args.tick_timeout_us,
             service_time_us: args.service_time_us,
+            admit_limit_ms: args.admit_limit_ms,
+            settle_limit_ms: args.settle_limit_ms,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -639,6 +666,8 @@ fn run_ringline(cfg: EchoCfg) {
         tls,
         tick_timeout_us,
         service_time_us,
+        admit_limit_ms,
+        settle_limit_ms,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -723,6 +752,104 @@ fn run_ringline(cfg: EchoCfg) {
         }
     }
 
+    /// `--admit-limit-ms` and `--settle-limit-ms`, for the same reason as
+    /// `PARK_ENABLED`.
+    static ADMIT_LIMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SETTLE_LIMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Replies a `bytes-*` arm could not send, and connections
+    /// `bytes-admitted-timeout` closed at each limit. Printed at shutdown: a
+    /// run that refused or closed anything measured something else.
+    static BYTES_SEND_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ADMIT_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SETTLE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    const BYTES_NOWAIT: u8 = 0;
+    const BYTES_ADMITTED: u8 = 1;
+    const BYTES_ADMITTED_TIMEOUT: u8 = 2;
+
+    /// The `bytes-*` arms. `with_bytes` hands the closure a `Bytes` view of
+    /// the received data, which is kept and sent after the closure returns,
+    /// so `send_admitted` can be awaited. The send call is chosen at compile
+    /// time (`MODE`), so no arm pays for a branch the others do not.
+    async fn bytes_echo_loop<const MODE: u8>(conn: Connection) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut tx, mut rx) = conn.split();
+        let admit_limit = std::time::Duration::from_millis(ADMIT_LIMIT_MS.load(Relaxed));
+        let settle_limit = std::time::Duration::from_millis(SETTLE_LIMIT_MS.load(Relaxed));
+        loop {
+            let mut got = None;
+            let n = rx
+                .with_bytes(|data| {
+                    let len = data.len();
+                    got = Some(data);
+                    ParseResult::Consumed(len)
+                })
+                .await;
+            let Some(data) = got.filter(|_| n > 0) else {
+                break;
+            };
+            burn_for(data.len());
+            match MODE {
+                BYTES_NOWAIT => {
+                    if let Err(e) = tx.send_nowait(&data) {
+                        BYTES_SEND_FAILED.fetch_add(1, Relaxed);
+                        eprintln!("echo: send_nowait failed: {e}");
+                        break;
+                    }
+                }
+                BYTES_ADMITTED => match tx.send_admitted(&data).await {
+                    Ok(sent) => drop(sent),
+                    Err(e) => {
+                        BYTES_SEND_FAILED.fetch_add(1, Relaxed);
+                        eprintln!("echo: send_admitted failed: {e}");
+                        break;
+                    }
+                },
+                _ => {
+                    let sent = match ringline::timeout(admit_limit, tx.send_admitted(&data)).await {
+                        Ok(Ok(sent)) => sent,
+                        Ok(Err(e)) => {
+                            BYTES_SEND_FAILED.fetch_add(1, Relaxed);
+                            eprintln!("echo: send_admitted failed: {e}");
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            ADMIT_TIMEOUTS.fetch_add(1, Relaxed);
+                            tx.close();
+                            break;
+                        }
+                    };
+                    match ringline::timeout(settle_limit, sent).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            BYTES_SEND_FAILED.fetch_add(1, Relaxed);
+                            eprintln!("echo: send failed: {e}");
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            SETTLE_TIMEOUTS.fetch_add(1, Relaxed);
+                            tx.close();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct BytesEchoHandler<const MODE: u8>;
+    impl<const MODE: u8> AsyncEventHandler for BytesEchoHandler<MODE> {
+        fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
+            async move { bytes_echo_loop::<MODE>(conn).await }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            BytesEchoHandler
+        }
+    }
+
+    ADMIT_LIMIT_MS.store(admit_limit_ms, std::sync::atomic::Ordering::Relaxed);
+    SETTLE_LIMIT_MS.store(settle_limit_ms, std::sync::atomic::Ordering::Relaxed);
+
     PARK_ENABLED.store(park, std::sync::atomic::Ordering::Relaxed);
     // Simulated work is charged per request, so the handler needs the request
     // size as well as the duration.
@@ -767,6 +894,11 @@ fn run_ringline(cfg: EchoCfg) {
     let (shutdown, handles) = match echo_mode {
         EchoMode::Forward => builder.launch::<ForwardEchoHandler>(),
         EchoMode::Copy => builder.launch::<EchoHandler>(),
+        EchoMode::BytesNowait => builder.launch::<BytesEchoHandler<BYTES_NOWAIT>>(),
+        EchoMode::BytesAdmitted => builder.launch::<BytesEchoHandler<BYTES_ADMITTED>>(),
+        EchoMode::BytesAdmittedTimeout => {
+            builder.launch::<BytesEchoHandler<BYTES_ADMITTED_TIMEOUT>>()
+        }
     }
     .expect("failed to launch ringline server");
 
@@ -814,6 +946,9 @@ fn run_ringline(cfg: EchoCfg) {
     let mode = match echo_mode {
         EchoMode::Copy => "copy",
         EchoMode::Forward => "forward",
+        EchoMode::BytesNowait => "bytes-nowait",
+        EchoMode::BytesAdmitted => "bytes-admitted",
+        EchoMode::BytesAdmittedTimeout => "bytes-admitted-timeout",
     };
     eprintln!(
         "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, service_time={service_time_us}us/req)"
@@ -825,6 +960,18 @@ fn run_ringline(cfg: EchoCfg) {
     // teardown skips that, hiding the server-side loop diagnostics.)
     shutdown.wait_on_signal();
     dump_runtime_metrics(metrics_out.as_deref());
+    if matches!(
+        echo_mode,
+        EchoMode::BytesNowait | EchoMode::BytesAdmitted | EchoMode::BytesAdmittedTimeout
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "bench-server: bytes_send_failed={} admit_timeouts={} settle_timeouts={}",
+            BYTES_SEND_FAILED.load(Relaxed),
+            ADMIT_TIMEOUTS.load(Relaxed),
+            SETTLE_TIMEOUTS.load(Relaxed)
+        );
+    }
 
     for h in handles {
         h.join().ok();
