@@ -100,6 +100,11 @@ pub struct SendCopyPool {
     passing_held: usize,
     // The largest `passing_held` has been.
     passing_peak: usize,
+    // The largest F + B (main-region free slots plus `passing_held`) since
+    // `take_free_plus_passing_peak` last read it, kept while the pool tracks
+    // passing slots. F + B rises only when a slot or reservation that no
+    // passing send holds comes back, so the returns update it.
+    free_plus_passing_peak: usize,
     // Set between `begin_passing` and `end_passing`: every slot and
     // reservation taken meanwhile is marked as passing.
     marking: bool,
@@ -160,6 +165,7 @@ impl SendCopyPool {
             passing: Vec::new(),
             passing_held: 0,
             passing_peak: 0,
+            free_plus_passing_peak: 0,
             marking: false,
             small_slot_size,
             small_count,
@@ -224,6 +230,28 @@ impl SendCopyPool {
     /// completes).
     pub(crate) fn passing_held(&self) -> usize {
         self.passing_held
+    }
+
+    /// The largest F + B (free slots plus [`passing_held`](Self::passing_held))
+    /// since the last call, or now if larger, and start the next window at
+    /// now. `Bounded` and `BoundedIdle` close a head's latch on it, so a
+    /// moment of F + B >= H between two admission checks is not missed when
+    /// a send outside the FIFO takes slots in between. 0 when the pool does
+    /// not track passing slots.
+    pub(crate) fn take_free_plus_passing_peak(&mut self) -> usize {
+        if self.passing.is_empty() {
+            return 0;
+        }
+        let now = self.free_count() + self.passing_held;
+        std::mem::replace(&mut self.free_plus_passing_peak, now).max(now)
+    }
+
+    /// Record F + B after a return, while the pool tracks passing slots.
+    fn note_free_plus_passing(&mut self) {
+        if !self.passing.is_empty() {
+            let now = self.free_count() + self.passing_held;
+            self.free_plus_passing_peak = self.free_plus_passing_peak.max(now);
+        }
     }
 
     /// The largest [`passing_held`](Self::passing_held) has been since the
@@ -523,6 +551,7 @@ impl SendCopyPool {
         if r.passing {
             self.return_passing(returned);
         }
+        self.note_free_plus_passing();
     }
 
     /// Return the unfilled remainder of a reservation to the pool. A passing
@@ -544,6 +573,7 @@ impl SendCopyPool {
             self.return_passing(r.remaining);
         }
         r.remaining = 0; // satisfies the Drop debug_assert
+        self.note_free_plus_passing();
     }
 
     /// Release a slot back to the free list (called on Send CQE).
@@ -590,6 +620,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = 0;
         if idx < self.count {
             self.free_list.push(idx);
+            self.note_free_plus_passing();
         } else {
             self.small_free_list.push(idx);
         }
@@ -1205,6 +1236,35 @@ mod tests {
         let (again, _p, _l) = pool.copy_in(b"x").unwrap();
         pool.release(again);
         assert_eq!(pool.passing_held(), 0);
+    }
+
+    /// The F + B peak covers the moments between reads: a return raises it,
+    /// a later allocation does not lower it, and a read starts the next
+    /// window at the current F + B. Without passing slots tracked it is 0.
+    #[test]
+    fn the_free_plus_passing_peak_covers_the_moments_between_reads() {
+        let mut pool = SendCopyPool::new(8, 8);
+        assert_eq!(pool.take_free_plus_passing_peak(), 0, "untracked");
+        pool.track_passing();
+        let held: Vec<u16> = (0..3).map(|_| pool.copy_in(b"x").unwrap().0).collect();
+        assert_eq!(pool.take_free_plus_passing_peak(), 5);
+        pool.release(held[0]);
+        pool.copy_in(b"y").unwrap();
+        pool.copy_in(b"z").unwrap();
+        assert_eq!(pool.free_count(), 4);
+        assert_eq!(
+            pool.take_free_plus_passing_peak(),
+            6,
+            "the moment after the release"
+        );
+        assert_eq!(
+            pool.take_free_plus_passing_peak(),
+            4,
+            "a new window starts at now"
+        );
+        let r = pool.reserve_slots(2).unwrap();
+        pool.release_reservation(r);
+        assert_eq!(pool.take_free_plus_passing_peak(), 4);
     }
 
     /// An allocation made while marking is paused is not counted, and

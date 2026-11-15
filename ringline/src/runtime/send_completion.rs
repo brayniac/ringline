@@ -224,16 +224,38 @@ pub(crate) struct PoolView {
     pub(crate) slots: usize,
     /// Slots of the small region available, under `SplitPool`.
     pub(crate) small_free: usize,
+    /// The largest F + B since the previous view taken with
+    /// [`take`](Self::take), for the latch of `Bounded` and `BoundedIdle`;
+    /// 0 when unknown, and then `free + passing` is all the latch reads.
+    pub(crate) free_plus_passing_peak: usize,
 }
 
 impl PoolView {
-    /// The figures of `pool` now.
+    /// The figures of `pool` now, with no F + B peak. Tests only: the
+    /// runtime reads the peak with every view.
+    #[cfg(test)]
     pub(crate) fn of(pool: &SendCopyPool) -> Self {
+        Self::with_peak(pool, 0)
+    }
+
+    /// The figures of `pool` now, with the largest F + B since the previous
+    /// `take` (`SendCopyPool::take_free_plus_passing_peak`), which starts the
+    /// next window. The window can begin before the current head became the
+    /// head, so a head's latch can close on a moment of its predecessor's
+    /// wait; that errs towards letting less pass.
+    pub(crate) fn take(pool: &mut SendCopyPool) -> Self {
+        let peak = pool.take_free_plus_passing_peak();
+        Self::with_peak(pool, peak)
+    }
+
+    /// The figures of `pool` now, with `free_plus_passing_peak` as given.
+    pub(crate) fn with_peak(pool: &SendCopyPool, free_plus_passing_peak: usize) -> Self {
         PoolView {
             free: pool.free_count(),
             passing: pool.passing_held(),
             slots: pool.slot_count(),
             small_free: pool.small_free_count(),
+            free_plus_passing_peak,
         }
     }
 }
@@ -1166,18 +1188,15 @@ impl SendCompletions {
     }
 
     /// Under `Bounded` and `BoundedIdle`, close `head`'s latch if
-    /// F + B >= H. Called by every admission check and scan, so the latch
-    /// closes the first time one of them sees it; a moment between two
-    /// checks when it held is not seen. F + B rises only when a slot that no
-    /// passing send holds returns, which sets the release hook's wake, so
-    /// without sends outside the FIFO it falls back below H only when the
-    /// head changes, and no moment is missed.
+    /// F + B >= H now, or was at some moment since the previous admission
+    /// check or scan (`pool.free_plus_passing_peak`, which the pool raises on
+    /// every return). Called by every admission check and scan.
     fn observe_latch(&mut self, head: SendId, head_needs: usize, pool: PoolView) {
         if matches!(
             self.order,
             SendAdmissionOrder::Bounded | SendAdmissionOrder::BoundedIdle
         ) && self.latched_head != Some(head)
-            && pool.free + pool.passing >= head_needs
+            && (pool.free + pool.passing).max(pool.free_plus_passing_peak) >= head_needs
         {
             self.latched_head = Some(head);
             if pool.free < head_needs {
@@ -1732,7 +1751,8 @@ impl Executor {
     }
 
     /// The event loops' end-of-iteration capacity wake, with the worker's
-    /// copy pool. Under `Strict`, [`wake_send_capacity`](Self::wake_send_capacity)
+    /// copy pool and its F + B peak since the last read
+    /// (`SendCopyPool::take_free_plus_passing_peak`). Under `Strict`, [`wake_send_capacity`](Self::wake_send_capacity)
     /// with the free count, as before the other orders existed. Under the
     /// others, [`SendCompletions::scan`] plus a wake of every task it
     /// returns; `idle` answers the connection test of `BoundedIdle` and
@@ -1740,6 +1760,7 @@ impl Executor {
     pub(crate) fn wake_send_capacity_in(
         &mut self,
         pool: &SendCopyPool,
+        free_plus_passing_peak: usize,
         idle: impl Fn(u32) -> bool,
     ) {
         if self.send_completions.order() == SendAdmissionOrder::Strict {
@@ -1747,8 +1768,8 @@ impl Executor {
             return;
         }
         let mut wakes = std::mem::take(&mut self.send_completions.wake_scratch);
-        self.send_completions
-            .scan(PoolView::of(pool), idle, &mut wakes);
+        let view = PoolView::with_peak(pool, free_plus_passing_peak);
+        self.send_completions.scan(view, idle, &mut wakes);
         for task_id in wakes.drain(..) {
             let _ = self.wake_task(task_id);
         }
@@ -2487,6 +2508,7 @@ mod tests {
             passing,
             slots,
             small_free: 0,
+            free_plus_passing_peak: 0,
         }
     }
 
@@ -2936,6 +2958,7 @@ mod tests {
             passing: 0,
             slots: 8,
             small_free,
+            free_plus_passing_peak: 0,
         }
     }
 
@@ -3124,6 +3147,7 @@ mod tests {
             passing,
             slots: 16,
             small_free: 0,
+            free_plus_passing_peak: 0,
         };
         assert_eq!(q.admit(older, budget(2), true, idle), Admit::Wait);
         let newer = q.enqueue(3, 0, 1, task(3));
@@ -3131,6 +3155,29 @@ mod tests {
         assert_eq!(
             q.admit(older, budget(1), false, idle),
             Admit::Pass { slots: 1 }
+        );
+    }
+
+    /// `Bounded` closes the latch on a moment of F + B >= H that the pool
+    /// saw between two checks, although F + B is below H at the check.
+    #[test]
+    fn bounded_latches_on_a_moment_between_checks() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+        q.enqueue(1, 0, 6, task(1));
+        let w = q.enqueue(2, 0, 1, task(2));
+        let view = |peak| PoolView {
+            free: 3,
+            passing: 0,
+            slots: 8,
+            small_free: 0,
+            free_plus_passing_peak: peak,
+        };
+        assert_eq!(q.admit(w, view(5), true, idle), Admit::Pass { slots: 1 });
+        assert_eq!(q.admit(w, view(6), true, idle), Admit::Wait, "F + B was 6");
+        assert_eq!(
+            q.admit(w, view(0), true, idle),
+            Admit::Wait,
+            "and stays latched"
         );
     }
 }

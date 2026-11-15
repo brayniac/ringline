@@ -4292,7 +4292,7 @@ impl Admission<'_> {
             }
             None
         } else {
-            let pool = PoolView::of(&driver.send_copy_pool);
+            let pool = PoolView::take(&mut driver.send_copy_pool);
             match executor.send_capacity_admit(id, pool, first_poll, |conn| driver.send_idle(conn))
             {
                 Admit::Wait => return pending(cx),

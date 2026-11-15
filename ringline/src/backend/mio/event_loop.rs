@@ -1614,9 +1614,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn wake_capacity_if_released(&mut self) {
         if self.driver.capacity_released || self.executor.send_scan_due() {
             self.driver.capacity_released = false;
+            let peak = self.driver.send_copy_pool.take_free_plus_passing_peak();
             let driver = &self.driver;
             self.executor
-                .wake_send_capacity_in(&driver.send_copy_pool, |conn| driver.send_idle(conn));
+                .wake_send_capacity_in(&driver.send_copy_pool, peak, |conn| driver.send_idle(conn));
         }
     }
 
