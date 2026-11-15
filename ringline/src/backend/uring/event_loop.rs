@@ -17046,14 +17046,45 @@ mod tests {
         plain_send(&mut el, outside, &FOUR);
         assert_eq!(el.driver.send_copy_pool.free_count(), 12);
         let release = never();
-        let (first, _) = waiting_send(&mut el, head, &FOURTEEN, release.clone(), move || {
-            outside.send_nowait(&THREE).expect("queued");
-        });
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran2 = ran.clone();
+        macro_rules! diag {
+            ($at:expr) => {
+                eprintln!(
+                    "DIAG {}: free={} ran={} counters={:?}",
+                    $at,
+                    el.driver.send_copy_pool.free_count(),
+                    ran.get(),
+                    el.executor
+                        .send_admission_counters(&el.driver.send_copy_pool)
+                );
+            };
+        }
+        diag!("start");
+        let (first, first_rec) =
+            waiting_send(&mut el, head, &FOURTEEN, release.clone(), move || {
+                let r = outside.send_nowait(&THREE);
+                eprintln!(
+                    "DIAG after(): send_nowait -> {:?}",
+                    r.as_ref().map_err(|e| e.to_string())
+                );
+                ran2.set(true);
+            });
+        diag!("first queued");
+        eprintln!("DIAG first_rec={:?} first_idx={first}", first_rec.get());
         // On the first's connection, so it cannot pass it.
         let (_, second) = waiting_send(&mut el, head, &TEN, never(), || {});
+        diag!("second queued");
+        eprintln!("DIAG second={:?}", second.get());
         release.set(true);
         el.executor.ready_queue.push_back(first | STANDALONE_BIT);
         el.poll_ready_tasks();
+        diag!("released");
+        eprintln!(
+            "DIAG first_rec={:?} second={:?}",
+            first_rec.get(),
+            second.get()
+        );
         assert_eq!(el.driver.send_copy_pool.free_count(), 9);
         assert_eq!(second.get(), None, "the second waits: 9 < 10");
         let (_, small) = waiting_send(&mut el, other, &ONE, never(), || {});
