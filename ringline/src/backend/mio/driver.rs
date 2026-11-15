@@ -1844,21 +1844,23 @@ pub(crate) mod tests {
     /// Under the idle orders mio keeps the flag by the rule io_uring keeps:
     /// a send queued when a write finds the socket full waited, and an
     /// awaited send leaves whether the sends since the previous one waited as
-    /// the connection's flag. Here a plain send and an awaited one are both
-    /// queued at the `WouldBlock`, so the drained connection is still not
-    /// idle; an awaited send that completes without waiting makes it idle.
+    /// the connection's flag. Here both sends are awaited: the first fills
+    /// the socket, and the second, queued behind it at the `WouldBlock`, is
+    /// marked only by `waited_entries`, so the drained connection is still
+    /// not idle. An awaited send that completes without waiting makes it
+    /// idle.
     #[test]
     fn an_awaited_send_queued_at_a_full_socket_leaves_the_connection_not_idle() {
         let (mut driver, _wake, conn_index, mut client) = idle_order_driver();
         let conn = token(&driver, conn_index);
-        let ids = bounded_ids(2);
+        let ids = bounded_ids(3);
         driver
             .make_ctx()
-            .send(conn, &vec![b'f'; ROOM_FILL])
+            .send_awaited(conn, &vec![b'f'; ROOM_FILL], ids[0])
             .expect("queued");
         driver
             .make_ctx()
-            .send_awaited(conn, b"end", ids[0])
+            .send_awaited(conn, b"end", ids[1])
             .expect("queued");
         let (all_flushed, _) = driver.flush_sends(conn_index).expect("flush");
         assert!(!all_flushed, "the socket filled");
@@ -1871,7 +1873,7 @@ pub(crate) mod tests {
 
         driver
             .make_ctx()
-            .send_awaited(conn, b"x", ids[1])
+            .send_awaited(conn, b"x", ids[2])
             .expect("queued");
         drain(&mut driver, conn_index, &mut client, 1);
         assert!(

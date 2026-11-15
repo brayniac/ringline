@@ -152,9 +152,12 @@ pub enum SendAdmissionOrder {
     Bounded,
     /// As `Bounded`, and only a waiter whose connection has no send queued or
     /// in flight and whose most recent send did not wait for room in the
-    /// socket (O4). How each backend decides that a send waited is in
-    /// `ConnSendState::room_waited`; with every send on the connection
-    /// awaited, the two agree on this rule.
+    /// socket (O4). Both backends keep the flag by one rule
+    /// (`ConnSendState::room_waited`), but count different sends as having
+    /// waited when replies are pipelined: mio every send queued when a write
+    /// returned `WouldBlock`, io_uring only a send whose own submission came
+    /// back short or with `EAGAIN`. With one reply in flight per connection
+    /// they agree.
     BoundedIdle,
     /// A waiter passes while B plus its own slots is at most the smaller of
     /// this many slots and P - H (O7). No latch.
@@ -226,10 +229,10 @@ pub(crate) struct PoolView {
     pub(crate) slots: usize,
     /// Slots of the small region available, under `SplitPool`.
     pub(crate) small_free: usize,
-    /// The largest F + B at a return since the previous view taken with
-    /// [`take`](Self::take), for the latch of `Bounded` and `BoundedIdle`;
-    /// 0 when there was none or it is unknown, and then `free + passing` is
-    /// all the latch reads.
+    /// The largest F + B at a return, or at the latest head change, since
+    /// the previous view taken with [`take`](Self::take), for the latch of
+    /// `Bounded` and `BoundedIdle`; 0 when there was none or it is unknown,
+    /// and then `free + passing` is all the latch reads.
     pub(crate) free_plus_passing_peak: usize,
 }
 
@@ -241,21 +244,17 @@ impl PoolView {
         Self::with_peak(pool, 0)
     }
 
-    /// The figures of `pool` now, with the largest F + B at a return since
-    /// the previous `take` (`SendCopyPool::take_free_plus_passing_peak`),
-    /// which starts the next window empty.
+    /// The figures of `pool` now, with the largest F + B since the previous
+    /// `take` (`SendCopyPool::take_free_plus_passing_peak`): at a return, or
+    /// when the head last changed, which restarts the window at F + B then
+    /// (`Executor::restart_send_window_if_head_changed`). The take starts the
+    /// next window empty.
     ///
-    /// A head that changes because its predecessor was admitted starts with
-    /// an empty window: the admission check took the window, and the admitted
-    /// head's own reservation follows it with no return in between. A head
-    /// that changes by a cancel or a teardown inherits the returns since the
-    /// last check, which belong to its predecessor's wait. Resetting the
-    /// window there would need the pool in `SendCompletions::cancel` and
-    /// `remove_connection`, which a future's `Drop` and the release path
-    /// reach with the executor alone. The latch then closes early only if
-    /// F + B reached the new head's need at such a return and fell back below
-    /// it before the head changed, which needs a send outside the FIFO to
-    /// take the slots in between.
+    /// So the window covers the current head's wait from the moment it
+    /// became the head, and nothing of its predecessor's: a send outside the
+    /// FIFO that lowers F + B after the change cannot hide that moment, and
+    /// returns made during the predecessor's wait cannot close the new
+    /// head's latch.
     pub(crate) fn take(pool: &mut SendCopyPool) -> Self {
         let peak = pool.take_free_plus_passing_peak();
         Self::with_peak(pool, peak)
@@ -454,15 +453,23 @@ pub(crate) struct SendCompletions {
     /// `Strict`.
     next_seq: u32,
     /// The number of the latest scan that looked behind the head, under the
-    /// orders that pass; never 0, which `woken_in` uses for none.
+    /// orders that pass; 0 until the first such scan, and never 0 after it,
+    /// since `woken_in` uses 0 for none.
     scan_epoch: u32,
     /// Under `Bounded` and `BoundedIdle`, the head while whose wait
     /// F + B >= H has been seen: nothing passes it. A later head is another
     /// id, so the latch opens when the head changes.
     latched_head: Option<SendId>,
+    /// The FIFO's head changed, under an order other than `Strict`, since
+    /// the last [`take_head_changed`](Self::take_head_changed): the latch's
+    /// window has to restart at F + B now.
+    head_changed: bool,
     /// A [`scan`](Self::scan) is due at the end of the event-loop iteration.
-    /// Set only under an order other than `Strict`, when a waiter leaves the
-    /// waiting state and when a later poll of a waiter is told to wait.
+    /// Set only under an order other than `Strict`: when a waiter leaves the
+    /// waiting state, when a later poll of a waiter is told to wait, when any
+    /// poll is told to wait because an older waiter takes the room
+    /// ([`admit`](Self::admit)), and by a scan that woke passers, for the
+    /// scan after it.
     scan_due: bool,
     /// The task ids a scan wakes, kept between scans by
     /// [`Executor::wake_send_capacity_in`] so that a scan allocates only
@@ -836,6 +843,7 @@ impl SendCompletions {
             // the pop it always had.
             if self.order != SendAdmissionOrder::Strict {
                 self.compact_if_mostly_stale();
+                self.head_changed = true;
             }
             self.head_task()
         } else {
@@ -920,6 +928,9 @@ impl SendCompletions {
                 self.remove(id);
                 self.left_waiting();
                 if was_head {
+                    if self.order != SendAdmissionOrder::Strict {
+                        self.head_changed = true;
+                    }
                     return self.head_task();
                 }
             }
@@ -1241,10 +1252,10 @@ impl SendCompletions {
     }
 
     /// Under `Bounded` and `BoundedIdle`, close `head`'s latch if
-    /// F + B >= H now, or was at a return since the previous admission check
-    /// or scan (`pool.free_plus_passing_peak`). Called by every admission
-    /// check and scan. See [`PoolView::take`] for when that window can hold a
-    /// moment of the previous head's wait.
+    /// F + B >= H now, or was at a return or when `head` became the head,
+    /// since the previous admission check or scan
+    /// (`pool.free_plus_passing_peak`, [`PoolView::take`]). Called by every
+    /// admission check and scan.
     fn observe_latch(&mut self, head: SendId, head_needs: usize, pool: PoolView) {
         if matches!(
             self.order,
@@ -1277,6 +1288,14 @@ impl SendCompletions {
         })
     }
 
+    /// Whether the FIFO's head changed since the last call, under an order
+    /// other than `Strict`, and forget it. Set when the head is admitted,
+    /// cancelled, aborted, failed by `shutdown_write` or released with its
+    /// connection.
+    pub(crate) fn take_head_changed(&mut self) -> bool {
+        std::mem::take(&mut self.head_changed)
+    }
+
     /// Whether a [`scan`](Self::scan) is due: the event loop runs its
     /// capacity wake at the end of the iteration when this is set, as it
     /// does when slots came back.
@@ -1287,7 +1306,8 @@ impl SendCompletions {
     /// The capacity wake under an order other than `Strict`, and the scan
     /// [`scan_due`](Self::scan_due) asks for: push onto `wakes` the head's
     /// task if the head fits, and otherwise the tasks of the waiters behind
-    /// it that could pass, oldest first. Clears `scan_due`. Under `SplitPool`,
+    /// it that could pass, oldest first. Clears `scan_due`, and sets it again
+    /// if it woke a passer, so that the next scan runs. Under `SplitPool`,
     /// [`scan_split`](Self::scan_split) instead.
     ///
     /// Each waiter woken is counted against the free slots, and against the
@@ -1534,10 +1554,13 @@ impl SendCompletions {
     /// If the head changed from `old_head`, push the new head's task onto
     /// `wakes`.
     fn wake_new_head(&mut self, old_head: Option<SendId>, wakes: &mut Vec<u32>) {
-        if self.front() != old_head
-            && let Some(next) = self.head_task()
-        {
-            wakes.push(next);
+        if self.front() != old_head {
+            if self.order != SendAdmissionOrder::Strict {
+                self.head_changed = true;
+            }
+            if let Some(next) = self.head_task() {
+                wakes.push(next);
+            }
         }
     }
 
@@ -1812,6 +1835,19 @@ impl Executor {
             main_free: pool.free_count() as u64,
             small_free: pool.small_free_count() as u64,
             ..self.send_completions.counters
+        }
+    }
+
+    /// If the FIFO's head changed since the last call
+    /// ([`SendCompletions::take_head_changed`]), restart the latch's F + B
+    /// window at F + B now (`SendCopyPool::restart_free_plus_passing_window`).
+    /// Called after every executor call that can change the head, where the
+    /// pool is at hand: `Admission`'s submit, cancel and abandon paths and
+    /// its `Drop`, `ConnCtx::abort`, `shutdown_write`, and the backends'
+    /// connection release.
+    pub(crate) fn restart_send_window_if_head_changed(&mut self, pool: &mut SendCopyPool) {
+        if self.send_completions.take_head_changed() {
+            pool.restart_free_plus_passing_window();
         }
     }
 
@@ -2587,6 +2623,14 @@ mod tests {
         true
     }
 
+    /// What the runtime does after each call that can change the head
+    /// (`Executor::restart_send_window_if_head_changed`).
+    fn restart_if_head_changed(q: &mut SendCompletions, copy_pool: &mut SendCopyPool) {
+        if q.take_head_changed() {
+            copy_pool.restart_free_plus_passing_window();
+        }
+    }
+
     /// The task ids `scan` wakes for `view`, every connection idle.
     fn scanned(q: &mut SendCompletions, view: PoolView) -> Vec<u32> {
         let mut wakes = Vec::new();
@@ -3301,6 +3345,7 @@ mod tests {
             }
             copy_pool.release_reservation(reservation);
             q.mark_submitted(first);
+            restart_if_head_changed(&mut q, &mut copy_pool);
             // The end-of-iteration scan its admission asks for.
             let peak = copy_pool.take_free_plus_passing_peak();
             q.scan(
@@ -3391,5 +3436,142 @@ mod tests {
         assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
         assert!(q.scan_due(), "the next scan is due");
         assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(3)]);
+    }
+
+    /// A head that becomes the head when its predecessor is admitted, with
+    /// F + B >= its need at that moment, latches although a send outside the
+    /// FIFO lowers F + B before the next check: the window restarts at the
+    /// head change. mio's shape, where the admitted head holds its permit
+    /// unfilled, so no return records F + B.
+    #[test]
+    fn a_head_admitted_then_a_send_outside_the_fifo_still_latches_the_next() {
+        let mut copy_pool = SendCopyPool::new(16, 8);
+        copy_pool.track_passing();
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+        let first = q.enqueue(1, 0, 4, task(1));
+        q.enqueue(2, 0, 10, task(2));
+        let w = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(first, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Head
+        );
+        let permit = copy_pool.reserve_slots(4).unwrap();
+        q.mark_submitted(first);
+        restart_if_head_changed(&mut q, &mut copy_pool);
+        assert_eq!(copy_pool.free_count() + copy_pool.passing_held(), 12);
+        let outside: Vec<u16> = (0..3).map(|_| copy_pool.copy_in(b"o").unwrap().0).collect();
+        assert_eq!(
+            q.admit(w, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Wait,
+            "F + B was 12 >= 10 when the second became the head"
+        );
+        for slot in outside {
+            copy_pool.release(slot);
+        }
+        copy_pool.release_reservation(permit);
+    }
+
+    /// The same, in io_uring's shape: the admitted head's slots are filled
+    /// from its reservation.
+    #[test]
+    fn a_head_admitted_from_a_filled_reservation_still_latches_the_next() {
+        let mut copy_pool = SendCopyPool::new(16, 8);
+        copy_pool.track_passing();
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+        let first = q.enqueue(1, 0, 4, task(1));
+        q.enqueue(2, 0, 10, task(2));
+        let w = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(first, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Head
+        );
+        let mut reservation = copy_pool.reserve_slots(4).unwrap();
+        let held: Vec<u16> = (0..4)
+            .map(|_| copy_pool.copy_in_reserved(&mut reservation, b"h").0)
+            .collect();
+        copy_pool.release_reservation(reservation);
+        q.mark_submitted(first);
+        restart_if_head_changed(&mut q, &mut copy_pool);
+        let outside: Vec<u16> = (0..3).map(|_| copy_pool.copy_in(b"o").unwrap().0).collect();
+        assert_eq!(
+            q.admit(w, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Wait
+        );
+        for slot in outside.into_iter().chain(held) {
+            copy_pool.release(slot);
+        }
+    }
+
+    /// A head that becomes the head when its predecessor is cancelled, with
+    /// F + B >= its need at that moment, latches although a send outside the
+    /// FIFO lowers F + B before the next check.
+    #[test]
+    fn a_cancelled_head_then_a_send_outside_the_fifo_still_latches_the_next() {
+        let mut copy_pool = SendCopyPool::new(16, 8);
+        copy_pool.track_passing();
+        let plain: Vec<u16> = (0..4).map(|_| copy_pool.copy_in(b"p").unwrap().0).collect();
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+        let first = q.enqueue(1, 0, 14, task(1));
+        // On the first's connection, so it cannot pass it.
+        let second = q.enqueue(1, 0, 10, task(2));
+        let w = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(second, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Wait,
+            "12 < 14: no latch while the first is the head"
+        );
+        assert_eq!(q.cancel(first), Some(task(2)));
+        restart_if_head_changed(&mut q, &mut copy_pool);
+        let outside: Vec<u16> = (0..3).map(|_| copy_pool.copy_in(b"o").unwrap().0).collect();
+        assert_eq!(
+            q.admit(w, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Wait,
+            "F + B was 12 >= 10 when the second became the head"
+        );
+        for slot in outside.into_iter().chain(plain) {
+            copy_pool.release(slot);
+        }
+    }
+
+    /// Every way the head changes is flagged, and a waiter that leaves from
+    /// behind the head is not; `Strict` flags nothing.
+    #[test]
+    fn every_head_change_is_flagged_and_nothing_else() {
+        let ways: [fn(&mut SendCompletions, SendId); 5] = [
+            |q, head| {
+                q.mark_submitted(head);
+            },
+            |q, head| {
+                q.cancel(head);
+            },
+            |q, _| {
+                q.remove_connection(1);
+            },
+            |q, _| {
+                q.fail_waiting(1, 0, io::ErrorKind::BrokenPipe, "shut down");
+            },
+            |q, _| {
+                q.abort_connection(1, 0);
+            },
+        ];
+        for (n, change) in ways.iter().enumerate() {
+            let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+            let head = q.enqueue(1, 0, 6, task(1));
+            let behind = q.enqueue(2, 0, 1, task(2));
+            q.enqueue(3, 0, 1, task(3));
+            q.cancel(behind);
+            assert!(
+                !q.take_head_changed(),
+                "way {n}: a waiter behind the head left"
+            );
+            change(&mut q, head);
+            assert!(q.take_head_changed(), "way {n}");
+            assert!(!q.take_head_changed(), "way {n}: taken once");
+        }
+        let mut q = SendCompletions::new();
+        let head = q.enqueue(1, 0, 6, task(1));
+        q.enqueue(2, 0, 1, task(2));
+        q.cancel(head);
+        assert!(!q.take_head_changed(), "Strict");
     }
 }

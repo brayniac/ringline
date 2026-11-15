@@ -4117,8 +4117,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         crate::runtime::io::with_driver_state(
             &mut self.driver,
             &mut self.executor,
-            |_, executor| {
+            |driver, executor| {
                 executor.remove_connection(conn_index);
+                executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
             },
         );
         // The future just dropped may have owned a half, whose `Drop` finds
@@ -16943,6 +16944,36 @@ mod tests {
         assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
         assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
         assert!(!el.driver.send_slab.in_use(slab_idx));
+    }
+
+    /// Under `BoundedIdle` a coalesced run that settles two awaited sends
+    /// ends one wait: when the run came back short and waited for room, the
+    /// connection is not idle once both have settled. Calling
+    /// `end_logical_send` once per settled send, the second call would clear
+    /// what the first recorded, and this would fail.
+    #[test]
+    fn a_coalesced_run_that_waited_leaves_its_connection_not_idle() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .send_admission_order(crate::SendAdmissionOrder::BoundedIdle)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
+        // One byte of five: the run waits for room.
+        el.test_dispatch_cqe(ud.raw(), 1, 0);
+        assert!(el.driver.send_queues[conn_index as usize].room_waited);
+        // Room: the rest is resubmitted and goes out whole.
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), 4, 0);
+        assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
+        assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
+        assert!(!el.driver.send_idle(conn_index), "the run waited for room");
     }
 
     /// A partial write that covers the first send settles it at once; an

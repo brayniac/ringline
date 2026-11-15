@@ -240,16 +240,26 @@ impl SendCopyPool {
     /// a send outside the FIFO takes slots in between. 0 when the pool does
     /// not track passing slots.
     ///
-    /// The window starts empty, not at F + B now: the admission check that
-    /// reads it is followed, in the same call, by the admitted head taking
-    /// its slots, and F + B before that reservation belongs to that head's
-    /// wait, not to the next head's.
+    /// The window starts empty, not at F + B now: F + B at a check belongs
+    /// to the head of that moment, and the next head's window starts when it
+    /// becomes the head ([`restart_free_plus_passing_window`](Self::restart_free_plus_passing_window)).
     pub(crate) fn take_free_plus_passing_peak(&mut self) -> usize {
         if self.passing.is_empty() {
             return 0;
         }
         let now = self.free_count() + self.passing_held;
         std::mem::take(&mut self.free_plus_passing_peak).max(now)
+    }
+
+    /// Start the window at F + B now, at the moment the FIFO's head changed:
+    /// what the window held belonged to the old head, and F + B now is a
+    /// moment of the new head's wait, which a send outside the FIFO could
+    /// lower before the next check reads the window. Called after every
+    /// head change (`Executor::restart_send_window_if_head_changed`).
+    pub(crate) fn restart_free_plus_passing_window(&mut self) {
+        if !self.passing.is_empty() {
+            self.free_plus_passing_peak = self.free_count() + self.passing_held;
+        }
     }
 
     /// Record F + B after a return, while the pool tracks passing slots.
