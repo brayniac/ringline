@@ -1569,6 +1569,52 @@ mod tests {
         assert!(!exec.send_capacity_turn(next, 8));
     }
 
+    /// The end-of-iteration wake with the pool: under `Strict` it is the
+    /// head wake, which never wakes a waiter behind the head; under an order
+    /// that passes, it wakes the waiter that can pass a head that does not
+    /// fit, and under `BoundedIdle` and `BudgetIdle` only once the waiter's
+    /// connection is idle.
+    #[test]
+    fn wake_send_capacity_in_wakes_who_the_order_admits() {
+        use crate::buffer::send_copy::SendCopyPool;
+        use send_completion::SendAdmissionOrder;
+
+        for order in [
+            SendAdmissionOrder::Strict,
+            SendAdmissionOrder::FirstFit,
+            SendAdmissionOrder::BoundedIdle,
+            SendAdmissionOrder::BudgetIdle(8),
+        ] {
+            let mut exec = Executor::new(8, 8, 8, 0, 0);
+            exec.set_send_admission_order(order);
+            let mut pool = SendCopyPool::new(8, 64);
+            if order != SendAdmissionOrder::Strict {
+                pool.track_passing();
+            }
+            for _ in 0..4 {
+                pool.copy_in(b"held").unwrap();
+            }
+            let a = parked_standalone(&mut exec);
+            let b = parked_standalone(&mut exec);
+            exec.enqueue_send_capacity(2, 1, 6, a);
+            exec.enqueue_send_capacity(5, 1, 1, b);
+
+            exec.wake_send_capacity_in(&pool, |_| false);
+            let busy = exec.ready_queue.pop_front();
+            exec.wake_send_capacity_in(&pool, |_| true);
+            let idle = exec.ready_queue.pop_front();
+            match order {
+                SendAdmissionOrder::Strict => {
+                    assert_eq!((busy, idle), (None, None), "nothing passes");
+                    assert_eq!(exec.send_capacity_wakes, 0, "the head does not fit");
+                }
+                // Woken once: the task is Ready and not queued again.
+                SendAdmissionOrder::FirstFit => assert_eq!((busy, idle), (Some(b), None)),
+                _ => assert_eq!((busy, idle), (None, Some(b)), "{order:?}: only once idle"),
+            }
+        }
+    }
+
     #[test]
     fn owner_task_routes_recv_wakeup() {
         let mut exec = Executor::new(16, 4, 4, 0, 0);

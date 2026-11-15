@@ -260,6 +260,11 @@ pub(crate) struct Driver {
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released permit. The event loop clears it.
     pub(crate) capacity_released: bool,
+    /// Keep each connection's `room_waited` and `send_waited`, and set
+    /// `capacity_released` when a connection's queue drains: the worker's
+    /// order is `SendAdmissionOrder::BoundedIdle` or `BudgetIdle`, which read
+    /// them (`send_idle`). Off under every other order.
+    pub(crate) track_room_waits: bool,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
     /// The peer each UDP socket is `connect(2)`ed to, parallel to
@@ -518,6 +523,9 @@ impl Driver {
                 } else {
                     pool.no_huge_pages();
                 }
+                if config.send_admission_order != crate::SendAdmissionOrder::Strict {
+                    pool.track_passing();
+                }
                 pool
             },
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
@@ -575,6 +583,7 @@ impl Driver {
             forward_hold_cap: config.forward_hold_cap,
             settled_sends: VecDeque::new(),
             capacity_released: false,
+            track_room_waits: config.send_admission_order.needs_idle_connection(),
             udp_sockets,
             udp_connected_peers,
             udp_gro: config.udp_gro,
@@ -841,6 +850,10 @@ impl Driver {
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
         self.send_queues[idx].close_notify_deadline = None;
+        if self.track_room_waits {
+            self.send_queues[idx].room_waited = false;
+            self.send_queues[idx].send_waited = false;
+        }
 
         // The future dropped at teardown may have owned a half, whose `Drop`
         // queues an orphan that finds a changed generation. Clear the flags
@@ -980,6 +993,17 @@ impl Driver {
         }
     }
 
+    /// Whether `conn_index` has nothing queued to write and its most recent
+    /// send did not wait for room in the socket: the condition
+    /// `SendAdmissionOrder::BoundedIdle` and `BudgetIdle` put on the
+    /// connection of a send that passes a waiting head. mio keeps a connection's unwritten sends
+    /// in `pending_sends`, not in `ConnSendState`'s `queue` and `in_flight`.
+    /// Meaningful only while `track_room_waits` is set.
+    pub(crate) fn send_idle(&self, conn_index: u32) -> bool {
+        let idx = conn_index as usize;
+        self.pending_sends[idx].is_empty() && !self.send_queues[idx].room_waited
+    }
+
     /// Flush pending sends for a connection. Called by the event loop when
     /// the connection becomes writable.
     ///
@@ -1002,6 +1026,9 @@ impl Driver {
         };
 
         let mut total_written: u32 = 0;
+        // Under `BoundedIdle` and `BudgetIdle`, whether this flush can end a
+        // busy queue.
+        let had_sends = self.track_room_waits && !self.pending_sends[idx].is_empty();
 
         // Use writev() to coalesce multiple pending sends into a single
         // syscall, reducing TCP segment count under pipelining.
@@ -1048,6 +1075,12 @@ impl Driver {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
+                    // Under `BoundedIdle` and `BudgetIdle` the queued sends
+                    // waited for room (`ConnSendState::room_waited`).
+                    if self.track_room_waits {
+                        self.send_queues[idx].room_waited = true;
+                        self.send_queues[idx].send_waited = true;
+                    }
                     // Queue survives this flush — keep the dirty invariant.
                     self.mark_send_dirty(idx);
                     return Ok((false, total_written));
@@ -1082,6 +1115,13 @@ impl Driver {
                             self.settled_sends.push_back((id, Ok(len)));
                         }
                         self.pending_sends[idx].pop_front();
+                        // A send that completes under `BoundedIdle` and
+                        // `BudgetIdle` leaves whether it waited as the
+                        // connection's most recent.
+                        if self.track_room_waits {
+                            let state = &mut self.send_queues[idx];
+                            state.room_waited = state.send_waited;
+                        }
                     } else {
                         entry.offset += remaining;
                         remaining = 0;
@@ -1090,6 +1130,15 @@ impl Driver {
                     break;
                 }
             }
+        }
+
+        // All sends flushed. Under `BoundedIdle` and `BudgetIdle` the
+        // connection is idle, so a waiter on it may now pass a waiting head:
+        // the end-of-iteration capacity wake looks for it. The next send
+        // starts a new wait.
+        if had_sends {
+            self.send_queues[idx].send_waited = false;
+            self.capacity_released = true;
         }
 
         // All sends flushed. A deferred half-close goes out only now, after

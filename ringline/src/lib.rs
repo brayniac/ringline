@@ -414,6 +414,9 @@ pub use runtime::select::Select3;
 pub use runtime::select::select;
 /// Poll three futures concurrently, returning whichever completes first.
 pub use runtime::select::select3;
+/// The order in which a worker admits bounded sends. Experiment option.
+#[doc(hidden)]
+pub use runtime::send_completion::SendAdmissionOrder;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 /// Why a task's handle did not produce a value: it panicked or was cancelled.

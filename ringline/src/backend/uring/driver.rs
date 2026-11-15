@@ -881,6 +881,11 @@ pub(crate) struct Driver {
     /// leave teardown's released slots unsignalled until after a
     /// `submit_and_wait` that can block.
     pub(crate) capacity_released: bool,
+    /// Keep each connection's `room_waited` and `send_waited`, and set
+    /// `capacity_released` when a connection's sends go idle: the worker's
+    /// order is `SendAdmissionOrder::BoundedIdle` or `BudgetIdle`, which read
+    /// them (`send_idle`). Off under every other order.
+    pub(crate) track_room_waits: bool,
     /// Connections whose Close is owed to the event loop's end-of-iteration
     /// drain, which runs `try_finalize_close` for each. `close_connection`
     /// (read error, task exit, setup failure) registers a
@@ -1124,6 +1129,9 @@ impl Driver {
         } else {
             send_copy_pool.no_huge_pages();
         }
+        if config.send_admission_order != crate::SendAdmissionOrder::Strict {
+            send_copy_pool.track_passing();
+        }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
         let mut accumulators = AccumulatorTable::new_with_max(
             config.max_connections,
@@ -1299,6 +1307,7 @@ impl Driver {
             settled_sends: VecDeque::new(),
             recv_aborts: VecDeque::new(),
             capacity_released: false,
+            track_room_waits: config.send_admission_order.needs_idle_connection(),
             pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
             copy_retry_scratch: Vec::new(),
@@ -1446,6 +1455,10 @@ impl Driver {
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;
         state.on_send_backstop = false;
+        if self.track_room_waits {
+            state.room_waited = false;
+            state.send_waited = false;
+        }
         self.disarm_close_notify_deadline(conn_index);
         // A previous occupant's awaited send can still be sitting in the
         // queue here (its close abandoned the drain); the new occupant must
@@ -2222,11 +2235,29 @@ impl Driver {
     /// iteration, and each iteration after until the ring takes it. Nothing
     /// is dropped or released on that path (Domain Invariant 7).
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
-        // Clear the finished send's wait state.
+        // Clear the finished send's wait state. Under `BoundedIdle` and
+        // `BudgetIdle` its having waited for room becomes the connection's
+        // `room_waited`.
         let state = &mut self.send_queues[conn_index as usize];
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;
+        if self.track_room_waits {
+            state.room_waited = std::mem::take(&mut state.send_waited);
+        }
         self.submit_next_queued_inner(conn_index)
+    }
+
+    /// Whether `conn_index` has no send queued or in flight, no chain
+    /// active, and its most recent send did not wait for room in the
+    /// socket: the condition `SendAdmissionOrder::BoundedIdle` and
+    /// `BudgetIdle` put on the connection of a send that passes a waiting
+    /// head. Meaningful only while `track_room_waits` is set.
+    pub(crate) fn send_idle(&self, conn_index: u32) -> bool {
+        let state = &self.send_queues[conn_index as usize];
+        state.queue.is_empty()
+            && !state.in_flight
+            && !state.room_waited
+            && !self.chain_table.is_active(conn_index)
     }
 
     /// [`submit_next_queued`](Self::submit_next_queued) without clearing the
@@ -2279,6 +2310,12 @@ impl Driver {
         // Queue empty: the connection is idle.
         state.in_flight = false;
         state.parked = false;
+        // Under `BoundedIdle` and `BudgetIdle` a waiter on this connection
+        // may now pass a waiting head; the end-of-iteration capacity wake
+        // looks for it.
+        if self.track_room_waits {
+            self.capacity_released = true;
+        }
         // Submit a deferred shutdown_write now that the queue is drained.
         if let Some(cs) = self.connections.get_mut(conn_index)
             && matches!(cs.write, WriteHalf::ShutdownPending)
