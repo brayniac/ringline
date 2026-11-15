@@ -205,6 +205,19 @@ impl SendCopyPool {
         self.marking = false;
     }
 
+    /// Stop marking for an allocation inside a passing send's call that is
+    /// not the send's own (a close_notify queued by the close that a failed
+    /// encryption forces), and return whether marking was on, for
+    /// [`resume_passing`](Self::resume_passing).
+    pub(crate) fn pause_passing(&mut self) -> bool {
+        std::mem::take(&mut self.marking)
+    }
+
+    /// Restore the marking [`pause_passing`](Self::pause_passing) returned.
+    pub(crate) fn resume_passing(&mut self, marking: bool) {
+        self.marking = marking;
+    }
+
     /// The slots held by sends admitted past a waiting head: marked slots
     /// not yet released, plus the unfilled remainder of their reservations
     /// (mio holds a bounded send's whole permit unfilled until the send
@@ -1192,6 +1205,23 @@ mod tests {
         let (again, _p, _l) = pool.copy_in(b"x").unwrap();
         pool.release(again);
         assert_eq!(pool.passing_held(), 0);
+    }
+
+    /// An allocation made while marking is paused is not counted, and
+    /// marking resumes as it was.
+    #[test]
+    fn a_paused_passing_send_does_not_mark() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        pool.begin_passing();
+        let marking = pool.pause_passing();
+        pool.copy_in(b"alert").unwrap();
+        assert_eq!(pool.passing_held(), 0, "taken while paused");
+        pool.resume_passing(marking);
+        pool.copy_in(b"reply").unwrap();
+        assert_eq!(pool.passing_held(), 1, "marking resumed");
+        pool.end_passing();
+        assert!(!pool.pause_passing(), "nothing to pause after end_passing");
     }
 
     /// A passing reservation counts its whole size at once, as mio's permit

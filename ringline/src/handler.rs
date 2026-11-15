@@ -862,7 +862,13 @@ impl<'a> DriverCtx<'a> {
                         // failure consumed sequence numbers whose ciphertext
                         // will never reach the wire, which is fatal for the
                         // connection, not just for this send.
+                        //
+                        // The close queues a close_notify into pool slots.
+                        // Those belong to no passing send, so a send that was
+                        // passing a head stops marking around it.
+                        let marking = self.send_copy_pool.pause_passing();
                         self.close(conn);
+                        self.send_copy_pool.resume_passing(marking);
                         return Err(e);
                     }
                 };
