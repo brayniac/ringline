@@ -2251,13 +2251,16 @@ impl Driver {
         self.submit_next_queued_inner(conn_index)
     }
 
-    /// An awaited send on `conn_index` completed: the completion that settles
-    /// its id, which ends the logical send whatever number of SQEs carried
-    /// its chunks. Under `BoundedIdle` and `BudgetIdle`, whether any of them
-    /// waited for room becomes the connection's `room_waited`, and the next
-    /// send starts with none. A send without an id (`send_nowait`) ends no
-    /// logical send here: a wait of its is carried to the next one that
-    /// does, and its `room_waited` stays set meanwhile.
+    /// A completion on `conn_index` settled one or more awaited sends, which
+    /// ends them whatever number of SQEs carried their chunks. Call it once
+    /// per completion, not once per send it settles: the sends of one
+    /// completion waited or not together, and a second call would clear
+    /// what the first recorded. Under `BoundedIdle` and `BudgetIdle`,
+    /// whether any SQE since the previous call waited for room becomes the
+    /// connection's `room_waited`, and the next send starts with none. A
+    /// send without an id (`send_nowait`) ends nothing here: a wait of its
+    /// carries to the next completion that does, and the `room_waited` that
+    /// `wait_for_room` set stays meanwhile.
     pub(crate) fn end_logical_send(&mut self, conn_index: u32) {
         if self.track_room_waits {
             let state = &mut self.send_queues[conn_index as usize];

@@ -1217,3 +1217,315 @@ fn bounded_idle_admits_once_the_connection_s_last_send_did_not_wait() {
     let woken = run_wakes(ringline::SendAdmissionOrder::BoundedIdle, b'i');
     assert_eq!(woken.room_waited, (true, Some(true)), "{woken:?}");
 }
+
+// ── The latch of a head admitted after a large send ─────────────────────
+
+/// What [`Latcher`] saw: whether the head waited, whether a send to a
+/// reading peer was admitted past it at its first poll, and the latch
+/// closings counted.
+static LATCHED: Mutex<Option<(bool, Option<bool>, u64)>> = Mutex::new(None);
+
+/// One 4-slot send on its connection, whose peer does not read, leaves four
+/// of the eight slots free and B at 0; then a 6-slot head waits, and a
+/// 1-slot send to a reading peer is polled once.
+struct Latcher;
+
+impl AsyncEventHandler for Latcher {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            static FOUR: [u8; 4 * SLOT] = [1; 4 * SLOT];
+            static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
+            static ONE: [u8; SLOT] = [3; SLOT];
+            let (reader_addr, _) = PEERS.lock().unwrap().expect("peers");
+            fill(&mut conn);
+            let queued = conn.send_admitted(&FOUR).await.expect("admitted");
+            let mut head = conn.send_admitted(&HEAD);
+            let head_waited = poll_once(&mut head).await.is_pending();
+            let mut reader = ringline::connect(reader_addr)
+                .await
+                .expect("connect the reader");
+            let mut small = reader.send_admitted(&ONE);
+            let passed = match poll_once(&mut small).await {
+                Poll::Ready(Ok(sent)) => Some(sent.passed_head()),
+                Poll::Ready(Err(_)) => Some(false),
+                Poll::Pending => None,
+            };
+            let closings = ringline::send_admission_counters().latch_closings;
+            drop(small);
+            drop(head);
+            drop(queued);
+            conn.abort();
+            *LATCHED.lock().unwrap() = Some((head_waited, passed, closings));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        Latcher
+    }
+}
+
+/// Under `Bounded` and `BoundedIdle` a head that becomes the head after a
+/// large admission starts with its latch open: F + B is 4 < 6 throughout its
+/// wait, so a 1-slot send passes it and no latch closes, as under
+/// `FirstFit`.
+#[test]
+fn a_head_after_a_large_admission_starts_with_its_latch_open() {
+    for order in [
+        ringline::SendAdmissionOrder::FirstFit,
+        ringline::SendAdmissionOrder::Bounded,
+        ringline::SendAdmissionOrder::BoundedIdle,
+    ] {
+        let _serial = serial();
+        *LATCHED.lock().unwrap() = None;
+        let reader = TcpListener::bind("127.0.0.1:0").expect("bind the reader");
+        *PEERS.lock().unwrap() = Some((reader.local_addr().unwrap(), reader.local_addr().unwrap()));
+        // Not joined, as in `run_order`.
+        std::thread::spawn(move || {
+            let (mut stream, _) = reader.accept().expect("accept the reader");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(SLOTS, SLOT as u32)
+            .send_admission_order(order)
+            .build()
+            .expect("valid config");
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<Latcher>()
+            .expect("launch");
+        let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+        peer.write_all(b"l").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let seen = loop {
+            if let Some(seen) = LATCHED.lock().unwrap().take() {
+                break seen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{order:?}: the task never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        drop(peer);
+        runtime.shutdown();
+        common::join_workers(&runtime, handles);
+        assert_eq!(seen, (true, Some(true), 0), "{order:?}");
+    }
+}
+
+// ── An older waiter its task does not poll ──────────────────────────────
+
+/// What [`Unpolled`] saw: whether the older waiter's first poll waited,
+/// whether the newer one's did, and whether the newer one was admitted
+/// while the older one was still held, unpolled.
+static UNPOLLED: Mutex<Option<(bool, bool, Option<bool>)>> = Mutex::new(None);
+
+/// On its connection, whose peer does not read, four slots held and a
+/// 6-slot head waiting, as in [`pass_the_head`]. A 4-slot send to a reading
+/// peer takes the four free slots; a 1-slot waiter on another connection is
+/// polled once and then held unpolled; once the four slots come back, a
+/// 4-slot waiter is parked.
+struct Unpolled;
+
+impl AsyncEventHandler for Unpolled {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            static QUEUED: [u8; SLOT] = [1; SLOT];
+            static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
+            static ONE: [u8; SLOT] = [3; SLOT];
+            static FOUR: [u8; 4 * SLOT] = [4; 4 * SLOT];
+            let (first_addr, second_addr) = PEERS.lock().unwrap().expect("peers");
+            fill(&mut conn);
+            let mut queued = Vec::new();
+            for _ in 0..4 {
+                queued.push(conn.send_admitted(&QUEUED).await.expect("admitted"));
+            }
+            let mut head = conn.send_admitted(&HEAD);
+            let _ = poll_once(&mut head).await;
+            let mut first = ringline::connect(first_addr)
+                .await
+                .expect("connect the first reader");
+            let mut second = ringline::connect(second_addr)
+                .await
+                .expect("connect the second reader");
+            let mut all_four = first.send_admitted(&FOUR);
+            let Poll::Ready(Ok(sent)) = poll_once(&mut all_four).await else {
+                *UNPOLLED.lock().unwrap() = Some((false, false, None));
+                return;
+            };
+            let mut older = second.send_admitted(&ONE);
+            let older_waited = poll_once(&mut older).await.is_pending();
+            let _ = sent.await;
+            let newer = park(first.send_admitted(&FOUR)).await;
+            let newer_waited = newer.first_waited.get();
+            let admitted = resolved_soon(&newer).await;
+            drop(older);
+            drop(head);
+            conn.abort();
+            *UNPOLLED.lock().unwrap() = Some((older_waited, newer_waited, admitted));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        Unpolled
+    }
+}
+
+/// Under `FirstFit` an older waiter that its task holds without polling
+/// keeps the room it was woken for only until the next scan: a newer waiter
+/// that fits is then admitted while the older one is still held.
+#[test]
+fn an_older_waiter_its_task_does_not_poll_does_not_hold_back_a_newer_one() {
+    let _serial = serial();
+    *UNPOLLED.lock().unwrap() = None;
+    let first = TcpListener::bind("127.0.0.1:0").expect("bind the first reader");
+    let second = TcpListener::bind("127.0.0.1:0").expect("bind the second reader");
+    *PEERS.lock().unwrap() = Some((first.local_addr().unwrap(), second.local_addr().unwrap()));
+    // Not joined, as in `run_order`.
+    for listener in [first, second] {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept a reader");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+    }
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .send_admission_order(ringline::SendAdmissionOrder::FirstFit)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Unpolled>()
+        .expect("launch");
+    let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    peer.write_all(b"u").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let seen = loop {
+        if let Some(seen) = UNPOLLED.lock().unwrap().take() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "the task never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(peer);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    assert_eq!(
+        seen,
+        (true, true, Some(true)),
+        "(older waited, newer waited, newer admitted)"
+    );
+}
+
+// ── SplitPool and TLS ───────────────────────────────────────────────────
+
+/// What [`TlsSplitter`] saw: the result of a small bounded send on its TLS
+/// connection, and the small FIFO's admissions after it.
+static TLS_SPLIT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+/// Reads one request on its TLS connection and answers it with a small
+/// bounded send.
+struct TlsSplitter;
+
+impl AsyncEventHandler for TlsSplitter {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            let sent = match conn.send_admitted(b"small reply").await {
+                Ok(sent) => outcome(sent.await),
+                Err(e) => format!("refused: {e}"),
+            };
+            let admissions = ringline::send_admission_counters().small_admissions;
+            *TLS_SPLIT.lock().unwrap() = Some((sent, admissions));
+            let _ = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSplitter
+    }
+}
+
+/// Under `SplitPool` a bounded send on a TLS connection takes the main
+/// region whatever its size, so its records reach the peer encrypted and the
+/// small FIFO admits nothing.
+#[test]
+fn split_pool_keeps_tls_sends_in_the_main_region() {
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+
+    let _serial = serial();
+    *TLS_SPLIT.lock().unwrap() = None;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = CertificateDer::from(cert.cert);
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let tls = ringline::TlsConfig::builder()
+        .cert(vec![der.clone()], key.into())
+        .build()
+        .expect("tls config");
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .send_admission_order(ringline::SendAdmissionOrder::SplitPool {
+            small_slots: 2,
+            small_slot_size: 1024,
+        })
+        .tls(tls)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSplitter>()
+        .expect("launch");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let client = rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+    let sock = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut stream = rustls::StreamOwned::new(client, sock);
+    stream.write_all(b"request").expect("handshake and write");
+    let mut reply = [0u8; 11];
+    stream.read_exact(&mut reply).expect("the reply, decrypted");
+    assert_eq!(&reply, b"small reply");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        if let Some(seen) = TLS_SPLIT.lock().unwrap().take() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "the TLS task never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        seen,
+        ("Ok: 11".to_string(), 0),
+        "(the send, small admissions)"
+    );
+    drop(stream);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
