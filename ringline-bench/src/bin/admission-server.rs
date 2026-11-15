@@ -108,6 +108,50 @@ enum SmallSend {
     Send,
 }
 
+/// The order in which the worker admits `send_admitted` replies
+/// (`ringline::SendAdmissionOrder`, an experiment option of the runtime on
+/// Experiment C's work branch). The design's names are in each variant's
+/// doc.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Order {
+    /// O0: only the head of the FIFO is admitted.
+    Strict,
+    /// O2.
+    FirstFit,
+    /// O3.
+    Bounded,
+    /// O4.
+    BoundedIdle,
+    /// O7, with R = `--budget`.
+    Budget,
+    /// O7w, with R = `--budget`.
+    BudgetIdle,
+}
+
+impl Order {
+    fn runtime(self, budget: u16) -> ringline::SendAdmissionOrder {
+        match self {
+            Order::Strict => ringline::SendAdmissionOrder::Strict,
+            Order::FirstFit => ringline::SendAdmissionOrder::FirstFit,
+            Order::Bounded => ringline::SendAdmissionOrder::Bounded,
+            Order::BoundedIdle => ringline::SendAdmissionOrder::BoundedIdle,
+            Order::Budget => ringline::SendAdmissionOrder::Budget(budget),
+            Order::BudgetIdle => ringline::SendAdmissionOrder::BudgetIdle(budget),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Order::Strict => "strict",
+            Order::FirstFit => "first-fit",
+            Order::Bounded => "bounded",
+            Order::BoundedIdle => "bounded-idle",
+            Order::Budget => "budget",
+            Order::BudgetIdle => "budget-idle",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "admission-server",
@@ -116,12 +160,17 @@ enum SmallSend {
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]
     addr: SocketAddr,
-    /// How replies of at most `--small-max` bytes are sent: `admitted` is
-    /// order O0, `send` is O1. The other orders need a runtime option; a flag
-    /// that selects one belongs beside this one, and `send_reply` is the one
-    /// place that chooses the call.
+    /// How replies of at most `--small-max` bytes are sent: `admitted` waits
+    /// under `--order`, `send` is O1. `send_reply` is the one place that
+    /// chooses the call.
     #[arg(long, value_enum)]
     small_send: SmallSend,
+    /// The order `send_admitted` waits under.
+    #[arg(long, value_enum, default_value = "strict")]
+    order: Order,
+    /// R, in slots, for `--order budget` and `budget-idle`.
+    #[arg(long, default_value_t = 32)]
+    budget: u16,
     #[arg(long, default_value_t = 4096)]
     small_max: u32,
     #[arg(long)]
@@ -280,6 +329,9 @@ struct LargeRecord {
 struct Sample {
     at_ns: u64,
     held: [u64; 3],
+    /// B: the slots held by sends admitted past a head, as the runtime
+    /// counts them (`SendAdmissionCounters::passing_held`).
+    passing_held: u64,
 }
 
 /// What `main` prints at shutdown, beyond the counters. Only requests with
@@ -300,6 +352,13 @@ struct Recorder {
     samples: Vec<Sample>,
     /// The earliest and latest scheduled time of a recorded request.
     window_ns: Option<(u64, u64)>,
+    /// Per class, admitted replies the runtime admitted past a head, and
+    /// how long each held its slots: from admission until it settled, in
+    /// microseconds (settled ones only).
+    passed: [u64; 3],
+    passing_hold_us: [Vec<u32>; 3],
+    /// The runtime's admission counters at the last sample.
+    counters: Option<ringline::SendAdmissionCounters>,
 }
 
 static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
@@ -310,6 +369,9 @@ static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
     large: Vec::new(),
     samples: Vec::new(),
     window_ns: None,
+    passed: [0; 3],
+    passing_hold_us: [Vec::new(), Vec::new(), Vec::new()],
+    counters: None,
 });
 
 fn recorder() -> std::sync::MutexGuard<'static, Recorder> {
@@ -351,6 +413,10 @@ struct Pending {
     recorded: bool,
     /// Its index in `Recorder::large`.
     large: Option<usize>,
+    /// Whether the runtime admitted it past a waiting head.
+    passed: bool,
+    /// When it was admitted.
+    admitted: Instant,
 }
 
 impl Drop for Pending {
@@ -410,6 +476,10 @@ impl Unsettled {
         large: Option<usize>,
     ) {
         HELD[class].fetch_add(slots, Relaxed);
+        let passed = sent.passed_head();
+        if passed && recorded {
+            recorder().passed[class] += 1;
+        }
         self.queue.push_back(Pending {
             sent,
             since: Instant::now(),
@@ -417,6 +487,8 @@ impl Unsettled {
             slots,
             recorded,
             large,
+            passed,
+            admitted: Instant::now(),
         });
     }
 
@@ -481,6 +553,10 @@ impl Unsettled {
         if ok {
             count(&COUNTERS.replies, front.class);
             record_end(&front, Ended::Settled);
+            if front.passed && front.recorded {
+                let held = front.admitted.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                recorder().passing_hold_us[front.class].push(held);
+            }
         } else {
             count(&COUNTERS.failed, front.class);
             record_end(&front, Ended::Failed);
@@ -697,6 +773,7 @@ async fn sample_held() {
     loop {
         next = (next + interval).max(mono_ns());
         ringline::sleep(Duration::from_nanos(next.saturating_sub(mono_ns()))).await;
+        let counters = ringline::send_admission_counters();
         let sample = Sample {
             at_ns: mono_ns(),
             held: [
@@ -704,8 +781,11 @@ async fn sample_held() {
                 HELD[SLOW].load(Relaxed),
                 HELD[LARGE].load(Relaxed),
             ],
+            passing_held: counters.passing_held,
         };
-        recorder().samples.push(sample);
+        let mut r = recorder();
+        r.samples.push(sample);
+        r.counters = Some(counters);
     }
 }
 
@@ -745,6 +825,7 @@ fn spread(v: &mut [u32]) -> Value {
 /// to `to_ns`, and how many there were.
 fn held_mean(samples: &[Sample], from_ns: u64, to_ns: u64) -> Value {
     let mut sum = [0u64; 3];
+    let mut passing = 0u64;
     let mut n = 0u64;
     for s in samples
         .iter()
@@ -753,6 +834,7 @@ fn held_mean(samples: &[Sample], from_ns: u64, to_ns: u64) -> Value {
         for (total, held) in sum.iter_mut().zip(s.held) {
             *total += held;
         }
+        passing += s.passing_held;
         n += 1;
     }
     let mean = |c: usize| (n > 0).then(|| sum[c] as f64 / n as f64);
@@ -760,6 +842,7 @@ fn held_mean(samples: &[Sample], from_ns: u64, to_ns: u64) -> Value {
         "small_fast": mean(FAST),
         "small_slow": mean(SLOW),
         "large": mean(LARGE),
+        "passing_held": (n > 0).then(|| passing as f64 / n as f64),
         "samples": n,
     })
 }
@@ -781,6 +864,8 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
                 "scheduled_us": spread(&mut r.scheduled_us[c]),
                 "wait_us": spread(&mut r.wait_us[c]),
                 "beyond_admit_limit": beyond,
+                "passed": r.passed[c],
+                "passing_hold_us": spread(&mut r.passing_hold_us[c]),
                 "not_admitted": {
                     "admit_timeout": not[Unadmitted::AdmitTimeout as usize],
                     "refused": not[Unadmitted::Refused as usize],
@@ -820,6 +905,15 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
         "classes": classes,
         "large_replies": large,
         "held_run": held_mean(&r.samples, 0, u64::MAX),
+        "admission_counters": r.counters.map(|c| json!({
+            "passing_admissions": c.passing_admissions,
+            "passing_slots": c.passing_slots,
+            "passing_held": c.passing_held,
+            "passing_held_max": c.passing_held_max,
+            "latch_closings": c.latch_closings,
+            "wake_scans": c.wake_scans,
+            "scan_wakes": c.scan_wakes,
+        })),
         "held_window": window,
         "window_ns": r.window_ns.map(|(lo, hi)| [lo, hi]),
     })
@@ -843,6 +937,7 @@ fn main() {
         .core_offset(args.cpu)
         .max_connections(4096)
         .send_pool(args.pool_slots, args.slot_size)
+        .send_admission_order(args.order.runtime(args.budget))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -889,6 +984,8 @@ fn main() {
                 "failed": OUTSIDE[2].load(Relaxed),
             },
             "small_send": small_send,
+            "order": args.order.name(),
+            "budget": args.budget,
             "admit_limit_ms": args.admit_limit_ms,
             "settle_limit_ms": args.settle_limit_ms,
             "pipeline": args.pipeline,
