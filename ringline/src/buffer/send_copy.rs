@@ -100,10 +100,11 @@ pub struct SendCopyPool {
     passing_held: usize,
     // The largest `passing_held` has been.
     passing_peak: usize,
-    // The largest F + B (main-region free slots plus `passing_held`) since
-    // `take_free_plus_passing_peak` last read it, kept while the pool tracks
-    // passing slots. F + B rises only when a slot or reservation that no
-    // passing send holds comes back, so the returns update it.
+    // The largest F + B (main-region free slots plus `passing_held`) seen at
+    // a return since `take_free_plus_passing_peak` last read it, 0 if none;
+    // kept while the pool tracks passing slots. F + B rises only when a slot
+    // or reservation that no passing send holds comes back, so the returns
+    // update it.
     free_plus_passing_peak: usize,
     // Set between `begin_passing` and `end_passing`: every slot and
     // reservation taken meanwhile is marked as passing.
@@ -233,17 +234,22 @@ impl SendCopyPool {
     }
 
     /// The largest F + B (free slots plus [`passing_held`](Self::passing_held))
-    /// since the last call, or now if larger, and start the next window at
-    /// now. `Bounded` and `BoundedIdle` close a head's latch on it, so a
+    /// now or at any return since the last call, and start the next window
+    /// empty. `Bounded` and `BoundedIdle` close a head's latch on it, so a
     /// moment of F + B >= H between two admission checks is not missed when
     /// a send outside the FIFO takes slots in between. 0 when the pool does
     /// not track passing slots.
+    ///
+    /// The window starts empty, not at F + B now: the admission check that
+    /// reads it is followed, in the same call, by the admitted head taking
+    /// its slots, and F + B before that reservation belongs to that head's
+    /// wait, not to the next head's.
     pub(crate) fn take_free_plus_passing_peak(&mut self) -> usize {
         if self.passing.is_empty() {
             return 0;
         }
         let now = self.free_count() + self.passing_held;
-        std::mem::replace(&mut self.free_plus_passing_peak, now).max(now)
+        std::mem::take(&mut self.free_plus_passing_peak).max(now)
     }
 
     /// Record F + B after a return, while the pool tracks passing slots.
@@ -1260,8 +1266,13 @@ mod tests {
         assert_eq!(
             pool.take_free_plus_passing_peak(),
             4,
-            "a new window starts at now"
+            "a new window has only now"
         );
+        // A read just before an allocation: the window after it does not keep
+        // the figure from before.
+        let taken = pool.copy_in(b"w").unwrap().0;
+        assert_eq!(pool.take_free_plus_passing_peak(), 3, "not the 4 before it");
+        pool.release(taken);
         let r = pool.reserve_slots(2).unwrap();
         pool.release_reservation(r);
         assert_eq!(pool.take_free_plus_passing_peak(), 4);

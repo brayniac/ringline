@@ -1217,3 +1217,105 @@ fn bounded_idle_admits_once_the_connection_s_last_send_did_not_wait() {
     let woken = run_wakes(ringline::SendAdmissionOrder::BoundedIdle, b'i');
     assert_eq!(woken.room_waited, (true, Some(true)), "{woken:?}");
 }
+
+// ── The latch of a head admitted after a large send ─────────────────────
+
+/// What [`Latcher`] saw: whether the head waited, whether a send to a
+/// reading peer was admitted past it at its first poll, and the latch
+/// closings counted.
+static LATCHED: Mutex<Option<(bool, Option<bool>, u64)>> = Mutex::new(None);
+
+/// One 4-slot send on its connection, whose peer does not read, leaves four
+/// of the eight slots free and B at 0; then a 6-slot head waits, and a
+/// 1-slot send to a reading peer is polled once.
+struct Latcher;
+
+impl AsyncEventHandler for Latcher {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            static FOUR: [u8; 4 * SLOT] = [1; 4 * SLOT];
+            static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
+            static ONE: [u8; SLOT] = [3; SLOT];
+            let (reader_addr, _) = PEERS.lock().unwrap().expect("peers");
+            fill(&mut conn);
+            let queued = conn.send_admitted(&FOUR).await.expect("admitted");
+            let mut head = conn.send_admitted(&HEAD);
+            let head_waited = poll_once(&mut head).await.is_pending();
+            let mut reader = ringline::connect(reader_addr)
+                .await
+                .expect("connect the reader");
+            let mut small = reader.send_admitted(&ONE);
+            let passed = match poll_once(&mut small).await {
+                Poll::Ready(Ok(sent)) => Some(sent.passed_head()),
+                Poll::Ready(Err(_)) => Some(false),
+                Poll::Pending => None,
+            };
+            let closings = ringline::send_admission_counters().latch_closings;
+            drop(small);
+            drop(head);
+            drop(queued);
+            conn.abort();
+            *LATCHED.lock().unwrap() = Some((head_waited, passed, closings));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        Latcher
+    }
+}
+
+/// Under `Bounded` and `BoundedIdle` a head that becomes the head after a
+/// large admission starts with its latch open: F + B is 4 < 6 throughout its
+/// wait, so a 1-slot send passes it and no latch closes, as under
+/// `FirstFit`.
+#[test]
+fn a_head_after_a_large_admission_starts_with_its_latch_open() {
+    for order in [
+        ringline::SendAdmissionOrder::FirstFit,
+        ringline::SendAdmissionOrder::Bounded,
+        ringline::SendAdmissionOrder::BoundedIdle,
+    ] {
+        let _serial = serial();
+        *LATCHED.lock().unwrap() = None;
+        let reader = TcpListener::bind("127.0.0.1:0").expect("bind the reader");
+        *PEERS.lock().unwrap() = Some((reader.local_addr().unwrap(), reader.local_addr().unwrap()));
+        // Not joined, as in `run_order`.
+        std::thread::spawn(move || {
+            let (mut stream, _) = reader.accept().expect("accept the reader");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(SLOTS, SLOT as u32)
+            .send_admission_order(order)
+            .build()
+            .expect("valid config");
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<Latcher>()
+            .expect("launch");
+        let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+        peer.write_all(b"l").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let seen = loop {
+            if let Some(seen) = LATCHED.lock().unwrap().take() {
+                break seen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{order:?}: the task never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        drop(peer);
+        runtime.shutdown();
+        common::join_workers(&runtime, handles);
+        assert_eq!(seen, (true, Some(true), 0), "{order:?}");
+    }
+}

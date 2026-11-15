@@ -224,9 +224,10 @@ pub(crate) struct PoolView {
     pub(crate) slots: usize,
     /// Slots of the small region available, under `SplitPool`.
     pub(crate) small_free: usize,
-    /// The largest F + B since the previous view taken with
+    /// The largest F + B at a return since the previous view taken with
     /// [`take`](Self::take), for the latch of `Bounded` and `BoundedIdle`;
-    /// 0 when unknown, and then `free + passing` is all the latch reads.
+    /// 0 when there was none or it is unknown, and then `free + passing` is
+    /// all the latch reads.
     pub(crate) free_plus_passing_peak: usize,
 }
 
@@ -238,11 +239,21 @@ impl PoolView {
         Self::with_peak(pool, 0)
     }
 
-    /// The figures of `pool` now, with the largest F + B since the previous
-    /// `take` (`SendCopyPool::take_free_plus_passing_peak`), which starts the
-    /// next window. The window can begin before the current head became the
-    /// head, so a head's latch can close on a moment of its predecessor's
-    /// wait; that errs towards letting less pass.
+    /// The figures of `pool` now, with the largest F + B at a return since
+    /// the previous `take` (`SendCopyPool::take_free_plus_passing_peak`),
+    /// which starts the next window empty.
+    ///
+    /// A head that changes because its predecessor was admitted starts with
+    /// an empty window: the admission check took the window, and the admitted
+    /// head's own reservation follows it with no return in between. A head
+    /// that changes by a cancel or a teardown inherits the returns since the
+    /// last check, which belong to its predecessor's wait. Resetting the
+    /// window there would need the pool in `SendCompletions::cancel` and
+    /// `remove_connection`, which a future's `Drop` and the release path
+    /// reach with the executor alone. The latch then closes early only if
+    /// F + B reached the new head's need at such a return and fell back below
+    /// it before the head changed, which needs a send outside the FIFO to
+    /// take the slots in between.
     pub(crate) fn take(pool: &mut SendCopyPool) -> Self {
         let peak = pool.take_free_plus_passing_peak();
         Self::with_peak(pool, peak)
@@ -1188,9 +1199,10 @@ impl SendCompletions {
     }
 
     /// Under `Bounded` and `BoundedIdle`, close `head`'s latch if
-    /// F + B >= H now, or was at some moment since the previous admission
-    /// check or scan (`pool.free_plus_passing_peak`, which the pool raises on
-    /// every return). Called by every admission check and scan.
+    /// F + B >= H now, or was at a return since the previous admission check
+    /// or scan (`pool.free_plus_passing_peak`). Called by every admission
+    /// check and scan. See [`PoolView::take`] for when that window can hold a
+    /// moment of the previous head's wait.
     fn observe_latch(&mut self, head: SendId, head_needs: usize, pool: PoolView) {
         if matches!(
             self.order,
@@ -3195,6 +3207,46 @@ mod tests {
                 Admit::Wait,
                 "{order:?}: latched by the scan"
             );
+        }
+    }
+
+    /// The next head does not inherit the F + B its predecessor saw before
+    /// it reserved: H1 (4 slots) is admitted with 8 free, H2 (6 slots)
+    /// becomes the head with F = 4 and B = 0, so F + B stays 4 < 6 through
+    /// H2's wait, and a 1-slot waiter passes under `Bounded`.
+    #[test]
+    fn the_next_head_does_not_inherit_its_predecessor_s_free_plus_passing() {
+        for order in [SendAdmissionOrder::Bounded, SendAdmissionOrder::BoundedIdle] {
+            let mut copy_pool = SendCopyPool::new(8, 8);
+            copy_pool.track_passing();
+            let mut q = SendCompletions::with_order(order);
+            let first = q.enqueue(1, 0, 4, task(1));
+            q.enqueue(2, 0, 6, task(2));
+            let w = q.enqueue(3, 0, 1, task(3));
+            // The first head's own poll and submit, as `Admission` makes them.
+            assert_eq!(
+                q.admit(first, PoolView::take(&mut copy_pool), true, idle),
+                Admit::Head
+            );
+            let mut reservation = copy_pool.reserve_slots(4).unwrap();
+            for _ in 0..4 {
+                copy_pool.copy_in_reserved(&mut reservation, b"h");
+            }
+            copy_pool.release_reservation(reservation);
+            q.mark_submitted(first);
+            // The end-of-iteration scan its admission asks for.
+            let peak = copy_pool.take_free_plus_passing_peak();
+            q.scan(
+                PoolView::with_peak(&copy_pool, peak),
+                |_| true,
+                &mut Vec::new(),
+            );
+            assert_eq!(
+                q.admit(w, PoolView::take(&mut copy_pool), true, idle),
+                Admit::Pass { slots: 1 },
+                "{order:?}: F + B was 4 < 6 throughout the second head's wait"
+            );
+            assert_eq!(q.counters.latch_closings, 0, "{order:?}");
         }
     }
 }
