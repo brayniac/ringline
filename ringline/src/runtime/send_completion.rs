@@ -157,7 +157,9 @@ pub enum SendAdmissionOrder {
     /// waited when replies are pipelined: mio every send queued when a write
     /// returned `WouldBlock`, io_uring only a send whose own submission came
     /// back short or with `EAGAIN`. With one reply in flight per connection
-    /// they agree.
+    /// they agree, but for a short write that the next write completes:
+    /// io_uring counts any short completion as a wait, mio only a write that
+    /// returned `WouldBlock`.
     BoundedIdle,
     /// A waiter passes while B plus its own slots is at most the smaller of
     /// this many slots and P - H (O7). No latch.
@@ -3477,7 +3479,10 @@ mod tests {
     }
 
     /// The same, in io_uring's shape: the admitted head's slots are filled
-    /// from its reservation.
+    /// from its reservation. This passes without the restart: returning the
+    /// reservation's empty remainder records F + B before `mark_submitted`,
+    /// so the window already holds the 12. It checks that shape, not the
+    /// restart.
     #[test]
     fn a_head_admitted_from_a_filled_reservation_still_latches_the_next() {
         let mut copy_pool = SendCopyPool::new(16, 8);
