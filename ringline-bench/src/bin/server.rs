@@ -175,11 +175,14 @@ enum EchoMode {
     Forward,
     /// `with_bytes`, then `send_nowait` after the closure returns. The
     /// baseline of Experiment B (`docs/send-admission-design.md`, section 4).
-    /// `bytes-nowait` and `bytes-admitted` differ only in the send call;
-    /// `bytes-admitted-await` and `bytes-admitted-timeout` also await the
-    /// reply's settlement before the next read, which arms the next receive
-    /// after the send completes.
+    /// `bytes-nowait`, `bytes-send` and `bytes-admitted` differ only in the
+    /// send call; `bytes-admitted-await` and `bytes-admitted-timeout` also
+    /// await the reply's settlement before the next read, which arms the next
+    /// receive after the send completes.
     BytesNowait,
+    /// `with_bytes`, then `send` after the closure returns, with the
+    /// `SendCompletion` dropped.
+    BytesSend,
     /// `with_bytes`, then `send_admitted` after the closure returns, with the
     /// `SendCompletion` dropped once the send is admitted.
     BytesAdmitted,
@@ -836,6 +839,7 @@ fn run_ringline(cfg: EchoCfg) {
     const BYTES_ADMITTED: u8 = 1;
     const BYTES_ADMITTED_TIMEOUT: u8 = 2;
     const BYTES_ADMITTED_AWAIT: u8 = 3;
+    const BYTES_SEND: u8 = 4;
 
     /// The `bytes-*` arms. `with_bytes` hands the closure a `Bytes` view of
     /// the received data, which is kept and sent after the closure returns,
@@ -867,6 +871,14 @@ fn run_ringline(cfg: EchoCfg) {
                         break;
                     }
                 }
+                BYTES_SEND => match tx.send(&data) {
+                    Ok(sent) => drop(sent),
+                    Err(e) => {
+                        BYTES_SEND_FAILED.fetch_add(1, Relaxed);
+                        eprintln!("echo: send failed: {e}");
+                        break;
+                    }
+                },
                 BYTES_ADMITTED => match tx.send_admitted(&data).await {
                     Ok(sent) => drop(sent),
                     Err(e) => {
@@ -980,6 +992,7 @@ fn run_ringline(cfg: EchoCfg) {
         EchoMode::Forward => builder.launch::<ForwardEchoHandler>(),
         EchoMode::Copy => builder.launch::<EchoHandler>(),
         EchoMode::BytesNowait => builder.launch::<BytesEchoHandler<BYTES_NOWAIT>>(),
+        EchoMode::BytesSend => builder.launch::<BytesEchoHandler<BYTES_SEND>>(),
         EchoMode::BytesAdmitted => builder.launch::<BytesEchoHandler<BYTES_ADMITTED>>(),
         EchoMode::BytesAdmittedAwait => builder.launch::<BytesEchoHandler<BYTES_ADMITTED_AWAIT>>(),
         EchoMode::BytesAdmittedTimeout => {
@@ -1033,6 +1046,7 @@ fn run_ringline(cfg: EchoCfg) {
         EchoMode::Copy => "copy",
         EchoMode::Forward => "forward",
         EchoMode::BytesNowait => "bytes-nowait",
+        EchoMode::BytesSend => "bytes-send",
         EchoMode::BytesAdmitted => "bytes-admitted",
         EchoMode::BytesAdmittedAwait => "bytes-admitted-await",
         EchoMode::BytesAdmittedTimeout => "bytes-admitted-timeout",
@@ -1050,6 +1064,7 @@ fn run_ringline(cfg: EchoCfg) {
     if matches!(
         echo_mode,
         EchoMode::BytesNowait
+            | EchoMode::BytesSend
             | EchoMode::BytesAdmitted
             | EchoMode::BytesAdmittedAwait
             | EchoMode::BytesAdmittedTimeout
