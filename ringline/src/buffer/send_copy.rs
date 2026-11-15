@@ -1144,9 +1144,6 @@ mod tests {
         pool.release(idx);
     }
 
-    /// In a release build the tripwire is compiled out, so the documented
-    /// degradation is what must hold: the entry is cleared anyway, and the
-    /// recycled slot never reports a dead operation's id.
     /// A pool that does not track passing slots (the `Strict` order) counts
     /// nothing, whatever it allocates.
     #[test]
@@ -1326,6 +1323,9 @@ mod tests {
         assert_eq!(plain.small_free_count(), 0);
     }
 
+    /// In a release build the tripwire is compiled out, so the documented
+    /// degradation is what must hold: the entry is cleared anyway, and the
+    /// recycled slot never reports a dead operation's id.
     #[test]
     #[cfg(not(debug_assertions))]
     fn release_clears_a_live_bounded_send_without_the_tripwire() {

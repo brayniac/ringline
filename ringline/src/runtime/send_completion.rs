@@ -87,8 +87,12 @@
 //! **Admission orders.** The worker's [`SendAdmissionOrder`] is set once,
 //! when the executor is created. Under `Strict`, the default, only the head
 //! is admitted, through [`turn`](SendCompletions::turn) and
-//! [`head_ready`](SendCompletions::head_ready), and nothing below this
-//! paragraph runs. The other orders are an experiment
+//! [`head_ready`](SendCompletions::head_ready). The entry points the other
+//! orders share with it (`Executor::wake_send_capacity_in`,
+//! `Executor::send_scan_due`, `set_order`, `order`) test the order or a flag
+//! only the other orders set and take the `Strict` path; the rest of what
+//! this paragraph describes does not run under `Strict`. The other orders
+//! are an experiment
 //! (`docs/send-admission-design.md`, section 4, "Admission orders"): while
 //! the head does not fit, they also admit a waiter behind it
 //! ([`admit`](SendCompletions::admit)). A waiter admitted that way leaves its

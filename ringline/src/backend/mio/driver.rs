@@ -1787,8 +1787,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The completion and the permit are produced together, by the flush
-    /// that puts the entry's last byte on the socket.
     /// Under `SplitPool` a bounded send that takes a small slot holds a
     /// permit of one small slot from admission until its last byte reaches
     /// the socket, and its abort returns it the same way; the main region is
@@ -1852,6 +1850,8 @@ pub(crate) mod tests {
         assert!(driver.pending_sends[idx].is_empty());
     }
 
+    /// The completion and the permit are produced together, by the flush
+    /// that puts the entry's last byte on the socket.
     #[test]
     fn flush_completes_bounded_entry_and_releases_permit() {
         let config = test_config();
