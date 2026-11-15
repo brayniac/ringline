@@ -15,6 +15,9 @@ pub struct SlotReservation {
     /// towards [`SendCopyPool::passing_held`], and the slots filled from it
     /// are marked as passing.
     passing: bool,
+    /// Promised by the small region ([`SendCopyPool::reserve_small`]), so
+    /// its remainder goes back to that region's count.
+    small: bool,
 }
 
 impl SlotReservation {
@@ -58,6 +61,15 @@ pub enum ReserveError {
 ///
 /// When `send()` is called, the data is copied into a pool slot so the SQE
 /// points to memory owned by the library. The slot is released on the Send CQE.
+///
+/// Under `SendAdmissionOrder::SplitPool` the pool also has a small region
+/// ([`with_small_region`](Self::with_small_region)): slots of another size,
+/// indexed after the main region's, with their own free list and free count.
+/// Only [`copy_in_small`](Self::copy_in_small) and
+/// [`reserve_small`](Self::reserve_small) take them. Every other method that
+/// takes a slot, and `free_count`, `slot_count` and `slot_size`, are about the
+/// main region; the methods that take a slot index serve both, so a small
+/// slot is released, advanced and resubmitted as a main one is.
 pub struct SendCopyPool {
     backing: Vec<u8>,
     slot_size: u32,
@@ -88,9 +100,22 @@ pub struct SendCopyPool {
     passing_held: usize,
     // The largest `passing_held` has been.
     passing_peak: usize,
+    // The largest F + B (main-region free slots plus `passing_held`) since
+    // `take_free_plus_passing_peak` last read it, kept while the pool tracks
+    // passing slots. F + B rises only when a slot or reservation that no
+    // passing send holds comes back, so the returns update it.
+    free_plus_passing_peak: usize,
     // Set between `begin_passing` and `end_passing`: every slot and
     // reservation taken meanwhile is marked as passing.
     marking: bool,
+    // The small region: `small_count` slots of `small_slot_size` bytes,
+    // indexed from `count` up and stored after the main region's bytes, with
+    // its own free list and reservations. Empty unless the pool was built
+    // with `with_small_region`.
+    small_slot_size: u32,
+    small_count: u16,
+    small_free_list: Vec<u16>,
+    small_reserved: usize,
 }
 
 impl SendCopyPool {
@@ -103,10 +128,30 @@ impl SendCopyPool {
 
     /// Create a new pool with `count` slots, each `slot_size` bytes.
     pub fn new(count: u16, slot_size: u32) -> Self {
-        let total = count as usize * slot_size as usize;
+        Self::with_small_region(count, slot_size, 0, 0)
+    }
+
+    /// A pool with `count` main slots of `slot_size` bytes and a small
+    /// region of `small_count` slots of `small_slot_size` bytes, indexed
+    /// `count..count + small_count`. The drivers build one with a small
+    /// region under `SendAdmissionOrder::SplitPool`. `Config::validate` keeps
+    /// the indices below `u16::MAX`, which marks "no slot".
+    pub(crate) fn with_small_region(
+        count: u16,
+        slot_size: u32,
+        small_count: u16,
+        small_slot_size: u32,
+    ) -> Self {
+        assert!(
+            count as usize + small_count as usize <= u16::MAX as usize,
+            "{count} main and {small_count} small slots do not fit 16-bit slot indices"
+        );
+        let total =
+            count as usize * slot_size as usize + small_count as usize * small_slot_size as usize;
         let backing = vec![0u8; total];
         let free_list: Vec<u16> = (0..count).rev().collect();
-        let n = count as usize;
+        let small_free_list: Vec<u16> = (count..count + small_count).rev().collect();
+        let n = count as usize + small_count as usize;
         SendCopyPool {
             backing,
             slot_size,
@@ -120,14 +165,30 @@ impl SendCopyPool {
             passing: Vec::new(),
             passing_held: 0,
             passing_peak: 0,
+            free_plus_passing_peak: 0,
             marking: false,
+            small_slot_size,
+            small_count,
+            small_free_list,
+            small_reserved: 0,
+        }
+    }
+
+    /// The byte offset of slot `idx` in the backing: main slots first, then
+    /// the small region's.
+    fn slot_base(&self, idx: u16) -> usize {
+        if idx < self.count {
+            idx as usize * self.slot_size as usize
+        } else {
+            self.count as usize * self.slot_size as usize
+                + (idx - self.count) as usize * self.small_slot_size as usize
         }
     }
 
     /// Keep a mark on each slot a send admitted past a waiting head takes, so
     /// that [`passing_held`](Self::passing_held) counts them. The drivers
-    /// call this at creation when the worker's `SendAdmissionOrder` is not
-    /// `Strict`; without it no slot is ever marked.
+    /// call this at creation when the worker's `SendAdmissionOrder` lets a
+    /// send pass a waiting head; without it no slot is ever marked.
     pub(crate) fn track_passing(&mut self) {
         self.passing = vec![false; self.count as usize];
     }
@@ -150,12 +211,47 @@ impl SendCopyPool {
         self.marking = false;
     }
 
+    /// Stop marking for an allocation inside a passing send's call that is
+    /// not the send's own (a close_notify queued by the close that a failed
+    /// encryption forces), and return whether marking was on, for
+    /// [`resume_passing`](Self::resume_passing).
+    pub(crate) fn pause_passing(&mut self) -> bool {
+        std::mem::take(&mut self.marking)
+    }
+
+    /// Restore the marking [`pause_passing`](Self::pause_passing) returned.
+    pub(crate) fn resume_passing(&mut self, marking: bool) {
+        self.marking = marking;
+    }
+
     /// The slots held by sends admitted past a waiting head: marked slots
     /// not yet released, plus the unfilled remainder of their reservations
     /// (mio holds a bounded send's whole permit unfilled until the send
     /// completes).
     pub(crate) fn passing_held(&self) -> usize {
         self.passing_held
+    }
+
+    /// The largest F + B (free slots plus [`passing_held`](Self::passing_held))
+    /// since the last call, or now if larger, and start the next window at
+    /// now. `Bounded` and `BoundedIdle` close a head's latch on it, so a
+    /// moment of F + B >= H between two admission checks is not missed when
+    /// a send outside the FIFO takes slots in between. 0 when the pool does
+    /// not track passing slots.
+    pub(crate) fn take_free_plus_passing_peak(&mut self) -> usize {
+        if self.passing.is_empty() {
+            return 0;
+        }
+        let now = self.free_count() + self.passing_held;
+        std::mem::replace(&mut self.free_plus_passing_peak, now).max(now)
+    }
+
+    /// Record F + B after a return, while the pool tracks passing slots.
+    fn note_free_plus_passing(&mut self) {
+        if !self.passing.is_empty() {
+            let now = self.free_count() + self.passing_held;
+            self.free_plus_passing_peak = self.free_plus_passing_peak.max(now);
+        }
     }
 
     /// The largest [`passing_held`](Self::passing_held) has been since the
@@ -233,8 +329,8 @@ impl SendCopyPool {
     /// Copy `data` into an already-popped slot and initialise its tracking.
     /// Shared by `copy_in` and `copy_in_reserved` so the two cannot drift.
     /// The caller has checked `data.len() <= slot_size`.
-    fn fill_slot(&mut self, idx: u16, data: &[u8]) -> (u16, *const u8, u32) {
-        let offset = idx as usize * self.slot_size as usize;
+    /// `offset` is the slot's byte offset in the backing.
+    fn fill_slot(&mut self, idx: u16, offset: usize, data: &[u8]) -> (u16, *const u8, u32) {
         self.backing[offset..offset + data.len()].copy_from_slice(data);
         let ptr = self.backing.as_ptr().wrapping_add(offset);
         self.slot_offset[idx as usize] = 0;
@@ -252,7 +348,22 @@ impl SendCopyPool {
         }
         let idx = self.pop_unreserved()?;
         self.mark_if_passing(idx);
-        Some(self.fill_slot(idx, data))
+        Some(self.fill_slot(idx, idx as usize * self.slot_size as usize, data))
+    }
+
+    /// Allocate a slot of the small region and copy `data` into it, as
+    /// [`copy_in`](Self::copy_in) does in the main region. Returns `None` if
+    /// no small slot is free or `data` exceeds the small slot size.
+    pub(crate) fn copy_in_small(&mut self, data: &[u8]) -> Option<(u16, *const u8, u32)> {
+        if data.len() > self.small_slot_size as usize {
+            return None;
+        }
+        if self.small_free_count() == 0 {
+            crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+            return None;
+        }
+        let idx = self.small_free_list.pop()?;
+        Some(self.fill_slot(idx, self.slot_base(idx), data))
     }
 
     /// Allocate a slot and copy multiple contiguous segments into it sequentially.
@@ -341,6 +452,7 @@ impl SendCopyPool {
         Ok(SlotReservation {
             remaining: n,
             passing,
+            small: false,
         })
     }
 
@@ -360,6 +472,7 @@ impl SendCopyPool {
             r.remaining > 0,
             "copy_in_reserved past the end of the reservation"
         );
+        debug_assert!(!r.small, "a small reservation is never filled");
         debug_assert!(data.len() <= self.slot_size as usize);
         let idx = self
             .free_list
@@ -370,7 +483,33 @@ impl SendCopyPool {
         if r.passing {
             self.passing[idx as usize] = true;
         }
-        self.fill_slot(idx, data)
+        self.fill_slot(idx, idx as usize * self.slot_size as usize, data)
+    }
+
+    /// Promise one slot of the small region without popping it: mio's permit
+    /// for a bounded send that takes a small slot. Returned with
+    /// [`release_reservation`](Self::release_reservation), never filled.
+    ///
+    /// mio-only, as [`shrink_reservation`](Self::shrink_reservation) is:
+    /// io_uring copies a small send into its slot (`copy_in_small`).
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn reserve_small(&mut self) -> Result<SlotReservation, ReserveError> {
+        if self.small_count == 0 {
+            return Err(ReserveError::TooLarge {
+                needed: 1,
+                capacity: 0,
+            });
+        }
+        if self.small_free_count() == 0 {
+            crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+            return Err(ReserveError::Exhausted);
+        }
+        self.small_reserved += 1;
+        Ok(SlotReservation {
+            remaining: 1,
+            passing: false,
+            small: true,
+        })
     }
 
     /// Give back all but `keep` of a reservation's unfilled slots.
@@ -396,6 +535,7 @@ impl SendCopyPool {
     /// that.
     #[cfg(not(has_io_uring))]
     pub fn shrink_reservation(&mut self, r: &mut SlotReservation, keep: usize) {
+        debug_assert!(!r.small, "a small reservation is never narrowed");
         debug_assert!(
             keep <= r.remaining,
             "shrink_reservation cannot grow a reservation from {} to {keep}",
@@ -411,12 +551,19 @@ impl SendCopyPool {
         if r.passing {
             self.return_passing(returned);
         }
+        self.note_free_plus_passing();
     }
 
     /// Return the unfilled remainder of a reservation to the pool. A passing
     /// reservation's remainder stops counting towards
     /// [`passing_held`](Self::passing_held).
     pub fn release_reservation(&mut self, mut r: SlotReservation) {
+        if r.small {
+            debug_assert!(r.remaining <= self.small_reserved);
+            self.small_reserved -= r.remaining;
+            r.remaining = 0;
+            return;
+        }
         debug_assert!(
             r.remaining() <= self.reserved,
             "reservation remainder exceeds the pool's outstanding reservations"
@@ -426,6 +573,7 @@ impl SendCopyPool {
             self.return_passing(r.remaining);
         }
         r.remaining = 0; // satisfies the Drop debug_assert
+        self.note_free_plus_passing();
     }
 
     /// Release a slot back to the free list (called on Send CQE).
@@ -452,7 +600,7 @@ impl SendCopyPool {
     /// `release_queued_sends`, the release of a coalesced run's slots, and
     /// worker exit alike.
     pub fn release(&mut self, idx: u16) {
-        debug_assert!((idx as usize) < self.count as usize);
+        debug_assert!((idx as usize) < self.count as usize + self.small_count as usize);
         let carried = self.slot_send_id[idx as usize].take();
         debug_assert!(
             carried.is_none(),
@@ -470,7 +618,12 @@ impl SendCopyPool {
         self.in_use[idx as usize] = false;
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
-        self.free_list.push(idx);
+        if idx < self.count {
+            self.free_list.push(idx);
+            self.note_free_plus_passing();
+        } else {
+            self.small_free_list.push(idx);
+        }
     }
 
     /// Try to advance a partial send. If `bytes_sent < remaining`, updates
@@ -486,7 +639,7 @@ impl SendCopyPool {
         }
         self.slot_offset[i] += bytes_sent;
         self.slot_remaining[i] = new_remaining;
-        let base = i * self.slot_size as usize;
+        let base = self.slot_base(slot);
         let ptr = self
             .backing
             .as_ptr()
@@ -502,7 +655,7 @@ impl SendCopyPool {
     /// Get the current pointer and remaining length for a slot (for resubmission retries).
     pub fn current_ptr_remaining(&self, slot: u16) -> (*const u8, u32) {
         let i = slot as usize;
-        let base = i * self.slot_size as usize;
+        let base = self.slot_base(slot);
         let ptr = self
             .backing
             .as_ptr()
@@ -551,20 +704,35 @@ impl SendCopyPool {
         self.slot_send_id[slot as usize].take()
     }
 
-    /// Bytes per slot.
+    /// Bytes per slot of the main region.
     pub fn slot_size(&self) -> u32 {
         self.slot_size
     }
 
-    /// Slots available to a new allocation: the free list minus slots
-    /// promised to outstanding reservations.
+    /// Slots of the main region available to a new allocation: the free
+    /// list minus slots promised to outstanding reservations.
     pub fn free_count(&self) -> usize {
         self.free_list.len() - self.reserved
     }
 
-    /// Total slots in the pool.
+    /// Total slots in the pool's main region.
     pub fn slot_count(&self) -> usize {
         self.count as usize
+    }
+
+    /// Slots of the small region available to a new allocation or permit.
+    pub(crate) fn small_free_count(&self) -> usize {
+        self.small_free_list.len() - self.small_reserved
+    }
+
+    /// Slots in the small region; 0 without one.
+    pub(crate) fn small_slot_count(&self) -> usize {
+        self.small_count as usize
+    }
+
+    /// Bytes per small-region slot; 0 without a small region.
+    pub(crate) fn small_slot_size(&self) -> u32 {
+        self.small_slot_size
     }
 }
 
@@ -1020,9 +1188,6 @@ mod tests {
         pool.release(idx);
     }
 
-    /// In a release build the tripwire is compiled out, so the documented
-    /// degradation is what must hold: the entry is cleared anyway, and the
-    /// recycled slot never reports a dead operation's id.
     /// A pool that does not track passing slots (the `Strict` order) counts
     /// nothing, whatever it allocates.
     #[test]
@@ -1073,6 +1238,52 @@ mod tests {
         assert_eq!(pool.passing_held(), 0);
     }
 
+    /// The F + B peak covers the moments between reads: a return raises it,
+    /// a later allocation does not lower it, and a read starts the next
+    /// window at the current F + B. Without passing slots tracked it is 0.
+    #[test]
+    fn the_free_plus_passing_peak_covers_the_moments_between_reads() {
+        let mut pool = SendCopyPool::new(8, 8);
+        assert_eq!(pool.take_free_plus_passing_peak(), 0, "untracked");
+        pool.track_passing();
+        let held: Vec<u16> = (0..3).map(|_| pool.copy_in(b"x").unwrap().0).collect();
+        assert_eq!(pool.take_free_plus_passing_peak(), 5);
+        pool.release(held[0]);
+        pool.copy_in(b"y").unwrap();
+        pool.copy_in(b"z").unwrap();
+        assert_eq!(pool.free_count(), 4);
+        assert_eq!(
+            pool.take_free_plus_passing_peak(),
+            6,
+            "the moment after the release"
+        );
+        assert_eq!(
+            pool.take_free_plus_passing_peak(),
+            4,
+            "a new window starts at now"
+        );
+        let r = pool.reserve_slots(2).unwrap();
+        pool.release_reservation(r);
+        assert_eq!(pool.take_free_plus_passing_peak(), 4);
+    }
+
+    /// An allocation made while marking is paused is not counted, and
+    /// marking resumes as it was.
+    #[test]
+    fn a_paused_passing_send_does_not_mark() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        pool.begin_passing();
+        let marking = pool.pause_passing();
+        pool.copy_in(b"alert").unwrap();
+        assert_eq!(pool.passing_held(), 0, "taken while paused");
+        pool.resume_passing(marking);
+        pool.copy_in(b"reply").unwrap();
+        assert_eq!(pool.passing_held(), 1, "marking resumed");
+        pool.end_passing();
+        assert!(!pool.pause_passing(), "nothing to pause after end_passing");
+    }
+
     /// A passing reservation counts its whole size at once, as mio's permit
     /// does; filling it moves the count to the slots, and the unfilled
     /// remainder goes when the reservation is returned.
@@ -1121,6 +1332,90 @@ mod tests {
         assert_eq!(pool.passing_peak(), 4);
     }
 
+    /// The small region's slots are indexed after the main region's, live
+    /// after its bytes, and come and go through their own free list: the main
+    /// allocators never take one, and a release returns each slot to its own
+    /// region. Advancing a small slot reads its own bytes.
+    #[test]
+    fn the_small_region_has_its_own_slots_and_free_count() {
+        let mut pool = SendCopyPool::with_small_region(4, 64, 2, 16);
+        assert_eq!((pool.slot_count(), pool.free_count()), (4, 4));
+        assert_eq!((pool.small_slot_count(), pool.small_free_count()), (2, 2));
+        assert!(
+            pool.copy_in_small(&[0; 17]).is_none(),
+            "wider than a small slot"
+        );
+
+        let (small, ptr, len) = pool.copy_in_small(b"hello").unwrap();
+        let (other, other_ptr, _l) = pool.copy_in_small(b"other").unwrap();
+        assert!(small >= 4 && other >= 4, "small slots follow the main ones");
+        // Each small slot starts after the main region, at its own offset.
+        for (slot, at) in [(small, ptr), (other, other_ptr)] {
+            let expected = pool
+                .backing
+                .as_ptr()
+                .wrapping_add(4 * 64 + (slot as usize - 4) * 16);
+            assert_eq!(at, expected, "slot {slot}");
+        }
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(ptr, len as usize) },
+            b"hello"
+        );
+        pool.release(other);
+        assert_eq!((pool.free_count(), pool.small_free_count()), (4, 1));
+
+        let main: Vec<u16> = (0..4).map(|_| pool.copy_in(b"m").unwrap().0).collect();
+        assert!(main.iter().all(|&slot| slot < 4));
+        assert!(pool.copy_in(b"m").is_none(), "the main region is full");
+        assert_eq!(
+            pool.small_free_count(),
+            1,
+            "and the small one is not touched"
+        );
+
+        let (rest, remaining) = pool.try_advance(small, 2).unwrap();
+        assert_eq!(remaining, 3);
+        assert_eq!(unsafe { std::slice::from_raw_parts(rest, 3) }, b"llo");
+        assert_eq!(pool.current_ptr_remaining(small), (rest, 3));
+
+        pool.release(small);
+        assert_eq!((pool.free_count(), pool.small_free_count()), (0, 2));
+        pool.release(main[0]);
+        assert_eq!((pool.free_count(), pool.small_free_count()), (1, 2));
+        let (again, _p, _l) = pool.copy_in_small(b"x").unwrap();
+        assert_eq!(
+            again, small,
+            "the released slot went back to the small list"
+        );
+    }
+
+    /// mio's small permit holds one small slot and returns it to the small
+    /// region; a pool without one refuses it as never possible.
+    #[test]
+    #[cfg(not(has_io_uring))]
+    fn a_small_reservation_returns_to_the_small_region() {
+        let mut pool = SendCopyPool::with_small_region(4, 64, 1, 16);
+        let r = pool.reserve_small().unwrap();
+        assert_eq!((pool.free_count(), pool.small_free_count()), (4, 0));
+        assert_eq!(pool.reserve_small().err(), Some(ReserveError::Exhausted));
+        assert!(
+            pool.copy_in_small(b"x").is_none(),
+            "the permit holds the slot"
+        );
+        pool.release_reservation(r);
+        assert_eq!((pool.free_count(), pool.small_free_count()), (4, 1));
+
+        let mut plain = SendCopyPool::new(4, 64);
+        assert!(matches!(
+            plain.reserve_small(),
+            Err(ReserveError::TooLarge { capacity: 0, .. })
+        ));
+        assert_eq!(plain.small_free_count(), 0);
+    }
+
+    /// In a release build the tripwire is compiled out, so the documented
+    /// degradation is what must hold: the entry is cleared anyway, and the
+    /// recycled slot never reports a dead operation's id.
     #[test]
     #[cfg(not(debug_assertions))]
     fn release_clears_a_live_bounded_send_without_the_tripwire() {

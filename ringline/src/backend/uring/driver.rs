@@ -1122,14 +1122,23 @@ impl Driver {
         }
 
         let connections = ConnectionTable::new(config.max_connections);
-        let mut send_copy_pool =
-            SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
+        // `SplitPool` adds a small region, in the same allocation, before the
+        // pool is faulted in or advised.
+        let mut send_copy_pool = match config.send_admission_order.small_region() {
+            None => SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
+            Some((small_slots, small_slot_size)) => SendCopyPool::with_small_region(
+                config.send_copy_count,
+                config.send_copy_slot_size,
+                small_slots,
+                small_slot_size,
+            ),
+        };
         if config.prefault_buffers {
             send_copy_pool.prefault();
         } else {
             send_copy_pool.no_huge_pages();
         }
-        if config.send_admission_order != crate::SendAdmissionOrder::Strict {
+        if config.send_admission_order.lets_pass() {
             send_copy_pool.track_passing();
         }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
@@ -2235,16 +2244,25 @@ impl Driver {
     /// iteration, and each iteration after until the ring takes it. Nothing
     /// is dropped or released on that path (Domain Invariant 7).
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
-        // Clear the finished send's wait state. Under `BoundedIdle` and
-        // `BudgetIdle` its having waited for room becomes the connection's
-        // `room_waited`.
+        // Clear the finished send's wait state.
         let state = &mut self.send_queues[conn_index as usize];
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;
+        self.submit_next_queued_inner(conn_index)
+    }
+
+    /// An awaited send on `conn_index` completed: the completion that settles
+    /// its id, which ends the logical send whatever number of SQEs carried
+    /// its chunks. Under `BoundedIdle` and `BudgetIdle`, whether any of them
+    /// waited for room becomes the connection's `room_waited`, and the next
+    /// send starts with none. A send without an id (`send_nowait`) ends no
+    /// logical send here: a wait of its is carried to the next one that
+    /// does, and its `room_waited` stays set meanwhile.
+    pub(crate) fn end_logical_send(&mut self, conn_index: u32) {
         if self.track_room_waits {
+            let state = &mut self.send_queues[conn_index as usize];
             state.room_waited = std::mem::take(&mut state.send_waited);
         }
-        self.submit_next_queued_inner(conn_index)
     }
 
     /// Whether `conn_index` has no send queued or in flight, no chain

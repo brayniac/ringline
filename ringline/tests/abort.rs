@@ -18,10 +18,12 @@
 
 #![allow(clippy::manual_async_fn)]
 
+use std::cell::Cell;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -700,8 +702,8 @@ fn assert_head_kept(order: ringline::SendAdmissionOrder, passing: &Passing) {
     );
 }
 
-/// Under `Strict` nothing passes the waiting head, and the counters stay
-/// zero.
+/// Under `Strict` nothing passes the waiting head, and every count stays
+/// zero; the main region's free slots are the four the stalled sends leave.
 #[test]
 fn strict_admits_nothing_past_a_waiting_head() {
     let order = ringline::SendAdmissionOrder::Strict;
@@ -709,7 +711,13 @@ fn strict_admits_nothing_past_a_waiting_head() {
     assert_head_kept(order, &passing);
     assert_eq!(passing.reader, None, "{passing:?}");
     assert_eq!(passing.staller, None, "{passing:?}");
-    assert_eq!(passing.counters, ringline::SendAdmissionCounters::default());
+    assert_eq!(
+        passing.counters,
+        ringline::SendAdmissionCounters {
+            main_free: 4,
+            ..ringline::SendAdmissionCounters::default()
+        }
+    );
 }
 
 /// Under `FirstFit`, `Bounded` and `Budget(2)` a send that fits passes the
@@ -762,4 +770,450 @@ fn an_idle_order_passes_only_from_an_idle_connection() {
         assert_eq!(passing.counters.passing_admissions, 1, "{order:?}");
         assert_eq!(passing.counters.passing_held, 0, "{order:?}");
     }
+}
+
+// ── SplitPool ───────────────────────────────────────────────────────────
+
+/// Bytes of a send that takes a slot of the small region.
+const TINY: usize = 512;
+
+/// What a worker under `SplitPool` did, for the test thread to check.
+#[derive(Debug, Default)]
+struct Split {
+    /// The large head was waiting after its first poll.
+    head_waited: bool,
+    /// The small send behind the head on the head's own connection was
+    /// waiting after its first poll.
+    small_behind_head_waited: bool,
+    /// The small sends to a reading peer admitted at their first poll while
+    /// the head waited, of three, and whether any reported passing a head.
+    small_admitted_at_once: usize,
+    small_passed_head: bool,
+    /// The two small sends queued behind a full socket were admitted.
+    stalled_small_admitted: usize,
+    /// With the small region full, a small send on the stalled connection,
+    /// then one on the reading connection, were waiting.
+    small_waited_when_full: (bool, bool),
+    /// With the large head gone, a main send on the reading connection was
+    /// admitted, and one on the stalled connection, behind its small waiter,
+    /// was still waiting.
+    main_admitted_after_head: bool,
+    main_behind_small_waited: bool,
+    /// Once the stalled connection was aborted, the small send behind the
+    /// head on the head's connection was admitted.
+    small_behind_head_admitted: bool,
+    counters: ringline::SendAdmissionCounters,
+}
+
+static SPLIT: Mutex<Option<Split>> = Mutex::new(None);
+
+/// Runs [`split_the_pool`] on its connection.
+struct Splitter;
+
+impl AsyncEventHandler for Splitter {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            let split = split_the_pool(&mut conn).await;
+            *SPLIT.lock().unwrap() = Some(split);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        Splitter
+    }
+}
+
+/// On `conn`, whose peer does not read, the main region's four queued sends
+/// and a waiting head of six slots, as in [`pass_the_head`]; then small sends
+/// to a reading peer and to a stalled one, a main send on each once the head
+/// is gone, and the abort of the stalled one.
+async fn split_the_pool(conn: &mut Connection) -> Split {
+    static QUEUED: [u8; SLOT] = [1; SLOT];
+    static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
+    static SMALL: [u8; TINY] = [3; TINY];
+    let (reader_addr, staller_addr) = PEERS.lock().unwrap().expect("peers");
+    let mut out = Split::default();
+
+    fill(conn);
+    let mut queued = Vec::new();
+    for _ in 0..4 {
+        queued.push(conn.send_admitted(&QUEUED).await.expect("admitted"));
+    }
+    let mut head = conn.send_admitted(&HEAD);
+    out.head_waited = poll_once(&mut head).await.is_pending();
+    let small_behind_head = park(conn.send_admitted(&SMALL)).await;
+    out.small_behind_head_waited =
+        small_behind_head.first_waited.get() && !small_behind_head.resolved();
+
+    let mut reader = ringline::connect(reader_addr)
+        .await
+        .expect("connect the reader");
+    for _ in 0..3 {
+        let mut sent = reader.send_admitted(&SMALL);
+        let first = poll_once(&mut sent).await;
+        if let Poll::Ready(Ok(completion)) = first {
+            out.small_admitted_at_once += 1;
+            out.small_passed_head |= completion.passed_head();
+            let _ = completion.await;
+        }
+    }
+
+    let mut staller = ringline::connect(staller_addr)
+        .await
+        .expect("connect the staller");
+    fill(&mut staller);
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let mut sent = staller.send_admitted(&SMALL);
+        if let Poll::Ready(Ok(completion)) = poll_once(&mut sent).await {
+            out.stalled_small_admitted += 1;
+            stalled.push(completion);
+        }
+    }
+    let mut stalled_small = staller.send_admitted(&SMALL);
+    let mut reader_small = reader.send_admitted(&SMALL);
+    out.small_waited_when_full = (
+        poll_once(&mut stalled_small).await.is_pending(),
+        poll_once(&mut reader_small).await.is_pending(),
+    );
+    let mut stalled_main = staller.send_admitted(&QUEUED);
+    let _ = poll_once(&mut stalled_main).await;
+    drop(reader_small);
+    let reader_main = park(reader.send_admitted(&QUEUED)).await;
+
+    drop(head);
+    out.main_admitted_after_head = resolved_soon(&reader_main).await == Some(true);
+    out.main_behind_small_waited = poll_once(&mut stalled_main).await.is_pending();
+
+    staller.abort();
+    out.small_behind_head_admitted = resolved_soon(&small_behind_head).await == Some(true);
+    out.counters = ringline::send_admission_counters();
+    conn.abort();
+    out
+}
+
+/// Under `SplitPool` a large head waits in the main region while small sends
+/// are admitted from the small region, whose own FIFO is strict once it is
+/// full; each connection's sends keep their order across the two FIFOs, and
+/// a waiter held back by its connection's earlier waiter holds back no one.
+#[test]
+fn split_pool_admits_small_sends_while_a_large_head_waits() {
+    let _serial = serial();
+    *SPLIT.lock().unwrap() = None;
+    let reader = TcpListener::bind("127.0.0.1:0").expect("bind the reader");
+    let staller = TcpListener::bind("127.0.0.1:0").expect("bind the staller");
+    *PEERS.lock().unwrap() = Some((reader.local_addr().unwrap(), staller.local_addr().unwrap()));
+    // Not joined, as in `run_order`.
+    std::thread::spawn(move || {
+        let (mut stream, _) = reader.accept().expect("accept the reader");
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink);
+    });
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let (_stream, _) = staller.accept().expect("accept the staller");
+        let _ = held.recv_timeout(Duration::from_secs(20));
+    });
+
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .send_admission_order(ringline::SendAdmissionOrder::SplitPool {
+            small_slots: 2,
+            small_slot_size: 1024,
+        })
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Splitter>()
+        .expect("launch");
+    let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    peer.write_all(b"s").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let split = loop {
+        if let Some(split) = SPLIT.lock().unwrap().take() {
+            break split;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the splitting task never finished"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let _ = release.send(());
+    drop(peer);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+
+    assert!(split.head_waited, "{split:?}");
+    assert!(
+        split.small_behind_head_waited,
+        "behind its connection's head: {split:?}"
+    );
+    assert_eq!(split.small_admitted_at_once, 3, "{split:?}");
+    assert!(!split.small_passed_head, "a small send passes no head");
+    assert_eq!(split.stalled_small_admitted, 2, "{split:?}");
+    assert_eq!(split.small_waited_when_full, (true, true), "{split:?}");
+    assert!(split.main_admitted_after_head, "{split:?}");
+    assert!(
+        split.main_behind_small_waited,
+        "behind its connection's small waiter: {split:?}"
+    );
+    assert!(split.small_behind_head_admitted, "{split:?}");
+    assert_eq!(split.counters.small_admissions, 6, "{split:?}");
+    assert_eq!(split.counters.passing_admissions, 0, "{split:?}");
+}
+
+// ── Wakes of parked waiters ─────────────────────────────────────────────
+
+/// A waiter that a task of its own waits for: whether its first poll left
+/// it waiting, and, once it resolves, whether it was admitted.
+#[derive(Clone, Default)]
+struct Parked {
+    first_waited: Rc<Cell<bool>>,
+    admitted: Rc<Cell<Option<bool>>>,
+}
+
+impl Parked {
+    /// The waiter has resolved.
+    fn resolved(&self) -> bool {
+        self.admitted.get().is_some()
+    }
+}
+
+/// Polls `inner`, recording whether its first poll returned `Pending`.
+struct RecordFirst<F> {
+    inner: F,
+    first_waited: Option<Rc<Cell<bool>>>,
+}
+
+impl<F: Future + Unpin> Future for RecordFirst<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
+        let polled = Pin::new(&mut self.inner).poll(cx);
+        if let Some(first) = self.first_waited.take() {
+            first.set(polled.is_pending());
+        }
+        polled
+    }
+}
+
+/// Wait for `admission` in a new task, which the event loop polls again only
+/// when something wakes it, and return what that task records. The task
+/// makes the first poll before this returns.
+async fn park(admission: ringline::Admission<'static>) -> Parked {
+    let parked = Parked::default();
+    let recorded = parked.clone();
+    ringline::spawn(async move {
+        let waited = RecordFirst {
+            inner: admission,
+            first_waited: Some(recorded.first_waited.clone()),
+        };
+        let admitted = waited.await;
+        recorded.admitted.set(Some(admitted.is_ok()));
+    })
+    .expect("spawn the waiter");
+    ringline::sleep(Duration::from_millis(5)).await;
+    parked
+}
+
+/// Whether `parked` was admitted, once it resolves within 2 s, or `None`.
+async fn resolved_soon(parked: &Parked) -> Option<bool> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !parked.resolved() && Instant::now() < deadline {
+        ringline::sleep(Duration::from_millis(1)).await;
+    }
+    parked.admitted.get()
+}
+
+/// What [`wake_the_parked`] saw.
+#[derive(Debug, Default)]
+struct Woken {
+    /// (a) A passer parked for want of free slots: whether its first poll
+    /// waited, then whether it was admitted once the slots came back.
+    room: (bool, Option<bool>),
+    /// (b) A passer parked behind an earlier waiter on its own connection:
+    /// parked at first, then whether it was admitted once that waiter was
+    /// dropped.
+    own_connection: (bool, Option<bool>),
+    /// (c) A passer on a connection whose last send waited for room and then
+    /// drained: still parked 20 ms later, then whether it was admitted once a
+    /// send on that connection completed without waiting.
+    room_waited: (bool, Option<bool>),
+}
+
+static WOKEN: Mutex<Option<Woken>> = Mutex::new(None);
+
+/// The test thread's listener whose peer reads only once told to, and the
+/// way to tell it.
+static DRAINER: Mutex<Option<(SocketAddr, std::sync::mpsc::Sender<()>)>> = Mutex::new(None);
+
+/// Runs [`wake_the_parked`] on its connection; the first byte says which
+/// part: `p` for (a) and (b), `i` for (c).
+struct Wakeful;
+
+impl AsyncEventHandler for Wakeful {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let mut part = 0u8;
+            conn.with_data(|data| {
+                part = data[0];
+                ParseResult::Consumed(data.len())
+            })
+            .await;
+            let woken = wake_the_parked(&mut conn, part == b'i').await;
+            *WOKEN.lock().unwrap() = Some(woken);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        Wakeful
+    }
+}
+
+/// On `conn`, whose peer does not read, a head of six slots waits behind
+/// four held, as in [`pass_the_head`]. Then, unless `idle`, (a) and (b) on a
+/// connection whose peer reads; if `idle`, (c) on one whose peer starts
+/// reading when told.
+async fn wake_the_parked(conn: &mut Connection, idle: bool) -> Woken {
+    static QUEUED: [u8; SLOT] = [1; SLOT];
+    static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
+    static ONE: [u8; SLOT] = [3; SLOT];
+    static FOUR: [u8; 4 * SLOT] = [4; 4 * SLOT];
+    static FIVE: [u8; 5 * SLOT] = [5; 5 * SLOT];
+    let (reader_addr, _) = PEERS.lock().unwrap().expect("peers");
+    let mut out = Woken::default();
+
+    fill(conn);
+    let mut queued = Vec::new();
+    for _ in 0..4 {
+        queued.push(conn.send_admitted(&QUEUED).await.expect("admitted"));
+    }
+    let mut head = conn.send_admitted(&HEAD);
+    let _ = poll_once(&mut head).await;
+
+    if !idle {
+        let mut reader = ringline::connect(reader_addr)
+            .await
+            .expect("connect the reader");
+        // (a) The four free slots go to one passer; the next parks until they
+        // come back.
+        let mut all_four = reader.send_admitted(&FOUR);
+        if let Poll::Ready(Ok(sent)) = poll_once(&mut all_four).await {
+            let waiter = park(reader.send_admitted(&ONE)).await;
+            out.room.0 = waiter.first_waited.get();
+            let _ = sent.await;
+            out.room.1 = resolved_soon(&waiter).await;
+        }
+        // (b) A waiter that does not fit holds back the next on its
+        // connection until it is dropped; no slot comes back meanwhile.
+        ringline::sleep(Duration::from_millis(20)).await;
+        let mut too_big = reader.send_admitted(&FIVE);
+        let _ = poll_once(&mut too_big).await;
+        let behind = park(reader.send_admitted(&ONE)).await;
+        out.own_connection.0 = behind.first_waited.get() && !behind.resolved();
+        drop(too_big);
+        out.own_connection.1 = resolved_soon(&behind).await;
+    } else {
+        let (drainer_addr, drain) = DRAINER.lock().unwrap().take().expect("drainer");
+        let mut drained = ringline::connect(drainer_addr)
+            .await
+            .expect("connect the drainer");
+        // (c) More than the socket takes, so a write returns WouldBlock,
+        // then an awaited send behind it; the peer then reads it all.
+        fill(&mut drained);
+        let last = drained.send(b"end").expect("queued");
+        let _ = drain.send(());
+        let _ = last.await;
+        let waiter = park(drained.send_admitted(&ONE)).await;
+        ringline::sleep(Duration::from_millis(20)).await;
+        out.room_waited.0 = waiter.first_waited.get() && !waiter.resolved();
+        let clean = drained.send(b"x").expect("queued");
+        let _ = clean.await;
+        out.room_waited.1 = resolved_soon(&waiter).await;
+    }
+    drop(head);
+    conn.abort();
+    out
+}
+
+/// Run [`Wakeful`] under `order`, `part` naming its part, and return what it
+/// saw.
+fn run_wakes(order: ringline::SendAdmissionOrder, part: u8) -> Woken {
+    let _serial = serial();
+    *WOKEN.lock().unwrap() = None;
+    let reader = TcpListener::bind("127.0.0.1:0").expect("bind the reader");
+    let drainer = TcpListener::bind("127.0.0.1:0").expect("bind the drainer");
+    *PEERS.lock().unwrap() = Some((reader.local_addr().unwrap(), reader.local_addr().unwrap()));
+    let (drain, start) = std::sync::mpsc::channel::<()>();
+    *DRAINER.lock().unwrap() = Some((drainer.local_addr().unwrap(), drain));
+    // Not joined, as in `run_order`.
+    std::thread::spawn(move || {
+        let (mut stream, _) = reader.accept().expect("accept the reader");
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink);
+    });
+    std::thread::spawn(move || {
+        let (mut stream, _) = drainer.accept().expect("accept the drainer");
+        if start.recv_timeout(Duration::from_secs(20)).is_ok() {
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        }
+    });
+
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .send_admission_order(order)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Wakeful>()
+        .expect("launch");
+    let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    peer.write_all(&[part]).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let woken = loop {
+        if let Some(woken) = WOKEN.lock().unwrap().take() {
+            break woken;
+        }
+        assert!(Instant::now() < deadline, "the waking task never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(peer);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    woken
+}
+
+/// The event loop wakes a parked passer and admits it: (a) once the slots
+/// it waited for come back, and (b) once the earlier waiter on its own
+/// connection is dropped, which returns no slot.
+#[test]
+fn the_event_loop_wakes_a_parked_passer() {
+    let woken = run_wakes(ringline::SendAdmissionOrder::FirstFit, b'p');
+    assert_eq!(woken.room, (true, Some(true)), "{woken:?}");
+    assert_eq!(woken.own_connection, (true, Some(true)), "{woken:?}");
+}
+
+/// Under `BoundedIdle` a connection whose last send waited for room, and
+/// has drained since, lets no send pass; once a send on it completes
+/// without waiting, the event loop wakes the parked one and admits it.
+#[test]
+fn bounded_idle_admits_once_the_connection_s_last_send_did_not_wait() {
+    let woken = run_wakes(ringline::SendAdmissionOrder::BoundedIdle, b'i');
+    assert_eq!(woken.room_waited, (true, Some(true)), "{woken:?}");
 }

@@ -1599,9 +1599,9 @@ mod tests {
             exec.enqueue_send_capacity(2, 1, 6, a);
             exec.enqueue_send_capacity(5, 1, 1, b);
 
-            exec.wake_send_capacity_in(&pool, |_| false);
+            exec.wake_send_capacity_in(&pool, 0, |_| false);
             let busy = exec.ready_queue.pop_front();
-            exec.wake_send_capacity_in(&pool, |_| true);
+            exec.wake_send_capacity_in(&pool, 0, |_| true);
             let idle = exec.ready_queue.pop_front();
             match order {
                 SendAdmissionOrder::Strict => {
