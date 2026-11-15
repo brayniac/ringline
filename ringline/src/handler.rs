@@ -118,10 +118,11 @@ pub(crate) struct ConnSendState {
     /// that returns `WouldBlock`) and cleared when a send completes without
     /// having waited. Kept only while the driver's `track_room_waits` is set.
     pub room_waited: bool,
-    /// The send in progress has waited for room. On io_uring that is the
-    /// send in the kernel or waiting for `POLLOUT`, since it was first
-    /// submitted; on mio, any send queued since the queue was last empty.
-    /// Copied into `room_waited` when a send completes. Kept only while the
+    /// The send in progress has waited for room. On io_uring that is any
+    /// SQE of the logical send in progress (since the last completion that
+    /// settled an awaited send on the connection), copied into `room_waited`
+    /// by `Driver::end_logical_send`; on mio, any send queued since the queue
+    /// was last empty, copied when each send completes. Kept only while the
     /// driver's `track_room_waits` is set.
     pub send_waited: bool,
 }
