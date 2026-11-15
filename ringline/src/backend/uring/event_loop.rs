@@ -17052,7 +17052,12 @@ mod tests {
         // On the first's connection, so it cannot pass it.
         let (_, second) = waiting_send(&mut el, head, &TEN, never(), || {});
         release.set(true);
-        el.executor.ready_queue.push_back(first | STANDALONE_BIT);
+        // A parked task is polled only once its slot records a wake;
+        // `wake_task` records it and queues the task.
+        assert!(
+            el.executor.wake_task(first | STANDALONE_BIT),
+            "the first is parked"
+        );
         el.poll_ready_tasks();
         assert_eq!(el.driver.send_copy_pool.free_count(), 9);
         assert_eq!(second.get(), None, "the second waits: 9 < 10");
