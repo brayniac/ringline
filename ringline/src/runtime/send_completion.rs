@@ -3180,4 +3180,21 @@ mod tests {
             "and stays latched"
         );
     }
+
+    /// The scan closes the latch on its own: when only the scan sees
+    /// F + B >= H, a later admission check below H still passes nothing.
+    #[test]
+    fn the_scan_alone_closes_the_latch() {
+        for order in [SendAdmissionOrder::Bounded, SendAdmissionOrder::BoundedIdle] {
+            let mut q = SendCompletions::with_order(order);
+            q.enqueue(1, 0, 6, task(1));
+            let w = q.enqueue(2, 0, 1, task(2));
+            assert!(scanned(&mut q, pool(3, 3, 8)).is_empty(), "{order:?}");
+            assert_eq!(
+                q.admit(w, pool(3, 0, 8), true, idle),
+                Admit::Wait,
+                "{order:?}: latched by the scan"
+            );
+        }
+    }
 }
