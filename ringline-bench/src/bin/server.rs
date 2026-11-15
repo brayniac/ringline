@@ -55,6 +55,9 @@ struct EchoCfg {
     pin_to_core: bool,
     prefault_buffers: bool,
     defer_recv_arm: bool,
+    /// The runtime's experimental admission order for bounded sends, if
+    /// one was named (`--admission-order`).
+    admission_order: Option<ringline::SendAdmissionOrder>,
     iowq_max_workers: Option<u32>,
     accept_mode: AcceptModeArg,
     /// Offer every connection for park after each response.
@@ -197,6 +200,43 @@ enum Runtime {
     /// when built with `--features tokio-uring-arm`.
     TokioUring,
     Tokio,
+}
+
+/// `--admission-order`: the design's orders by the runtime's names.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AdmissionOrderArg {
+    /// O0.
+    Strict,
+    /// O2.
+    FirstFit,
+    /// O3.
+    Bounded,
+    /// O4.
+    BoundedIdle,
+    /// O7.
+    Budget,
+    /// O7w.
+    BudgetIdle,
+    /// O5.
+    SplitPool,
+}
+
+impl AdmissionOrderArg {
+    fn runtime(self, a: &Args) -> ringline::SendAdmissionOrder {
+        use ringline::SendAdmissionOrder as O;
+        match self {
+            AdmissionOrderArg::Strict => O::Strict,
+            AdmissionOrderArg::FirstFit => O::FirstFit,
+            AdmissionOrderArg::Bounded => O::Bounded,
+            AdmissionOrderArg::BoundedIdle => O::BoundedIdle,
+            AdmissionOrderArg::Budget => O::Budget(a.admission_budget),
+            AdmissionOrderArg::BudgetIdle => O::BudgetIdle(a.admission_budget),
+            AdmissionOrderArg::SplitPool => O::SplitPool {
+                small_slots: a.admission_small_slots,
+                small_slot_size: a.admission_small_slot_size,
+            },
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -367,6 +407,25 @@ struct Args {
     #[arg(long, default_value_t = false)]
     defer_recv_arm: bool,
 
+    /// (ringline echo) The order in which each worker admits bounded sends,
+    /// an experiment option of the runtime on Experiment C's work branch
+    /// (`ConfigBuilder::send_admission_order`, docs/send-admission-design.md
+    /// section 4). Omitted, the runtime's default (strict) applies.
+    #[arg(long, value_enum)]
+    admission_order: Option<AdmissionOrderArg>,
+
+    /// (ringline echo) R, in slots, for `--admission-order budget` and
+    /// `budget-idle`.
+    #[arg(long, default_value_t = 32)]
+    admission_budget: u16,
+
+    /// (ringline echo) The small region for `--admission-order split-pool`:
+    /// its slots and its slot size in bytes.
+    #[arg(long, default_value_t = 256)]
+    admission_small_slots: u16,
+    #[arg(long, default_value_t = 4096)]
+    admission_small_slot_size: u32,
+
     /// (ringline echo) Cap each worker's bounded io-wq pool
     /// (`ConfigBuilder::iowq_max_workers`; 0 leaves the kernel default).
     /// Omitted, ringline's default applies. The knob under measurement in
@@ -513,6 +572,7 @@ fn main() {
             metrics_out: args.metrics_out.clone(),
             prefault_buffers: args.prefault_buffers,
             defer_recv_arm: args.defer_recv_arm,
+            admission_order: args.admission_order.map(|o| o.runtime(&args)),
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: args.echo_mode.unwrap_or_else(|| {
                 // No default: a spec must name the loop it measures.
@@ -666,6 +726,7 @@ fn run_ringline(cfg: EchoCfg) {
         pin_to_core,
         prefault_buffers,
         defer_recv_arm,
+        admission_order,
         iowq_max_workers,
         accept_mode,
         park,
@@ -901,6 +962,10 @@ fn run_ringline(cfg: EchoCfg) {
         .tick_timeout_us(tick_timeout_us);
     let staged = match iowq_max_workers {
         Some(n) => staged.iowq_max_workers(n),
+        None => staged,
+    };
+    let staged = match admission_order {
+        Some(order) => staged.send_admission_order(order),
         None => staged,
     };
     let staged = if tls {
