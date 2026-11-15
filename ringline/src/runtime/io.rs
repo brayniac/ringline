@@ -4293,9 +4293,7 @@ impl Admission<'_> {
             None
         } else {
             let pool = PoolView::of(&driver.send_copy_pool);
-            let conn_index = self.conn_index;
-            match executor
-                .send_capacity_admit(id, pool, first_poll, || driver.send_idle(conn_index))
+            match executor.send_capacity_admit(id, pool, first_poll, |conn| driver.send_idle(conn))
             {
                 Admit::Wait => return pending(cx),
                 Admit::Head | Admit::Small => None,

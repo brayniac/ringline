@@ -908,17 +908,27 @@ impl SendCompletions {
     /// Under an order other than `Strict`, whether `id` may reserve slots
     /// now: as the head, when `pool.free` covers its `required_slots`, or
     /// past a head that does not fit, when the order lets it
-    /// ([`may_pass`](Self::may_pass)). `idle` says whether `id`'s connection
-    /// has no send queued or in flight and its most recent send did not
-    /// wait for room; it is called only under `BoundedIdle` and `BudgetIdle`,
-    /// and only for a waiter that passes every other test. Under `SplitPool`
-    /// it admits each FIFO's head when its region has room
+    /// ([`may_pass`](Self::may_pass)) with what is left once the older
+    /// waiters that could pass have taken their room
+    /// ([`left_after_older_passers`](Self::left_after_older_passers)), so
+    /// passers go oldest first whichever polls first. `idle` says, for a
+    /// connection index, whether the connection has no send queued or in
+    /// flight and its most recent send did not wait for room; it is called
+    /// only under `BoundedIdle` and `BudgetIdle`, for `id` once it passes
+    /// every other test and for the older waiters. Under `SplitPool` it
+    /// admits each FIFO's head when its region has room
     /// ([`admit_split`](Self::admit_split)).
     ///
     /// An answer of wait on any poll but the first sets `scan_due`: the
     /// poll may have come from a scan that counted on this waiter's slots,
     /// or the head may have stopped fitting because a send outside the FIFO
     /// took slots, and either way another waiter may now be able to pass.
+    /// So does a wait because an older waiter takes the room, on any poll,
+    /// so that the scan wakes the older one.
+    ///
+    /// Cost, for a waiter that would pass on its own: one visit per id ahead
+    /// of it in `waiting`, and the operations of each older waiter's
+    /// connection that fits. A rejection on its own test costs nothing more.
     ///
     /// Called by `Admission` on each poll while waiting, in place of
     /// [`turn`](Self::turn).
@@ -927,7 +937,7 @@ impl SendCompletions {
         id: SendId,
         pool: PoolView,
         first_poll: bool,
-        idle: impl FnOnce() -> bool,
+        idle: impl Fn(u32) -> bool,
     ) -> Admit {
         debug_assert_ne!(self.order, SendAdmissionOrder::Strict);
         let admit = self.admit_inner(id, pool, idle);
@@ -938,7 +948,7 @@ impl SendCompletions {
     }
 
     /// [`admit`](Self::admit) without its effect on `scan_due`.
-    fn admit_inner(&mut self, id: SendId, pool: PoolView, idle: impl FnOnce() -> bool) -> Admit {
+    fn admit_inner(&mut self, id: SendId, pool: PoolView, idle: impl Fn(u32) -> bool) -> Admit {
         if self.order.small_region().is_some() {
             return self.admit_split(id, pool);
         }
@@ -969,12 +979,85 @@ impl SendCompletions {
         if !self.may_pass(head, head_needs, conn_index, required_slots, seq, pool) {
             return Admit::Wait;
         }
-        if self.order.needs_idle_connection() && !idle() {
+        if self.order.needs_idle_connection() && !idle(conn_index) {
+            return Admit::Wait;
+        }
+        // Passers go oldest first, as the scan wakes them: an older waiter
+        // that could pass takes its room before this one, even when this
+        // poll comes first (a new waiter's first poll, in the same iteration
+        // as the release that made the room). If what is left does not cover
+        // this waiter, the scan at the end of the iteration wakes the older
+        // one.
+        let left = self.left_after_older_passers(head, head_needs, id, pool, &idle);
+        if !self.may_pass(head, head_needs, conn_index, required_slots, seq, left) {
+            self.scan_due = true;
             return Admit::Wait;
         }
         Admit::Pass {
             slots: required_slots,
         }
+    }
+
+    /// `pool` less what the waiters between the head and `id` that could
+    /// pass take, oldest first, each counted against the free slots and B as
+    /// [`scan`](Self::scan) counts the waiters it wakes.
+    ///
+    /// Cost: one visit per id in `waiting` ahead of `id`, stale ones
+    /// included, and for each waiter that fits, the operations of its
+    /// connection. It runs only for a waiter that would pass on its own.
+    fn left_after_older_passers(
+        &self,
+        head: SendId,
+        head_needs: usize,
+        id: SendId,
+        pool: PoolView,
+        idle: &impl Fn(u32) -> bool,
+    ) -> PoolView {
+        let mut left = pool;
+        for &older in self.waiting.iter().skip(1) {
+            if older == id {
+                break;
+            }
+            if let Some((required_slots, _)) = self.could_pass(older, head, head_needs, left, idle)
+            {
+                left.free -= required_slots;
+                left.passing += required_slots;
+            }
+        }
+        left
+    }
+
+    /// If `id` is a waiter with an owner that could pass `head` with
+    /// `left`, its `required_slots` and owner. The test the scan applies to
+    /// each waiter it might wake, and that an admission applies to the
+    /// waiters older than itself. A waiter with no owner ([`NO_OWNER`]) is
+    /// left out: no task would poll it, and its holder's first poll checks
+    /// it.
+    fn could_pass(
+        &self,
+        id: SendId,
+        head: SendId,
+        head_needs: usize,
+        left: PoolView,
+        idle: &impl Fn(u32) -> bool,
+    ) -> Option<(usize, u32)> {
+        let Some(Entry {
+            conn_index,
+            task_id,
+            state:
+                Completion::Waiting {
+                    required_slots,
+                    seq,
+                    ..
+                },
+        }) = self.entry(id)
+        else {
+            return None;
+        };
+        let passes = *task_id != NO_OWNER
+            && self.may_pass(head, head_needs, *conn_index, *required_slots, *seq, left)
+            && (!self.order.needs_idle_connection() || idle(*conn_index));
+        passes.then_some((*required_slots, *task_id))
     }
 
     /// Under `SplitPool`: `id` is admitted when it is its FIFO's head
@@ -1186,28 +1269,13 @@ impl SendCompletions {
         let mut left = pool;
         // `front` left the head at the front of `waiting`.
         for &id in self.waiting.iter().skip(1) {
-            let Some(Entry {
-                conn_index,
-                task_id,
-                state:
-                    Completion::Waiting {
-                        required_slots,
-                        seq,
-                        ..
-                    },
-            }) = self.entry(id)
-            else {
-                continue;
-            };
-            if *task_id == NO_OWNER
-                || !self.may_pass(head, head_needs, *conn_index, *required_slots, *seq, left)
-                || (self.order.needs_idle_connection() && !idle(*conn_index))
+            if let Some((required_slots, task_id)) =
+                self.could_pass(id, head, head_needs, left, &idle)
             {
-                continue;
+                wakes.push(task_id);
+                left.free -= required_slots;
+                left.passing += required_slots;
             }
-            wakes.push(*task_id);
-            left.free -= *required_slots;
-            left.passing += *required_slots;
         }
         self.counters.scan_wakes += (wakes.len() - woken_before) as u64;
     }
@@ -1611,7 +1679,7 @@ impl Executor {
         id: SendId,
         pool: PoolView,
         first_poll: bool,
-        idle: impl FnOnce() -> bool,
+        idle: impl Fn(u32) -> bool,
     ) -> Admit {
         self.send_completions.admit(id, pool, first_poll, idle)
     }
@@ -2422,7 +2490,7 @@ mod tests {
         }
     }
 
-    fn idle() -> bool {
+    fn idle(_conn_index: u32) -> bool {
         true
     }
 
@@ -2648,7 +2716,7 @@ mod tests {
             let mut q = SendCompletions::with_order(order);
             q.enqueue(1, 0, 6, task(1));
             let w = q.enqueue(2, 0, 1, task(2));
-            assert_eq!(q.admit(w, pool(4, 0, 8), true, || false), Admit::Wait);
+            assert_eq!(q.admit(w, pool(4, 0, 8), true, |_| false), Admit::Wait);
             let mut wakes = Vec::new();
             q.scan(pool(4, 0, 8), |conn| conn != 2, &mut wakes);
             assert!(wakes.is_empty(), "{order:?}: the scan reads the same test");
@@ -2670,7 +2738,7 @@ mod tests {
             q.enqueue(1, 0, 6, task(1));
             let w = q.enqueue(2, 0, 1, task(2));
             let asked = std::cell::Cell::new(false);
-            let admit = q.admit(w, pool(4, 0, 8), true, || {
+            let admit = q.admit(w, pool(4, 0, 8), true, |_| {
                 asked.set(true);
                 false
             });
@@ -3023,5 +3091,46 @@ mod tests {
                 q.waiting_len()
             );
         }
+    }
+
+    /// A waiter's first poll does not take the room an older parked waiter
+    /// could pass with: the older one is counted first, as the scan that
+    /// wakes it counts it. `FirstFit` with one slot coming back, and
+    /// `Budget(2)` with B falling from 2 to 1.
+    #[test]
+    fn an_older_waiter_that_could_pass_goes_before_a_newer_one() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::FirstFit);
+        q.enqueue(1, 0, 6, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        assert_eq!(q.admit(older, pool(0, 0, 8), true, idle), Admit::Wait);
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(newer, pool(1, 0, 8), true, idle),
+            Admit::Wait,
+            "the slot is the older waiter's"
+        );
+        assert!(q.scan_due(), "the older waiter is woken");
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
+        assert_eq!(
+            q.admit(older, pool(1, 0, 8), false, idle),
+            Admit::Pass { slots: 1 }
+        );
+
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Budget(2));
+        q.enqueue(1, 0, 10, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        let budget = |passing| PoolView {
+            free: 4,
+            passing,
+            slots: 16,
+            small_free: 0,
+        };
+        assert_eq!(q.admit(older, budget(2), true, idle), Admit::Wait);
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(q.admit(newer, budget(1), true, idle), Admit::Wait);
+        assert_eq!(
+            q.admit(older, budget(1), false, idle),
+            Admit::Pass { slots: 1 }
+        );
     }
 }
