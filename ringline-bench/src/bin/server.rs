@@ -177,6 +177,10 @@ enum EchoMode {
     /// `with_bytes`, then `send_admitted` after the closure returns, with the
     /// `SendCompletion` dropped once the send is admitted.
     BytesAdmitted,
+    /// `with_bytes`, then `send_admitted`, then the `SendCompletion` awaited
+    /// with no bound before the next read: `bytes-admitted-timeout` without
+    /// its two timers.
+    BytesAdmittedAwait,
     /// `with_bytes`, then `send_admitted` bounded by `--admit-limit-ms` and
     /// its `SendCompletion` bounded by `--settle-limit-ms`, as in section 2's
     /// example. A connection past either limit is closed.
@@ -766,6 +770,7 @@ fn run_ringline(cfg: EchoCfg) {
     const BYTES_NOWAIT: u8 = 0;
     const BYTES_ADMITTED: u8 = 1;
     const BYTES_ADMITTED_TIMEOUT: u8 = 2;
+    const BYTES_ADMITTED_AWAIT: u8 = 3;
 
     /// The `bytes-*` arms. `with_bytes` hands the closure a `Bytes` view of
     /// the received data, which is kept and sent after the closure returns,
@@ -805,6 +810,17 @@ fn run_ringline(cfg: EchoCfg) {
                         break;
                     }
                 },
+                BYTES_ADMITTED_AWAIT => {
+                    let settled = match tx.send_admitted(&data).await {
+                        Ok(sent) => sent.await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = settled {
+                        BYTES_SEND_FAILED.fetch_add(1, Relaxed);
+                        eprintln!("echo: send failed: {e}");
+                        break;
+                    }
+                }
                 _ => {
                     let sent = match ringline::timeout(admit_limit, tx.send_admitted(&data)).await {
                         Ok(Ok(sent)) => sent,
@@ -896,6 +912,7 @@ fn run_ringline(cfg: EchoCfg) {
         EchoMode::Copy => builder.launch::<EchoHandler>(),
         EchoMode::BytesNowait => builder.launch::<BytesEchoHandler<BYTES_NOWAIT>>(),
         EchoMode::BytesAdmitted => builder.launch::<BytesEchoHandler<BYTES_ADMITTED>>(),
+        EchoMode::BytesAdmittedAwait => builder.launch::<BytesEchoHandler<BYTES_ADMITTED_AWAIT>>(),
         EchoMode::BytesAdmittedTimeout => {
             builder.launch::<BytesEchoHandler<BYTES_ADMITTED_TIMEOUT>>()
         }
@@ -948,6 +965,7 @@ fn run_ringline(cfg: EchoCfg) {
         EchoMode::Forward => "forward",
         EchoMode::BytesNowait => "bytes-nowait",
         EchoMode::BytesAdmitted => "bytes-admitted",
+        EchoMode::BytesAdmittedAwait => "bytes-admitted-await",
         EchoMode::BytesAdmittedTimeout => "bytes-admitted-timeout",
     };
     eprintln!(
@@ -962,7 +980,10 @@ fn run_ringline(cfg: EchoCfg) {
     dump_runtime_metrics(metrics_out.as_deref());
     if matches!(
         echo_mode,
-        EchoMode::BytesNowait | EchoMode::BytesAdmitted | EchoMode::BytesAdmittedTimeout
+        EchoMode::BytesNowait
+            | EchoMode::BytesAdmitted
+            | EchoMode::BytesAdmittedAwait
+            | EchoMode::BytesAdmittedTimeout
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         eprintln!(
