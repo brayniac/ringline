@@ -101,10 +101,11 @@ pub struct SendCopyPool {
     // The largest `passing_held` has been.
     passing_peak: usize,
     // The largest F + B (main-region free slots plus `passing_held`) seen at
-    // a return since `take_free_plus_passing_peak` last read it, 0 if none;
-    // kept while the pool tracks passing slots. F + B rises only when a slot
-    // or reservation that no passing send holds comes back, so the returns
-    // update it.
+    // a return, or set at the latest head change
+    // (`restart_free_plus_passing_window`), since
+    // `take_free_plus_passing_peak` last read it, 0 if none; kept while the
+    // pool tracks passing slots. F + B rises only when a slot or reservation
+    // that no passing send holds comes back, so the returns update it.
     free_plus_passing_peak: usize,
     // Set between `begin_passing` and `end_passing`: every slot and
     // reservation taken meanwhile is marked as passing.
@@ -251,11 +252,12 @@ impl SendCopyPool {
         std::mem::take(&mut self.free_plus_passing_peak).max(now)
     }
 
-    /// Start the window at F + B now, at the moment the FIFO's head changed:
-    /// what the window held belonged to the old head, and F + B now is a
-    /// moment of the new head's wait, which a send outside the FIFO could
-    /// lower before the next check reads the window. Called after every
-    /// head change (`Executor::restart_send_window_if_head_changed`).
+    /// Start the window at F + B now, at the moment the FIFO's head changed,
+    /// its predecessor having left or a waiter having joined an empty FIFO:
+    /// what the window held belonged to the old head, or to no head, and
+    /// F + B now is a moment of the new head's wait, which a send outside the
+    /// FIFO could lower before the next check reads the window. Called after
+    /// every head change (`Executor::restart_send_window_if_head_changed`).
     pub(crate) fn restart_free_plus_passing_window(&mut self) {
         if !self.passing.is_empty() {
             self.free_plus_passing_peak = self.free_count() + self.passing_held;

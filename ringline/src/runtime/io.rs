@@ -4238,6 +4238,8 @@ impl Future for Admission<'_> {
                             task_id,
                         )
                     };
+                    // Joining an empty FIFO makes it the head.
+                    executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
                     this.state = AdmissionState::Waiting(id);
                     // Fall through: the pool is usually free, and costing the
                     // common case a wake-up round-trip would be a poor
