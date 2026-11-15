@@ -157,7 +157,9 @@ pub enum SendAdmissionOrder {
     /// waited when replies are pipelined: mio every send queued when a write
     /// returned `WouldBlock`, io_uring only a send whose own submission came
     /// back short or with `EAGAIN`. With one reply in flight per connection
-    /// they agree.
+    /// they agree, but for a short write that the next write completes:
+    /// io_uring counts any short completion as a wait, mio only a write that
+    /// returned `WouldBlock`.
     BoundedIdle,
     /// A waiter passes while B plus its own slots is at most the smaller of
     /// this many slots and P - H (O7). No latch.
@@ -247,14 +249,15 @@ impl PoolView {
     /// The figures of `pool` now, with the largest F + B since the previous
     /// `take` (`SendCopyPool::take_free_plus_passing_peak`): at a return, or
     /// when the head last changed, which restarts the window at F + B then
-    /// (`Executor::restart_send_window_if_head_changed`). The take starts the
-    /// next window empty.
+    /// (`Executor::restart_send_window_if_head_changed`). The head changes
+    /// when its predecessor leaves and when a waiter joins an empty FIFO. The
+    /// take starts the next window empty.
     ///
     /// So the window covers the current head's wait from the moment it
-    /// became the head, and nothing of its predecessor's: a send outside the
-    /// FIFO that lowers F + B after the change cannot hide that moment, and
-    /// returns made during the predecessor's wait cannot close the new
-    /// head's latch.
+    /// became the head, and nothing of its predecessor's or of the time the
+    /// FIFO was empty: a send outside the FIFO that lowers F + B after the
+    /// change cannot hide that moment, and returns made before it cannot
+    /// close the new head's latch.
     pub(crate) fn take(pool: &mut SendCopyPool) -> Self {
         let peak = pool.take_free_plus_passing_peak();
         Self::with_peak(pool, peak)
@@ -734,6 +737,10 @@ impl SendCompletions {
                 woken_in: 0,
             },
         });
+        // A waiter that joins an empty FIFO becomes its head.
+        if self.waiting_live == 0 && self.order != SendAdmissionOrder::Strict {
+            self.head_changed = true;
+        }
         self.waiting.push_back(id);
         self.waiting_live += 1;
         id
@@ -1289,9 +1296,9 @@ impl SendCompletions {
     }
 
     /// Whether the FIFO's head changed since the last call, under an order
-    /// other than `Strict`, and forget it. Set when the head is admitted,
-    /// cancelled, aborted, failed by `shutdown_write` or released with its
-    /// connection.
+    /// other than `Strict`, and forget it. Set when a waiter joins an empty
+    /// FIFO, and when the head is admitted, cancelled, aborted, failed by
+    /// `shutdown_write` or released with its connection.
     pub(crate) fn take_head_changed(&mut self) -> bool {
         std::mem::take(&mut self.head_changed)
     }
@@ -1842,9 +1849,9 @@ impl Executor {
     /// ([`SendCompletions::take_head_changed`]), restart the latch's F + B
     /// window at F + B now (`SendCopyPool::restart_free_plus_passing_window`).
     /// Called after every executor call that can change the head, where the
-    /// pool is at hand: `Admission`'s submit, cancel and abandon paths and
-    /// its `Drop`, `ConnCtx::abort`, `shutdown_write`, and the backends'
-    /// connection release.
+    /// pool is at hand: `Admission`'s enqueue on its first poll, its submit,
+    /// cancel and abandon paths and its `Drop`, `ConnCtx::abort`,
+    /// `shutdown_write`, and the backends' connection release.
     pub(crate) fn restart_send_window_if_head_changed(&mut self, pool: &mut SendCopyPool) {
         if self.send_completions.take_head_changed() {
             pool.restart_free_plus_passing_window();
@@ -3472,7 +3479,10 @@ mod tests {
     }
 
     /// The same, in io_uring's shape: the admitted head's slots are filled
-    /// from its reservation.
+    /// from its reservation. This passes without the restart: returning the
+    /// reservation's empty remainder records F + B before `mark_submitted`,
+    /// so the window already holds the 12. It checks that shape, not the
+    /// restart.
     #[test]
     fn a_head_admitted_from_a_filled_reservation_still_latches_the_next() {
         let mut copy_pool = SendCopyPool::new(16, 8);
@@ -3533,8 +3543,9 @@ mod tests {
         }
     }
 
-    /// Every way the head changes is flagged, and a waiter that leaves from
-    /// behind the head is not; `Strict` flags nothing.
+    /// Every way the head changes is flagged, a waiter joining an empty FIFO
+    /// included, and a waiter that joins or leaves behind the head is not;
+    /// `Strict` flags nothing.
     #[test]
     fn every_head_change_is_flagged_and_nothing_else() {
         let ways: [fn(&mut SendCompletions, SendId); 5] = [
@@ -3557,8 +3568,13 @@ mod tests {
         for (n, change) in ways.iter().enumerate() {
             let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
             let head = q.enqueue(1, 0, 6, task(1));
+            assert!(
+                q.take_head_changed(),
+                "way {n}: the first joined an empty FIFO"
+            );
             let behind = q.enqueue(2, 0, 1, task(2));
             q.enqueue(3, 0, 1, task(3));
+            assert!(!q.take_head_changed(), "way {n}: joined behind the head");
             q.cancel(behind);
             assert!(
                 !q.take_head_changed(),
@@ -3573,5 +3589,45 @@ mod tests {
         q.enqueue(2, 0, 1, task(2));
         q.cancel(head);
         assert!(!q.take_head_changed(), "Strict");
+    }
+
+    /// A waiter that joins an empty FIFO is a head change: its window starts
+    /// at F + B then, not with what the previous head left in it. 16 slots,
+    /// Bounded: A (4) is admitted and leaves the FIFO empty with F + B = 12;
+    /// a plain send takes 6 (F + B = 6); W (10) joins and its first check must
+    /// not latch on the 12, so a 1-slot waiter behind it passes.
+    #[test]
+    fn a_waiter_joining_an_empty_fifo_starts_a_new_window() {
+        let mut copy_pool = SendCopyPool::new(16, 8);
+        copy_pool.track_passing();
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Bounded);
+        let a = q.enqueue(1, 0, 4, task(1));
+        restart_if_head_changed(&mut q, &mut copy_pool);
+        assert_eq!(
+            q.admit(a, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Head
+        );
+        let permit = copy_pool.reserve_slots(4).unwrap();
+        q.mark_submitted(a);
+        restart_if_head_changed(&mut q, &mut copy_pool);
+        let plain: Vec<u16> = (0..6).map(|_| copy_pool.copy_in(b"p").unwrap().0).collect();
+        assert_eq!(copy_pool.free_count() + copy_pool.passing_held(), 6);
+        let w = q.enqueue(2, 0, 10, task(2));
+        restart_if_head_changed(&mut q, &mut copy_pool);
+        assert_eq!(
+            q.admit(w, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Wait
+        );
+        let small = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(small, PoolView::take(&mut copy_pool), true, idle),
+            Admit::Pass { slots: 1 },
+            "F + B stayed 6 < 10 throughout W's wait"
+        );
+        assert_eq!(q.counters.latch_closings, 0);
+        for slot in plain {
+            copy_pool.release(slot);
+        }
+        copy_pool.release_reservation(permit);
     }
 }

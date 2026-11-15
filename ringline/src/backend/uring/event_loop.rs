@@ -16946,6 +16946,214 @@ mod tests {
         assert!(!el.driver.send_slab.in_use(slab_idx));
     }
 
+    // ── The latch window's restart at its call sites ─────────────────
+
+    /// A loop under `Bounded` with 16 send-pool slots of 64 bytes.
+    fn bounded_order_loop() -> AsyncEventLoop<NoopHandler> {
+        make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(16, 64)
+                .send_admission_order(crate::SendAdmissionOrder::Bounded)
+                .build()
+                .expect("valid config"),
+        )
+    }
+
+    /// A fresh connection and its context.
+    fn bounded_conn(el: &mut AsyncEventLoop<NoopHandler>) -> ConnCtx {
+        let conn_index = accept_connection(el);
+        ConnCtx::new(conn_index, el.driver.connections.generation(conn_index))
+    }
+
+    /// Run `task` as a standalone task until it parks or finishes, and
+    /// return its index.
+    fn run_task(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        task: impl std::future::Future<Output = ()> + 'static,
+    ) -> u32 {
+        let idx = el.executor.standalone_slab.spawn(Box::pin(task)).unwrap();
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        idx
+    }
+
+    /// A bounded send of `data` on `ctx` that a task of its own waits for.
+    /// Returns the task's index and where it records whether the send was
+    /// admitted. Once `release` is set and the task is polled, it drops the
+    /// send instead, waiting, and then runs `after`.
+    fn waiting_send(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        ctx: ConnCtx,
+        data: &'static [u8],
+        release: std::rc::Rc<std::cell::Cell<bool>>,
+        after: impl FnOnce() + 'static,
+    ) -> (u32, std::rc::Rc<std::cell::Cell<Option<bool>>>) {
+        let admitted = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = admitted.clone();
+        let mut after = Some(after);
+        let idx = run_task(el, async move {
+            let mut admission = Some(ctx.send_admitted(data));
+            std::future::poll_fn(move |cx| {
+                if release.get() {
+                    drop(admission.take());
+                    if let Some(after) = after.take() {
+                        after();
+                    }
+                    return std::task::Poll::Ready(());
+                }
+                let polled = std::pin::Pin::new(admission.as_mut().expect("not resolved")).poll(cx);
+                match polled {
+                    std::task::Poll::Ready(result) => {
+                        record.set(Some(result.is_ok()));
+                        std::task::Poll::Ready(())
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await;
+        });
+        (idx, admitted)
+    }
+
+    /// Queue a plain send of `data` on `ctx` from a task; its slots stay
+    /// held, since no completion is dispatched for it.
+    fn plain_send(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx, data: &'static [u8]) {
+        run_task(el, async move {
+            ctx.send_nowait(data).expect("queued");
+        });
+    }
+
+    fn never() -> std::rc::Rc<std::cell::Cell<bool>> {
+        std::rc::Rc::new(std::cell::Cell::new(false))
+    }
+
+    /// A head cancelled by its future's drop makes the next waiter the head
+    /// with F + B = 12 >= its 10; a plain send then takes 3 before the new
+    /// head polls. The restart in `Admission`'s `Drop` records the 12, so the
+    /// latch closes and a 1-slot waiter waits. Without that restart, or with
+    /// `restart_send_window_if_head_changed` doing nothing, the waiter passes.
+    #[test]
+    fn a_cancelled_head_s_successor_latches_on_free_plus_passing_at_the_change() {
+        static FOUR: [u8; 4 * 64] = [1; 4 * 64];
+        static THREE: [u8; 3 * 64] = [2; 3 * 64];
+        static FOURTEEN: [u8; 14 * 64] = [3; 14 * 64];
+        static TEN: [u8; 10 * 64] = [4; 10 * 64];
+        static ONE: [u8; 64] = [5; 64];
+        let mut el = bounded_order_loop();
+        let outside = bounded_conn(&mut el);
+        let head = bounded_conn(&mut el);
+        let other = bounded_conn(&mut el);
+        plain_send(&mut el, outside, &FOUR);
+        assert_eq!(el.driver.send_copy_pool.free_count(), 12);
+        let release = never();
+        let (first, _) = waiting_send(&mut el, head, &FOURTEEN, release.clone(), move || {
+            outside.send_nowait(&THREE).expect("queued");
+        });
+        // On the first's connection, so it cannot pass it.
+        let (_, second) = waiting_send(&mut el, head, &TEN, never(), || {});
+        release.set(true);
+        el.executor.ready_queue.push_back(first | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 9);
+        assert_eq!(second.get(), None, "the second waits: 9 < 10");
+        let (_, small) = waiting_send(&mut el, other, &ONE, never(), || {});
+        assert_eq!(
+            small.get(),
+            None,
+            "F + B was 12 >= 10 when the second became the head"
+        );
+    }
+
+    /// A waiter that joins an empty FIFO is a head change. A head admitted
+    /// with 16 free leaves the FIFO empty and F + B = 12; a plain send takes
+    /// 6; a 10-slot waiter joins, and its window restarts at 6, so a 1-slot
+    /// waiter behind it passes. Without the restart after `Admission`'s
+    /// enqueue, the 10-slot waiter latches on the 12 and the 1-slot one
+    /// waits.
+    #[test]
+    fn a_waiter_joining_an_empty_fifo_does_not_latch_on_what_came_before() {
+        static FOUR: [u8; 4 * 64] = [1; 4 * 64];
+        static SIX: [u8; 6 * 64] = [2; 6 * 64];
+        static TEN: [u8; 10 * 64] = [3; 10 * 64];
+        static ONE: [u8; 64] = [4; 64];
+        let mut el = bounded_order_loop();
+        let outside = bounded_conn(&mut el);
+        let first = bounded_conn(&mut el);
+        let large = bounded_conn(&mut el);
+        let small = bounded_conn(&mut el);
+        let (_, admitted) = waiting_send(&mut el, first, &FOUR, never(), || {});
+        assert_eq!(admitted.get(), Some(true), "16 free");
+        plain_send(&mut el, outside, &SIX);
+        assert_eq!(el.driver.send_copy_pool.free_count(), 6);
+        let (_, waiting) = waiting_send(&mut el, large, &TEN, never(), || {});
+        assert_eq!(waiting.get(), None);
+        let (_, passed) = waiting_send(&mut el, small, &ONE, never(), || {});
+        assert_eq!(
+            passed.get(),
+            Some(true),
+            "F + B stayed 6 < 10 through the large waiter's wait"
+        );
+        assert_eq!(
+            el.executor
+                .send_admission_counters(&el.driver.send_copy_pool)
+                .latch_closings,
+            0
+        );
+    }
+
+    /// A head admitted with a waiter behind it makes that waiter the head
+    /// with F + B = 12 >= its 10; the admitted head's task then takes 6 with
+    /// a plain send before the new head polls. The latch closes, so a 1-slot
+    /// waiter waits.
+    ///
+    /// On io_uring the admitted head's plain path also records F + B when it
+    /// returns its reservation's empty remainder, so this holds without the
+    /// restart after `Admission`'s submit; it fails if neither records it.
+    #[test]
+    fn an_admitted_head_s_successor_latches_on_free_plus_passing_at_the_change() {
+        static THIRTEEN: [u8; 13 * 64] = [1; 13 * 64];
+        static FOUR: [u8; 4 * 64] = [2; 4 * 64];
+        static SIX: [u8; 6 * 64] = [3; 6 * 64];
+        static TEN: [u8; 10 * 64] = [4; 10 * 64];
+        static ONE: [u8; 64] = [5; 64];
+        let mut el = bounded_order_loop();
+        let outside = bounded_conn(&mut el);
+        let later = bounded_conn(&mut el);
+        let first = bounded_conn(&mut el);
+        let second = bounded_conn(&mut el);
+        let small = bounded_conn(&mut el);
+        plain_send(&mut el, outside, &THIRTEEN);
+        let run = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(run.tag(), Some(OpTag::SendMsgCoalesced));
+        assert_eq!(el.driver.send_copy_pool.free_count(), 3);
+        // The first waits for room; once admitted, its task takes 6 more.
+        let admitted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let record = admitted.clone();
+        run_task(&mut el, async move {
+            if let Ok(sent) = first.send_admitted(&FOUR).await {
+                record.set(true);
+                drop(sent);
+                later.send_nowait(&SIX).expect("queued");
+            }
+        });
+        let (_, waits) = waiting_send(&mut el, second, &TEN, never(), || {});
+        assert!(!admitted.get());
+        // The plain send completes: 16 free, and the capacity wake admits
+        // the first, which leaves the second the head.
+        el.test_dispatch_cqe(run.raw(), 13 * 64, 0);
+        el.wake_capacity_if_released();
+        el.poll_ready_tasks();
+        assert!(admitted.get(), "the first was admitted");
+        assert_eq!(el.driver.send_copy_pool.free_count(), 6);
+        assert_eq!(waits.get(), None, "the second waits: 6 < 10");
+        let (_, blocked) = waiting_send(&mut el, small, &ONE, never(), || {});
+        assert_eq!(
+            blocked.get(),
+            None,
+            "F + B was 12 >= 10 when the second became the head"
+        );
+    }
+
     /// Under `BoundedIdle` a coalesced run that settles two awaited sends
     /// ends one wait: when the run came back short and waited for room, the
     /// connection is not idle once both have settled. Calling
