@@ -700,8 +700,8 @@ fn assert_head_kept(order: ringline::SendAdmissionOrder, passing: &Passing) {
     );
 }
 
-/// Under `Strict` nothing passes the waiting head, and the counters stay
-/// zero.
+/// Under `Strict` nothing passes the waiting head, and every count stays
+/// zero; the main region's free slots are the four the stalled sends leave.
 #[test]
 fn strict_admits_nothing_past_a_waiting_head() {
     let order = ringline::SendAdmissionOrder::Strict;
@@ -709,7 +709,13 @@ fn strict_admits_nothing_past_a_waiting_head() {
     assert_head_kept(order, &passing);
     assert_eq!(passing.reader, None, "{passing:?}");
     assert_eq!(passing.staller, None, "{passing:?}");
-    assert_eq!(passing.counters, ringline::SendAdmissionCounters::default());
+    assert_eq!(
+        passing.counters,
+        ringline::SendAdmissionCounters {
+            main_free: 4,
+            ..ringline::SendAdmissionCounters::default()
+        }
+    );
 }
 
 /// Under `FirstFit`, `Bounded` and `Budget(2)` a send that fits passes the

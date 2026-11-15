@@ -674,6 +674,25 @@ impl Config {
                 "send_copy_count must be > 0".into(),
             ));
         }
+        if let Some((small_slots, small_slot_size)) = self.send_admission_order.small_region() {
+            // The small region's slots are indexed after the main region's,
+            // in the 16 bits a send's completion carries, and u16::MAX
+            // means "no slot".
+            if small_slots == 0 || small_slot_size == 0 {
+                return Err(crate::error::Error::RingSetup(
+                    "SendAdmissionOrder::SplitPool needs small_slots > 0 and small_slot_size > 0"
+                        .into(),
+                ));
+            }
+            if self.send_copy_count as usize + small_slots as usize > u16::MAX as usize {
+                return Err(crate::error::Error::RingSetup(format!(
+                    "SendAdmissionOrder::SplitPool: {} main and {small_slots} small send-pool \
+                     slots exceed the {} slot indices a send carries",
+                    self.send_copy_count,
+                    u16::MAX
+                )));
+            }
+        }
         self.validate_tls_slot_size()?;
         if self.tls_handshake_timeout.is_zero()
             || self.tls_handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT
@@ -2032,6 +2051,28 @@ mod tests {
     #[test]
     fn validate_send_copy_count_zero_rejected() {
         assert!(config_with(|c| c.send_copy_count = 0).validate().is_err());
+    }
+
+    /// `SplitPool` needs a small region, and the two regions' slots must fit
+    /// the 16-bit slot index a send carries.
+    #[test]
+    fn validate_split_pool_needs_a_small_region_that_fits_the_slot_index() {
+        let split = |small_slots, small_slot_size| crate::SendAdmissionOrder::SplitPool {
+            small_slots,
+            small_slot_size,
+        };
+        let with = |count: u16, order| {
+            config_with(|c| {
+                c.send_copy_count = count;
+                c.send_admission_order = order;
+            })
+            .validate()
+        };
+        assert!(with(1024, split(512, 1024)).is_ok());
+        assert!(with(1024, split(0, 1024)).is_err());
+        assert!(with(1024, split(512, 0)).is_err());
+        assert!(with(65_000, split(535, 64)).is_ok(), "65535 slots in all");
+        assert!(with(65_000, split(536, 64)).is_err());
     }
 
     #[test]

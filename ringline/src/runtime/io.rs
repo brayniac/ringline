@@ -1429,6 +1429,7 @@ impl ConnCtx {
             generation: self.generation,
             data,
             state: AdmissionState::Fresh,
+            small: false,
             _not_send: PhantomData,
         }
     }
@@ -4107,6 +4108,11 @@ pub struct Admission<'a> {
     generation: u32,
     data: &'a [u8],
     state: AdmissionState,
+    /// Under `SendAdmissionOrder::SplitPool`, the send takes a slot of the
+    /// pool's small region and waits in the small FIFO. Decided once, on the
+    /// first poll (`bounded_send_small`), and followed by the queue and the
+    /// submit alike.
+    small: bool,
     /// Makes the type `!Send`: a poll on another worker would index that
     /// worker's tables.
     _not_send: PhantomData<*const ()>,
@@ -4190,26 +4196,40 @@ impl Future for Admission<'_> {
                     {
                         return this.finish(Err(crate::handler::close_notify_sent_error()));
                     }
-                    let needed = {
+                    let split = executor.send_admission_order().small_region().is_some();
+                    let (needed, small) = {
                         let ctx = driver.make_ctx();
-                        crate::handler::bounded_send_slots(
+                        let needed = crate::handler::bounded_send_slots(
                             ctx.send_copy_pool,
                             ctx.tls_table,
                             this.conn_index,
                             this.data.len(),
-                        )
+                        );
+                        let small = split
+                            && crate::handler::bounded_send_small(
+                                ctx.send_copy_pool,
+                                ctx.tls_table,
+                                this.conn_index,
+                                this.data.len(),
+                            );
+                        (needed, small)
                     };
                     let needed = match needed {
                         Ok(n) => n,
                         // Permanent: no amount of waiting grows the pool.
                         Err(e) => return this.finish(Err(e)),
                     };
-                    let id = executor.enqueue_send_capacity(
-                        this.conn_index,
-                        this.generation,
-                        needed,
-                        task_id,
-                    );
+                    let id = if small {
+                        this.small = true;
+                        executor.enqueue_small_send(this.conn_index, this.generation, task_id)
+                    } else {
+                        executor.enqueue_send_capacity(
+                            this.conn_index,
+                            this.generation,
+                            needed,
+                            task_id,
+                        )
+                    };
                     this.state = AdmissionState::Waiting(id);
                     // Fall through: the pool is usually free, and costing the
                     // common case a wake-up round-trip would be a poor
@@ -4255,7 +4275,8 @@ impl Admission<'_> {
     /// [`admit`](Executor::send_capacity_admit) decides, and a send it lets
     /// pass the head is submitted with the pool marking what it takes
     /// (`SendCopyPool::begin_passing`), so B counts those slots until they
-    /// return.
+    /// return. Under `SplitPool` a send of the small FIFO is submitted into a
+    /// small slot (`send_bounded_small`).
     fn poll_waiting(
         &mut self,
         driver: &mut Driver,
@@ -4277,7 +4298,7 @@ impl Admission<'_> {
                 .send_capacity_admit(id, pool, first_poll, || driver.send_idle(conn_index))
             {
                 Admit::Wait => return pending(cx),
-                Admit::Head => None,
+                Admit::Head | Admit::Small => None,
                 Admit::Pass { slots } => Some(slots),
             }
         };
@@ -4287,7 +4308,11 @@ impl Admission<'_> {
             if passing.is_some() {
                 ctx.send_copy_pool.begin_passing();
             }
-            let submit = ctx.send_bounded(token, self.data, id);
+            let submit = if self.small {
+                ctx.send_bounded_small(token, self.data, id)
+            } else {
+                ctx.send_bounded(token, self.data, id)
+            };
             if passing.is_some() {
                 ctx.send_copy_pool.end_passing();
             }
@@ -4300,6 +4325,7 @@ impl Admission<'_> {
                 // cancels it.
                 let mut sent = SendCompletion::pending(self.conn_index, self.generation, id);
                 match passing {
+                    None if self.small => executor.mark_send_small(id),
                     None => executor.mark_send_submitted(id),
                     Some(slots) => {
                         executor.mark_send_passed(id, slots);

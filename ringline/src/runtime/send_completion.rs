@@ -103,6 +103,13 @@
 //! that could pass. Those polls check again with `admit`. A poll whose
 //! `admit` says wait also sets `scan_due`, so a scan that woke a waiter which
 //! then could not pass (the pool changed in between) is followed by another.
+//!
+//! `SplitPool` passes no head. Its waiters stay in the one `waiting` list,
+//! each marked for the small FIFO or the main one, and each FIFO's head is the
+//! oldest waiter marked for it whose connection has no earlier waiter in
+//! either FIFO ([`region_head`](SendCompletions::region_head)). The same
+//! `scan_due` and release hook reach its wake, which wakes each FIFO's head
+//! whose region has room.
 
 use std::collections::VecDeque;
 use std::io;
@@ -149,9 +156,46 @@ pub enum SendAdmissionOrder {
     /// As `Budget`, and only a waiter whose connection meets `BoundedIdle`'s
     /// condition (O7w). No latch.
     BudgetIdle(u16),
+    /// Two pools (O5): the copy pool gains a small region of `small_slots`
+    /// slots of `small_slot_size` bytes. A bounded send on a plain (not TLS)
+    /// connection whose message fits one small slot takes a small slot, and
+    /// waits in the small FIFO; every other send uses the main region, and a
+    /// bounded one waits in the main FIFO, as under `Strict`. Each FIFO is
+    /// strict: its head is admitted when its region has room for it. A waiter
+    /// whose connection has an earlier waiter in either FIFO is not its
+    /// FIFO's head until that waiter leaves, so it holds back no other
+    /// waiter. Nothing passes a head, so B stays 0.
+    SplitPool {
+        /// Slots in the small region.
+        small_slots: u16,
+        /// Bytes per small slot.
+        small_slot_size: u32,
+    },
 }
 
 impl SendAdmissionOrder {
+    /// Whether the order lets a waiter pass a head that does not fit, so the
+    /// pool keeps the passing marks B counts: every order but `Strict` and
+    /// `SplitPool`.
+    pub(crate) fn lets_pass(self) -> bool {
+        !matches!(
+            self,
+            SendAdmissionOrder::Strict | SendAdmissionOrder::SplitPool { .. }
+        )
+    }
+
+    /// The small region `SplitPool` gives the copy pool, as `(slots, bytes
+    /// per slot)`.
+    pub(crate) fn small_region(self) -> Option<(u16, u32)> {
+        match self {
+            SendAdmissionOrder::SplitPool {
+                small_slots,
+                small_slot_size,
+            } => Some((small_slots, small_slot_size)),
+            _ => None,
+        }
+    }
+
     /// Whether a waiter passes only from a connection with no send queued or
     /// in flight whose most recent send did not wait for room:
     /// `BoundedIdle` and `BudgetIdle`. The drivers keep each connection's
@@ -172,8 +216,10 @@ pub(crate) struct PoolView {
     pub(crate) free: usize,
     /// Slots held by sends that passed a head (B).
     pub(crate) passing: usize,
-    /// Slots in the pool (P).
+    /// Slots in the pool's main region (P).
     pub(crate) slots: usize,
+    /// Slots of the small region available, under `SplitPool`.
+    pub(crate) small_free: usize,
 }
 
 impl PoolView {
@@ -183,6 +229,7 @@ impl PoolView {
             free: pool.free_count(),
             passing: pool.passing_held(),
             slots: pool.slot_count(),
+            small_free: pool.small_free_count(),
         }
     }
 }
@@ -197,13 +244,16 @@ pub(crate) enum Admit {
     /// The waiter passes the head, which does not fit. `slots` is the
     /// waiter's `required_slots`.
     Pass { slots: usize },
+    /// Under `SplitPool`, the waiter is the small FIFO's head and a small
+    /// slot is free.
+    Small,
 }
 
 /// What the admission orders did on one worker, for the Experiment C server
 /// (`docs/send-admission-design.md`, section 4). Read with
 /// [`send_admission_counters`]. Every count starts at zero when the worker
-/// starts and only grows, except `passing_held`; under `Strict` all stay
-/// zero.
+/// starts and only grows, except `passing_held` and the free slots, which are
+/// figures of now; under `Strict` all but `main_free` stay zero.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SendAdmissionCounters {
@@ -225,6 +275,12 @@ pub struct SendAdmissionCounters {
     pub wake_scans: u64,
     /// The waiters those scans woke.
     pub scan_wakes: u64,
+    /// Slots of the main region free now.
+    pub main_free: u64,
+    /// Under `SplitPool`, slots of the small region free now.
+    pub small_free: u64,
+    /// Under `SplitPool`, sends admitted from the small FIFO.
+    pub small_admissions: u64,
 }
 
 /// The admission counters of the worker this runs on: see
@@ -279,6 +335,9 @@ enum Completion {
         /// its connection arrived before it. `by_conn` keeps no order. 0
         /// under `Strict`, which never reads it.
         seq: u32,
+        /// Under `SplitPool`, the waiter takes a slot of the small region and
+        /// waits in the small FIFO; `required_slots` is then 1.
+        small: bool,
     },
     /// Submitted to the driver; no completion yet.
     InFlight,
@@ -573,6 +632,31 @@ impl SendCompletions {
         required_slots: usize,
         task_id: u32,
     ) -> SendId {
+        self.enqueue_in(conn_index, generation, required_slots, task_id, false)
+    }
+
+    /// Under `SplitPool`, append a waiter of the small FIFO, which needs one
+    /// small slot, and return its id. `Admission`'s first poll, for a send
+    /// `bounded_send_small` puts in the small region.
+    pub(crate) fn enqueue_small(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        task_id: u32,
+    ) -> SendId {
+        debug_assert!(self.order.small_region().is_some());
+        self.enqueue_in(conn_index, generation, 1, task_id, true)
+    }
+
+    /// [`enqueue`](Self::enqueue) into the small FIFO if `small`.
+    fn enqueue_in(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        required_slots: usize,
+        task_id: u32,
+        small: bool,
+    ) -> SendId {
         let seq = if self.order == SendAdmissionOrder::Strict {
             0
         } else {
@@ -587,6 +671,7 @@ impl SendCompletions {
                 generation,
                 required_slots,
                 seq,
+                small,
             },
         });
         self.waiting.push_back(id);
@@ -809,8 +894,9 @@ impl SendCompletions {
     /// ([`may_pass`](Self::may_pass)). `idle` says whether `id`'s connection
     /// has no send queued or in flight and its most recent send did not
     /// wait for room; it is called only under `BoundedIdle` and `BudgetIdle`,
-    /// and only for a
-    /// waiter that passes every other test.
+    /// and only for a waiter that passes every other test. Under `SplitPool`
+    /// it admits each FIFO's head when its region has room
+    /// ([`admit_split`](Self::admit_split)).
     ///
     /// An answer of wait on any poll but the first sets `scan_due`: the
     /// poll may have come from a scan that counted on this waiter's slots,
@@ -836,6 +922,9 @@ impl SendCompletions {
 
     /// [`admit`](Self::admit) without its effect on `scan_due`.
     fn admit_inner(&mut self, id: SendId, pool: PoolView, idle: impl FnOnce() -> bool) -> Admit {
+        if self.order.small_region().is_some() {
+            return self.admit_split(id, pool);
+        }
         let Some((head, head_needs)) = self.head_and_need() else {
             return Admit::Wait;
         };
@@ -869,6 +958,60 @@ impl SendCompletions {
         Admit::Pass {
             slots: required_slots,
         }
+    }
+
+    /// Under `SplitPool`: `id` is admitted when it is its FIFO's head
+    /// ([`region_head`](Self::region_head)) and its region has room for it.
+    fn admit_split(&mut self, id: SendId, pool: PoolView) -> Admit {
+        let Some(Entry {
+            state: Completion::Waiting { small, .. },
+            ..
+        }) = self.entry(id)
+        else {
+            return Admit::Wait;
+        };
+        let small = *small;
+        let Some((head, required_slots, _)) = self.region_head(small) else {
+            return Admit::Wait;
+        };
+        if head != id {
+            return Admit::Wait;
+        }
+        match small {
+            true if pool.small_free >= required_slots => Admit::Small,
+            false if pool.free >= required_slots => Admit::Head,
+            _ => Admit::Wait,
+        }
+    }
+
+    /// Under `SplitPool`, the head of the small FIFO (`small`) or the main
+    /// one: the oldest waiter of that FIFO whose connection has no earlier
+    /// waiter in either FIFO. Returns its id, `required_slots` and owner.
+    ///
+    /// A waiter passed over here is held back by an earlier waiter on its
+    /// connection in the other FIFO, so it holds back no waiter of its own.
+    /// Visits `waiting` from the front up to the head, skipping stale ids and
+    /// the other FIFO's waiters, and for each waiter of this FIFO the
+    /// operations of its connection; the waiters held back that way are the
+    /// only ones of this FIFO it visits before the head.
+    fn region_head(&mut self, small: bool) -> Option<(SendId, usize, u32)> {
+        self.front()?;
+        self.waiting.iter().find_map(|&id| match self.entry(id) {
+            Some(Entry {
+                conn_index,
+                task_id,
+                state:
+                    Completion::Waiting {
+                        required_slots,
+                        seq,
+                        small: region,
+                        ..
+                    },
+            }) if *region == small && !self.has_earlier_waiter(*conn_index, *seq) => {
+                Some((id, *required_slots, *task_id))
+            }
+            _ => None,
+        })
     }
 
     /// The FIFO's head and the slots it needs.
@@ -910,7 +1053,7 @@ impl SendCompletions {
         pool: PoolView,
     ) -> bool {
         match self.order {
-            SendAdmissionOrder::Strict => false,
+            SendAdmissionOrder::Strict | SendAdmissionOrder::SplitPool { .. } => false,
             SendAdmissionOrder::FirstFit => true,
             SendAdmissionOrder::Bounded | SendAdmissionOrder::BoundedIdle => {
                 self.latched_head != Some(head)
@@ -971,7 +1114,8 @@ impl SendCompletions {
     /// The capacity wake under an order other than `Strict`, and the scan
     /// [`scan_due`](Self::scan_due) asks for: push onto `wakes` the head's
     /// task if the head fits, and otherwise the tasks of the waiters behind
-    /// it that could pass, oldest first. Clears `scan_due`.
+    /// it that could pass, oldest first. Clears `scan_due`. Under `SplitPool`,
+    /// [`scan_split`](Self::scan_split) instead.
     ///
     /// Each waiter woken is counted against the free slots, and against the
     /// budget under `Budget`, as if it had passed, so that the waiters woken
@@ -999,6 +1143,10 @@ impl SendCompletions {
     ) {
         debug_assert_ne!(self.order, SendAdmissionOrder::Strict);
         self.scan_due = false;
+        if self.order.small_region().is_some() {
+            self.scan_split(pool, wakes);
+            return;
+        }
         let Some((head, head_needs)) = self.head_and_need() else {
             return;
         };
@@ -1045,6 +1193,28 @@ impl SendCompletions {
             left.passing += *required_slots;
         }
         self.counters.scan_wakes += (wakes.len() - woken_before) as u64;
+    }
+
+    /// Under `SplitPool`, the capacity wake: each FIFO's head
+    /// ([`region_head`](Self::region_head)) if its region has room for it. A
+    /// release in either region, a head that left and a waiter whose earlier
+    /// waiter on its connection left all reach here, through the release
+    /// hook or `scan_due`.
+    fn scan_split(&mut self, pool: PoolView, wakes: &mut Vec<u32>) {
+        for (small, free) in [(false, pool.free), (true, pool.small_free)] {
+            if let Some((_, required_slots, task_id)) = self.region_head(small)
+                && free >= required_slots
+            {
+                wakes.push(task_id);
+            }
+        }
+    }
+
+    /// `id`, the small FIFO's head, was submitted: count the admission, then
+    /// [`mark_submitted`](Self::mark_submitted).
+    pub(crate) fn mark_small(&mut self, id: SendId) -> Option<u32> {
+        self.counters.small_admissions += 1;
+        self.mark_submitted(id)
     }
 
     /// `id`, a waiter [`admit`](Self::admit) let pass the head with
@@ -1429,6 +1599,27 @@ impl Executor {
         self.send_completions.admit(id, pool, first_poll, idle)
     }
 
+    /// [`SendCompletions::enqueue_small`]. `Admission`, first poll, under
+    /// `SplitPool`, for a send that takes a small slot.
+    pub(crate) fn enqueue_small_send(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        task_id: u32,
+    ) -> SendId {
+        self.send_completions
+            .enqueue_small(conn_index, generation, task_id)
+    }
+
+    /// [`SendCompletions::mark_small`] plus a wake of the new head of the
+    /// whole FIFO, as [`mark_send_submitted`](Self::mark_send_submitted)
+    /// does. `Admission`, after submitting the small FIFO's head.
+    pub(crate) fn mark_send_small(&mut self, id: SendId) {
+        if let Some(next) = self.send_completions.mark_small(id) {
+            let _ = self.wake_task(next);
+        }
+    }
+
     /// [`SendCompletions::mark_passed`]. `Admission`, after submitting a
     /// send that passed the head. `id` was behind the head, so the head does
     /// not change and nothing is woken.
@@ -1443,6 +1634,8 @@ impl Executor {
         SendAdmissionCounters {
             passing_held: pool.passing_held() as u64,
             passing_held_max: pool.passing_peak() as u64,
+            main_free: pool.free_count() as u64,
+            small_free: pool.small_free_count() as u64,
             ..self.send_completions.counters
         }
     }
@@ -2208,6 +2401,7 @@ mod tests {
             free,
             passing,
             slots,
+            small_free: 0,
         }
     }
 
@@ -2411,7 +2605,7 @@ mod tests {
                 Admit::Wait => {
                     q.cancel(id);
                 }
-                Admit::Head => panic!("not the head"),
+                Admit::Head | Admit::Small => panic!("not the head"),
             }
             assert!(copy_pool.passing_held() <= limit, "B within min(R, P - H)");
         }
@@ -2642,5 +2836,149 @@ mod tests {
         copy_pool.release(first);
         let counters = exec.send_admission_counters(&copy_pool);
         assert_eq!((counters.passing_held, counters.passing_held_max), (1, 2));
+    }
+
+    // ── SplitPool ───────────────────────────────────────────────────────
+
+    const SPLIT: SendAdmissionOrder = SendAdmissionOrder::SplitPool {
+        small_slots: 2,
+        small_slot_size: 1024,
+    };
+
+    fn split_pool(free: usize, small_free: usize) -> PoolView {
+        PoolView {
+            free,
+            passing: 0,
+            slots: 8,
+            small_free,
+        }
+    }
+
+    /// A large head waits in the main FIFO while small waiters are admitted
+    /// from the small region, which is strict in turn: its head goes first,
+    /// and only while a small slot is free.
+    #[test]
+    fn split_pool_admits_small_waiters_while_a_large_head_waits() {
+        let mut q = SendCompletions::with_order(SPLIT);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let first = q.enqueue_small(2, 0, task(2));
+        let second = q.enqueue_small(3, 0, task(3));
+        let third = q.enqueue_small(4, 0, task(4));
+        assert_eq!(q.admit(head, split_pool(4, 2), true, idle), Admit::Wait);
+        assert_eq!(
+            q.admit(second, split_pool(4, 2), true, idle),
+            Admit::Wait,
+            "first is ahead"
+        );
+        assert_eq!(q.admit(first, split_pool(4, 2), true, idle), Admit::Small);
+        assert_eq!(
+            q.mark_small(first),
+            None,
+            "the whole FIFO's head did not move"
+        );
+        assert_eq!(q.admit(second, split_pool(4, 1), true, idle), Admit::Small);
+        q.mark_small(second);
+        assert_eq!(
+            q.admit(third, split_pool(4, 0), true, idle),
+            Admit::Wait,
+            "no small slot"
+        );
+        assert_eq!(q.admit(third, split_pool(4, 1), true, idle), Admit::Small);
+        assert_eq!(q.admit(head, split_pool(4, 1), true, idle), Admit::Wait);
+        assert_eq!(q.admit(head, split_pool(6, 0), true, idle), Admit::Head);
+        assert_eq!(q.counters.small_admissions, 2);
+    }
+
+    /// A waiter whose connection has an earlier waiter in the other FIFO is
+    /// not admitted, in either direction, and is not its FIFO's head, so the
+    /// waiters behind it in that FIFO are admitted as if it were not there.
+    #[test]
+    fn split_pool_keeps_each_connection_s_order_across_regions() {
+        let mut q = SendCompletions::with_order(SPLIT);
+        // Small before main on connection 1.
+        let small_first = q.enqueue_small(1, 0, task(1));
+        let main_behind = q.enqueue(1, 0, 1, task(2));
+        let main_other = q.enqueue(2, 0, 1, task(3));
+        // Main before small on connection 3.
+        let main_first = q.enqueue(3, 0, 6, task(4));
+        let small_behind = q.enqueue_small(3, 0, task(5));
+        let small_other = q.enqueue_small(4, 0, task(6));
+
+        assert_eq!(
+            q.admit(main_behind, split_pool(4, 0), true, idle),
+            Admit::Wait
+        );
+        assert_eq!(
+            q.admit(main_other, split_pool(4, 0), true, idle),
+            Admit::Head,
+            "main_behind is not the main head"
+        );
+        q.mark_submitted(main_other);
+        assert_eq!(
+            q.admit(small_first, split_pool(4, 1), true, idle),
+            Admit::Small
+        );
+        q.mark_small(small_first);
+        assert_eq!(
+            q.admit(main_behind, split_pool(4, 0), true, idle),
+            Admit::Head,
+            "its connection's earlier waiter left"
+        );
+        q.mark_submitted(main_behind);
+
+        assert_eq!(
+            q.admit(small_behind, split_pool(4, 2), true, idle),
+            Admit::Wait
+        );
+        assert_eq!(
+            q.admit(small_other, split_pool(4, 2), true, idle),
+            Admit::Small,
+            "small_behind is not the small head"
+        );
+        q.cancel(main_first);
+        assert_eq!(
+            q.admit(small_behind, split_pool(4, 2), true, idle),
+            Admit::Small
+        );
+    }
+
+    /// The capacity wake under `SplitPool` wakes each FIFO's head whose
+    /// region has room for it, and no other waiter.
+    #[test]
+    fn split_pool_wakes_each_fifo_s_head_when_its_region_has_room() {
+        let mut q = SendCompletions::with_order(SPLIT);
+        q.enqueue(1, 0, 6, task(1));
+        q.enqueue(2, 0, 1, task(2));
+        q.enqueue_small(3, 0, task(3));
+        q.enqueue_small(4, 0, task(4));
+        assert_eq!(scanned(&mut q, split_pool(4, 0)), Vec::<u32>::new());
+        assert_eq!(scanned(&mut q, split_pool(4, 2)), vec![task(3)]);
+        assert_eq!(scanned(&mut q, split_pool(6, 0)), vec![task(1)]);
+        assert_eq!(scanned(&mut q, split_pool(6, 2)), vec![task(1), task(3)]);
+    }
+
+    /// Under `SplitPool` a waiter that leaves asks for the wake, which then
+    /// finds the waiter it held back as its FIFO's head.
+    #[test]
+    fn split_pool_wakes_the_waiter_an_earlier_one_held_back() {
+        let mut q = SendCompletions::with_order(SPLIT);
+        let small_first = q.enqueue_small(1, 0, task(1));
+        q.enqueue(1, 0, 1, task(2));
+        assert!(scanned(&mut q, split_pool(4, 0)).is_empty(), "held back");
+        q.cancel(small_first);
+        assert!(q.scan_due());
+        assert_eq!(scanned(&mut q, split_pool(4, 0)), vec![task(2)]);
+    }
+
+    /// The executor's counters report each region's free slots.
+    #[test]
+    fn executor_counters_report_each_region_s_free_slots() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.set_send_admission_order(SPLIT);
+        let mut copy_pool = SendCopyPool::with_small_region(8, 64, 2, 16);
+        copy_pool.copy_in(b"main").unwrap();
+        copy_pool.copy_in_small(b"small").unwrap();
+        let counters = exec.send_admission_counters(&copy_pool);
+        assert_eq!((counters.main_free, counters.small_free), (7, 1));
     }
 }

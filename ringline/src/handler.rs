@@ -363,6 +363,24 @@ pub(crate) fn bounded_send_slots(
     Ok(needed)
 }
 
+/// Whether a bounded send of `len` bytes on `conn_index` takes a slot of the
+/// pool's small region: the pool has one (`SendAdmissionOrder::SplitPool`),
+/// the connection is plain, and the message fits one small slot. An empty
+/// message needs no slot and stays in the main FIFO.
+///
+/// `Admission` calls this once, on its first poll, and the small FIFO and
+/// `DriverCtx::send_bounded_small` follow its answer.
+pub(crate) fn bounded_send_small(
+    pool: &SendCopyPool,
+    tls_table: *mut crate::tls::TlsTable,
+    conn_index: u32,
+    len: usize,
+) -> bool {
+    // SAFETY: read-only probe, under the contract of `bounded_send_slots`.
+    let tls = !tls_table.is_null() && unsafe { (*tls_table).has(conn_index) };
+    pool.small_slot_count() > 0 && len > 0 && len <= pool.small_slot_size() as usize && !tls
+}
+
 #[cfg(has_io_uring)]
 /// A short-lived borrow of driver fields, built by `Driver::make_ctx`.
 pub(crate) struct DriverCtx<'a> {
@@ -958,6 +976,62 @@ impl<'a> DriverCtx<'a> {
             // bounded send must still resolve, so settle it now.
             self.settled_sends_push(id, Ok(0));
         }
+        Ok(())
+    }
+
+    /// Submit a bounded send that takes a slot of the pool's small region
+    /// (`bounded_send_small`): `SendAdmissionOrder::SplitPool` admitted it as
+    /// the small FIFO's head with a small slot free. The one-slot form of
+    /// [`send_bounded`](Self::send_bounded)'s plain path, with the same
+    /// generation check and `closing_refusal`, its slot from the small
+    /// region, and `id` and the message's length on that slot. The slot is
+    /// sent, advanced and released through the same paths as a main slot.
+    ///
+    /// On `Ok` exactly one completion for `id` is coming, from the send's CQE
+    /// or a teardown that destroys the queued entry. On `Err` nothing was
+    /// queued.
+    pub(crate) fn send_bounded_small(
+        &mut self,
+        conn: ConnId,
+        data: &[u8],
+        id: crate::runtime::send_completion::SendId,
+    ) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
+        }
+        debug_assert!(
+            bounded_send_small(self.send_copy_pool, self.tls_table, conn.index, data.len()),
+            "a send outside the small region reached send_bounded_small"
+        );
+        let Some((slot, ptr, len)) = self.send_copy_pool.copy_in_small(data) else {
+            return Err(io::Error::other("send copy pool exhausted"));
+        };
+        self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
+        let user_data = crate::completion::UserData::encode(
+            crate::completion::OpTag::Send,
+            conn.index,
+            crate::completion::UserData::send_payload(slot, conn.generation),
+        );
+        let entry =
+            crate::backend::uring::sqe::Sqe::stream_send(conn.index, ptr, len, user_data.raw());
+        self.submit_or_queue(
+            conn.index,
+            BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+            },
+        );
         Ok(())
     }
 
@@ -2721,6 +2795,50 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
+        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
+            data.to_vec(),
+            id,
+            data.len() as u32,
+            permit,
+        ));
+        self.mark_send_dirty(idx);
+        Ok(())
+    }
+
+    /// Queue a bounded send that takes a slot of the pool's small region
+    /// (`bounded_send_small`): `SendAdmissionOrder::SplitPool` admitted it as
+    /// the small FIFO's head with a small slot free. As
+    /// [`send_bounded`](Self::send_bounded)'s plain path, with a permit of one
+    /// small slot (`SendCopyPool::reserve_small`) held on the entry until it
+    /// flushes or is discarded. On `Err` nothing was reserved or queued.
+    pub(crate) fn send_bounded_small(
+        &mut self,
+        conn: ConnId,
+        data: &[u8],
+        id: crate::runtime::send_completion::SendId,
+    ) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
+        }
+        debug_assert!(
+            bounded_send_small(self.send_copy_pool, self.tls_table, conn.index, data.len()),
+            "a send outside the small region reached send_bounded_small"
+        );
+        let permit = self
+            .send_copy_pool
+            .reserve_small()
+            .map_err(|_| io::Error::other("send copy pool exhausted"))?;
+        let idx = conn.index as usize;
         self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
             data.to_vec(),
             id,

@@ -513,8 +513,17 @@ impl Driver {
                 .collect(),
             recv_batch: crate::recv::arrival::BatchClock::new(),
             send_copy_pool: {
-                let mut pool =
-                    SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
+                // `SplitPool` adds a small region, in the same allocation,
+                // before the pool is faulted in or advised.
+                let mut pool = match config.send_admission_order.small_region() {
+                    None => SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
+                    Some((small_slots, small_slot_size)) => SendCopyPool::with_small_region(
+                        config.send_copy_count,
+                        config.send_copy_slot_size,
+                        small_slots,
+                        small_slot_size,
+                    ),
+                };
                 // Built on the pinned worker thread, so the pages stay local to
                 // it. mio has no provided recv ring; the send pool is the only
                 // pre-allocated buffer memory here.
@@ -523,7 +532,7 @@ impl Driver {
                 } else {
                     pool.no_huge_pages();
                 }
-                if config.send_admission_order != crate::SendAdmissionOrder::Strict {
+                if config.send_admission_order.lets_pass() {
                     pool.track_passing();
                 }
                 pool
@@ -1780,6 +1789,69 @@ pub(crate) mod tests {
 
     /// The completion and the permit are produced together, by the flush
     /// that puts the entry's last byte on the socket.
+    /// Under `SplitPool` a bounded send that takes a small slot holds a
+    /// permit of one small slot from admission until its last byte reaches
+    /// the socket, and its abort returns it the same way; the main region is
+    /// not touched.
+    #[test]
+    fn send_bounded_small_holds_a_small_permit_until_it_flushes() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .send_admission_order(crate::SendAdmissionOrder::SplitPool {
+                small_slots: 2,
+                small_slot_size: 16,
+            })
+            .build()
+            .expect("valid split-pool config");
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(2);
+
+        driver
+            .make_ctx()
+            .send_bounded_small(conn, b"small", ids[0])
+            .expect("a small slot is free");
+        assert_eq!(driver.send_copy_pool.small_free_count(), 1);
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "the main region is untouched"
+        );
+        driver.capacity_released = false;
+        let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");
+        assert!(all_flushed);
+        assert_eq!(written, 5);
+        assert_eq!(
+            driver.send_copy_pool.small_free_count(),
+            2,
+            "returned on the socket"
+        );
+        assert!(driver.capacity_released);
+        let mut got = [0u8; 5];
+        client
+            .read_exact(&mut got)
+            .expect("the peer reads the send");
+        assert_eq!(&got, b"small");
+
+        driver
+            .make_ctx()
+            .send_bounded_small(conn, b"again", ids[1])
+            .expect("a small slot is free");
+        assert_eq!(driver.send_copy_pool.small_free_count(), 1);
+        driver.clear_pending_sends(idx, crate::handler::aborted_error);
+        assert_eq!(
+            driver.send_copy_pool.small_free_count(),
+            2,
+            "returned by the discard"
+        );
+        assert!(driver.pending_sends[idx].is_empty());
+    }
+
     #[test]
     fn flush_completes_bounded_entry_and_releases_permit() {
         let config = test_config();

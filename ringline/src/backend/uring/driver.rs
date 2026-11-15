@@ -1122,14 +1122,23 @@ impl Driver {
         }
 
         let connections = ConnectionTable::new(config.max_connections);
-        let mut send_copy_pool =
-            SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
+        // `SplitPool` adds a small region, in the same allocation, before the
+        // pool is faulted in or advised.
+        let mut send_copy_pool = match config.send_admission_order.small_region() {
+            None => SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
+            Some((small_slots, small_slot_size)) => SendCopyPool::with_small_region(
+                config.send_copy_count,
+                config.send_copy_slot_size,
+                small_slots,
+                small_slot_size,
+            ),
+        };
         if config.prefault_buffers {
             send_copy_pool.prefault();
         } else {
             send_copy_pool.no_huge_pages();
         }
-        if config.send_admission_order != crate::SendAdmissionOrder::Strict {
+        if config.send_admission_order.lets_pass() {
             send_copy_pool.track_passing();
         }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
