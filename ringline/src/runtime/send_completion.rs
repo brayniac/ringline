@@ -583,6 +583,12 @@ impl SendCompletions {
     fn left_waiting(&mut self) {
         self.waiting_live -= 1;
         self.waiter_left();
+        self.compact_if_mostly_stale();
+    }
+
+    /// [`compact`](Self::compact) once the stale ids in `waiting` number
+    /// more than the live ones plus 64.
+    fn compact_if_mostly_stale(&mut self) {
         if self.waiting.len() > 2 * self.waiting_live + 64 {
             self.compact();
         }
@@ -781,6 +787,13 @@ impl SendCompletions {
             self.waiting.pop_front();
             self.waiting_live -= 1;
             self.waiter_left();
+            // Under the orders that pass, waiters behind this head can have
+            // left already, and the scan's cost rests on `waiting` holding at
+            // most twice the live ids plus 64. `Strict` never scans, and keeps
+            // the pop it always had.
+            if self.order != SendAdmissionOrder::Strict {
+                self.compact_if_mostly_stale();
+            }
             self.head_task()
         } else {
             self.left_waiting();
@@ -2984,5 +2997,31 @@ mod tests {
         copy_pool.copy_in_small(b"small").unwrap();
         let counters = exec.send_admission_counters(&copy_pool);
         assert_eq!((counters.main_free, counters.small_free), (7, 1));
+    }
+
+    /// Under an order that passes, heads admitted at the front keep the
+    /// stale ids that passers left behind them within twice the live ids
+    /// plus 64, the bound the scan's cost rests on.
+    #[test]
+    fn heads_admitted_at_the_front_keep_stale_ids_bounded() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::FirstFit);
+        let heads: Vec<SendId> = (0..65).map(|i| q.enqueue(i, 0, 6, task(i))).collect();
+        for i in 0..100 {
+            let passer = q.enqueue(100 + i, 0, 1, task(100 + i));
+            assert_eq!(
+                q.admit(passer, pool(4, 0, 8), true, idle),
+                Admit::Pass { slots: 1 }
+            );
+            q.mark_submitted(passer);
+        }
+        for head in heads {
+            q.mark_submitted(head);
+            assert!(
+                q.waiting.len() <= 2 * q.waiting_len() + 64,
+                "{} ids for {} live",
+                q.waiting.len(),
+                q.waiting_len()
+            );
+        }
     }
 }
