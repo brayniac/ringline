@@ -1430,3 +1430,102 @@ fn an_older_waiter_its_task_does_not_poll_does_not_hold_back_a_newer_one() {
         "(older waited, newer waited, newer admitted)"
     );
 }
+
+// ── SplitPool and TLS ───────────────────────────────────────────────────
+
+/// What [`TlsSplitter`] saw: the result of a small bounded send on its TLS
+/// connection, and the small FIFO's admissions after it.
+static TLS_SPLIT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+/// Reads one request on its TLS connection and answers it with a small
+/// bounded send.
+struct TlsSplitter;
+
+impl AsyncEventHandler for TlsSplitter {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            let sent = match conn.send_admitted(b"small reply").await {
+                Ok(sent) => outcome(sent.await),
+                Err(e) => format!("refused: {e}"),
+            };
+            let admissions = ringline::send_admission_counters().small_admissions;
+            *TLS_SPLIT.lock().unwrap() = Some((sent, admissions));
+            let _ = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSplitter
+    }
+}
+
+/// Under `SplitPool` a bounded send on a TLS connection takes the main
+/// region whatever its size, so its records reach the peer encrypted and the
+/// small FIFO admits nothing.
+#[test]
+fn split_pool_keeps_tls_sends_in_the_main_region() {
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+
+    let _serial = serial();
+    *TLS_SPLIT.lock().unwrap() = None;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = CertificateDer::from(cert.cert);
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let tls = ringline::TlsConfig::builder()
+        .cert(vec![der.clone()], key.into())
+        .build()
+        .expect("tls config");
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .send_admission_order(ringline::SendAdmissionOrder::SplitPool {
+            small_slots: 2,
+            small_slot_size: 1024,
+        })
+        .tls(tls)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSplitter>()
+        .expect("launch");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let client = rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+    let sock = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut stream = rustls::StreamOwned::new(client, sock);
+    stream.write_all(b"request").expect("handshake and write");
+    let mut reply = [0u8; 11];
+    stream.read_exact(&mut reply).expect("the reply, decrypted");
+    assert_eq!(&reply, b"small reply");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        if let Some(seen) = TLS_SPLIT.lock().unwrap().take() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "the TLS task never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        seen,
+        ("Ok: 11".to_string(), 0),
+        "(the send, small admissions)"
+    );
+    drop(stream);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}

@@ -4819,3 +4819,30 @@ enum DiskOrder {
     Write(crate::disk_order::OrderKey),
     Sync(crate::disk_order::OrderKey),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bounded send on a plain connection takes a small slot when its
+    /// message is 1 to `small_slot_size` bytes. An empty message needs no
+    /// slot and stays in the main FIFO, and a pool without a small region
+    /// puts nothing there.
+    #[test]
+    fn a_bounded_send_takes_a_small_slot_only_when_it_fits_one() {
+        let pool = SendCopyPool::with_small_region(4, 64, 2, 16);
+        let plain = std::ptr::null_mut();
+        assert!(!bounded_send_small(&pool, plain, 0, 0), "empty");
+        assert!(bounded_send_small(&pool, plain, 0, 1));
+        assert!(bounded_send_small(&pool, plain, 0, 16));
+        assert!(
+            !bounded_send_small(&pool, plain, 0, 17),
+            "wider than a small slot"
+        );
+        let without = SendCopyPool::new(4, 64);
+        assert!(
+            !bounded_send_small(&without, plain, 0, 1),
+            "no small region"
+        );
+    }
+}
