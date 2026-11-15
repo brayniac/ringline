@@ -20,10 +20,14 @@
 # admit_ms >= settle_ms it is about settle_ms - large_delay_ms, the wait for
 # the stalled peers' abort, and without contention it would be milliseconds.
 #
-# net.ipv4.tcp_wmem is capped at {tcp_wmem_max} B. With the default 4 MiB cap
-# the kernel's send buffer took each 2 MiB stalled reply whole, the replies
-# settled, and the large reply was delivered in 2-5 ms: nothing was
-# contended.
+# net.ipv4.tcp_wmem is capped at {tcp_wmem_max} B, so a stalled reply stays
+# in the send pool. Pilots at ratio 1 (send-admission-b.md):
+# - the default 4 MiB cap, 2 MiB stalled replies: the kernel took each reply
+#   whole, the large reply arrived in 2-5 ms, and nothing was contended;
+# - a 64 KiB cap: contended, but the admitted 7 MiB reply did not drain
+#   within settle_ms and was aborted in every episode;
+# - 1 MiB with 3 MiB stalled replies, and 256 KiB with 2.5 MiB: the large
+#   reply arrived in 807-818 ms in every episode. The first is the default.
 name = "send-admission B contended {small_send} admit{admit_ms} rep{rep}"
 
 [params]
@@ -40,10 +44,10 @@ small_conns    = "16"
 small_rate     = "2000"
 small_size     = "256"
 stall_peers    = "3"
-stall_size     = "2097152"
+stall_size     = "3145728"
 large_size     = "7340032"
 large_delay_ms = "200"
-tcp_wmem_max   = "65536"
+tcp_wmem_max   = "1048576"
 pool_slots     = "512"
 slot_size      = "16384"
 

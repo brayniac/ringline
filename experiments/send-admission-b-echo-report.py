@@ -19,7 +19,13 @@ import tarfile
 from pathlib import Path
 from statistics import median
 
-ARMS = ["bytes-nowait", "bytes-admitted", "bytes-admitted-timeout"]
+ARMS = [
+    "bytes-nowait",
+    "bytes-admitted",
+    "bytes-admitted-timeout",
+    "bytes-admitted-await",
+    "bytes-nowait-defer",
+]
 WORKER = re.compile(
     r"WORKER cell=(\d+) tag=(\S+) arm=(\S+) window=(\S+) cpu_ns=(\d+) wall_ns=(\d+)"
 )

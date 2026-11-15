@@ -461,6 +461,14 @@ Run after sections 2 and 3 are built.
     fewer small replies delivered than with `send` at a ratio of 1 or more.
     The specification then adds tries under the constraints below.
 
+Result (`docs/journal/2026-11-send-admission-b.md`): both conditions held.
+Uncontended, `send_admitted` cost -1.4% to +2.8% against `send_nowait` at one
+saturated worker, inside the floor. Contended, at ratios of 1 and 2 it
+delivered every small reply within `admit_limit`, as `send` did. The rule does
+not count latency: small replies sent with `send_admitted` waited behind the
+head, p99 about 770 ms against 11.5 ms with `send`. Whether a server can accept
+that, or needs tries, is not yet decided.
+
 Constraints already found for each outcome:
 
 - Guarded batches, in either outcome. A waiting form waits only for the

@@ -1,6 +1,8 @@
 # Experiment B: what send_admitted costs, and what FIFO order costs
 
-- **Status:** open.
+- **Status:** closed. Both conditions of section 4's decision rule held; the
+  latency cost in the contended case, which the rule does not count, is for
+  the owner to weigh.
 - **Span:** Nov 2026 · follows #930 (`send_admitted`) and #939 (`abort`) ·
   SystemsLab context `send-admission-expB`
 
@@ -99,3 +101,123 @@ Contended:
 - The design's decision rule then holds for the contended case: at ratios of
   1 or more `send_admitted` delivers no fewer small replies than `send`. Its
   cost there is latency, which the rule does not count.
+
+## Results
+
+Binaries: io_uring builds of `exp/send-admission-b` at cf283561 (the first two
+echo runs and the first contended pilots) and 31d31976 (the rest; it adds
+`bytes-admitted-await`). Linux 6.12.116, `debian-13-6.12` guests. No server
+refused or closed a connection in any echo window (84 of 84 in the control
+runs, and every window in the first two), and the worker was 96% to 100% busy
+in every closed window.
+
+### Uncontended
+
+Worker CPU per operation, closed loop, in microseconds. Each run is one boot of
+the two guests; each figure is the median of its four cells, with the change
+against `bytes-nowait` in the same run. Runs 1 and 2 are
+`send-admission-b-echo.toml` (`01a1dde5-8bb4`, `01a1dde5-8c01`), runs 3 and 4
+`send-admission-b-echo-controls.toml` (`01a1de0c-50d4`, `01a1de0c-510d`).
+
+| arm | run 1 | run 2 | run 3 | run 4 | all cells |
+| --- | --- | --- | --- | --- | --- |
+| `bytes-nowait` | 8.95 | 9.06 | 9.02 | 9.09 | 9.00 [8.63-9.33], n=16 |
+| `bytes-admitted` | 9.20 (+2.8%) | 9.04 (-0.3%) | 8.90 (-1.4%) | 9.09 (-0.1%) | 9.09 [8.77-9.39], n=16 |
+| `bytes-admitted-timeout` | 7.72 (-13.7%) | 7.61 (-16.1%) | 7.71 (-14.6%) | 7.80 (-14.2%) | 7.67 [7.50-8.15], n=16 |
+| `bytes-admitted-await` | | | 7.73 (-14.3%) | 7.70 (-15.3%) | 7.71 [7.59-8.40], n=8 |
+| `bytes-nowait-defer` | | | 7.91 (-12.3%) | 7.80 (-14.2%) | 7.80 [7.63-8.42], n=8 |
+
+- **The floor.** `bytes-nowait`'s four cells spread 1.3%, 6.1%, 6.1% and
+  6.2% within a run, and its run medians 1.6% across the four runs. Two
+  single-arm runs in separate boots differed by 4.0%.
+- **`bytes-admitted`** differs from `bytes-nowait` by -1.4% to +2.8% in the
+  four runs, inside the within-run floor. The design's prediction holds; mine
+  (1 to 4% more) is not supported.
+- **`bytes-admitted-timeout`** is 14 to 16% cheaper, in every run. My
+  prediction (5 to 15% more) is refuted. Two controls, added after runs 1 and
+  2, place the cause:
+  - `bytes-admitted-await` awaits the same settlement with no timers, and is
+    as cheap. The two timers cost nothing measurable.
+  - `bytes-nowait` with `--defer-recv-arm` is about as cheap, with
+    `send_nowait` and no wait. The saving comes from the receive being armed
+    after the reply's send completes rather than with it, the mechanism
+    `BENCHMARKS.md` records for `ConfigBuilder::defer_recv_arm` (21.11 to
+    19.10 us per operation, at 8 workers). It is a property of when the
+    next receive is armed, not of `send_admitted`.
+- **Open loop**, 55,000 requests/s: every arm's worker CPU per operation is
+  within 15.13 +/- 0.25 us (cell range 14.28 to 15.65), and p99 is 385 to
+  395 us at the median (cell range 369 to 491). Nothing separates the arms.
+- At 256 connections the closed loop also measures throughput, since the
+  worker is saturated: `bytes-admitted-timeout` served 129,000 operations/s
+  against 110,000 for `bytes-nowait`.
+
+### Contended
+
+`send-admission-b-contended.toml` with its defaults (1 MiB `tcp_wmem` cap,
+three 3 MiB stalled replies, a 7 MiB head), 24 runs in a rotated order, four
+per cell. `settle_limit` is 1 s. "Not within" is small replies whose latency
+from their scheduled send time exceeded `admit_limit`, late or lost, of about
+80,000 offered in each run's 40 s window.
+
+| ratio | small replies | not within | small p99 | large replies delivered |
+| --- | --- | --- | --- | --- |
+| 0.5 | `send_admitted` | 124, 200, 186, 176 | 470 ms | 0 of 40 (admission timeout) |
+| 0.5 | `send` | 0, 0, 0, 0 | 11.5 ms | 0 of 40 (admission timeout) |
+| 1 | `send_admitted` | 0, 0, 0, 0 | 771 ms | 40 of 40, after 808 ms |
+| 1 | `send` | 0, 0, 0, 0 | 11.5 ms | 40 of 40, after 805 ms |
+| 2 | `send_admitted` | 0, 0, 0, 0 | 770 ms | 40 of 40, after 808 ms |
+| 2 | `send` | 0, 4, 0, 0 | 11.4 ms | 40 of 40, after 806 ms |
+
+- Every run was contended: in each episode the large reply either waited
+  about 808 ms for the stalled peers' abort, or timed out in admission. All
+  30 stalled replies per run were aborted at `settle_limit`.
+- At ratios of 1 and 2, `send_admitted` delivered every small reply within the
+  limit. At 0.5 it missed 0.16 to 0.25% of them, all delivered late and none
+  lost, at most 513 ms after their scheduled send. Those are the requests
+  scheduled just before the head arrived and read after it, which waited the
+  head's whole `admit_limit`. The prediction held.
+- `send` was refused, and its connection aborted, 4 times in one run at
+  ratio 2 and 8 times in one run at 0.5. The 4 cost 4 small replies. The run
+  with 8 lost no small reply in the window, so those refusals hit requests
+  scheduled outside it. A refusal means no slot was free; when each happened,
+  and which admission took the last slots, was not recorded.
+- The cost of FIFO order is latency: small replies sent with `send_admitted`
+  wait behind the head until it is admitted or times out, p99 about 770 ms
+  against 11.5 ms with `send`.
+- Small-reply p50 was about 6 ms in both arms on loopback. I do not know
+  why; it is the same in both arms and below every limit.
+
+## Outcome
+
+Section 4's decision rule holds on both conditions:
+
+- uncontended, `send_admitted`'s CPU per operation is within the floor of
+  `send_nowait`'s;
+- contended, at `admit_limit` of `settle_limit` or more, `send_admitted`
+  delivered no fewer small replies within the limit than `send`.
+
+By the rule, the specification for section 4 covers only guarded batches,
+and a server sends every plain reply with `send_admitted`, with `admit_limit`
+at or above `settle_limit`.
+
+The rule does not count latency. While a head waits for stalled peers to be
+aborted, every reply on the worker waits behind it, up to `settle_limit`,
+with slots free: here a p99 of 770 ms against 11.5 ms. A server that cannot
+accept that needs tries, as the section's constraints describe. Whether it
+can is for the owner.
+
+## Not covered
+
+- One message size (256 B), one rig (a z1 server guest, one worker) and one
+  kernel (6.12). A larger reply, which needs several slots, was not measured
+  uncontended.
+- Neither arm sent TLS, guarded batches, or zero-copy replies.
+- The contended case ran on loopback with the kernel's send buffer capped at
+  1 MiB, so that stalled replies stay in the pool. With the default cap the
+  kernel took each 2 MiB stalled reply whole.
+- Syscalls and completions per operation were not read from the recordings,
+  so the receive-arming mechanism rests on the two controls, not on a count.
+- The design's A-against-A pair ran in separate boots. The comparison ran
+  within one boot instead, as the November echo rerun did, because the
+  between-boot floor (4.0%) was as large as the effect being measured.
+
