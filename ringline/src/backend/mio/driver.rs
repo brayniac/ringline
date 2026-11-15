@@ -860,8 +860,10 @@ impl Driver {
         self.send_queues[idx].close_pending = false;
         self.send_queues[idx].close_notify_deadline = None;
         if self.track_room_waits {
-            self.send_queues[idx].room_waited = false;
-            self.send_queues[idx].send_waited = false;
+            let state = &mut self.send_queues[idx];
+            state.room_waited = false;
+            state.send_waited = false;
+            state.waited_entries = 0;
         }
 
         // The future dropped at teardown may have owned a half, whose `Drop`
@@ -1084,12 +1086,13 @@ impl Driver {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
-                    // Under `BoundedIdle` and `BudgetIdle` the queued sends
-                    // waited for room: each that completes passes it on to
-                    // `ConnSendState::room_waited`. `send_idle` reads that
-                    // only once the queue is empty, after those completions.
+                    // Under `BoundedIdle` and `BudgetIdle` every send queued
+                    // now was in the write that found the socket full, so
+                    // each waited for room (`ConnSendState::room_waited`).
                     if self.track_room_waits {
-                        self.send_queues[idx].send_waited = true;
+                        let state = &mut self.send_queues[idx];
+                        state.waited_entries = self.pending_sends[idx].len();
+                        state.room_waited = true;
                     }
                     // Queue survives this flush — keep the dirty invariant.
                     self.mark_send_dirty(idx);
@@ -1121,16 +1124,26 @@ impl Driver {
                             self.send_copy_pool.release_reservation(permit);
                             self.capacity_released = true;
                         }
-                        if let Some((id, len)) = entry.send_id.take() {
+                        let settled = entry.send_id.take();
+                        let awaited = settled.is_some();
+                        if let Some((id, len)) = settled {
                             self.settled_sends.push_back((id, Ok(len)));
                         }
                         self.pending_sends[idx].pop_front();
-                        // A send that completes under `BoundedIdle` and
-                        // `BudgetIdle` leaves whether it waited as the
-                        // connection's most recent.
+                        // Under `BoundedIdle` and `BudgetIdle`: this send's
+                        // wait joins the ones since the last awaited send,
+                        // and an awaited send leaves them as the
+                        // connection's `room_waited`, as io_uring's
+                        // `end_logical_send` does.
                         if self.track_room_waits {
                             let state = &mut self.send_queues[idx];
-                            state.room_waited = state.send_waited;
+                            if state.waited_entries > 0 {
+                                state.waited_entries -= 1;
+                                state.send_waited = true;
+                            }
+                            if awaited {
+                                state.room_waited = std::mem::take(&mut state.send_waited);
+                            }
                         }
                     } else {
                         entry.offset += remaining;
@@ -1144,10 +1157,8 @@ impl Driver {
 
         // All sends flushed. Under `BoundedIdle` and `BudgetIdle` the
         // connection is idle, so a waiter on it may now pass a waiting head:
-        // the end-of-iteration capacity wake looks for it. The next send
-        // starts a new wait.
+        // the end-of-iteration capacity wake looks for it.
         if had_sends {
-            self.send_queues[idx].send_waited = false;
             self.capacity_released = true;
         }
 
@@ -1786,6 +1797,114 @@ pub(crate) mod tests {
             ),
             "expected an empty socket, got {err:?}"
         );
+    }
+
+    /// A driver under `BoundedIdle`, which keeps the room-wait flags, and a
+    /// connection to a client that is not reading yet.
+    fn idle_order_driver() -> (Driver, crate::wakeup::WakeHandle, u32, std::net::TcpStream) {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .send_admission_order(crate::SendAdmissionOrder::BoundedIdle)
+            .build()
+            .expect("valid config");
+        let (mut driver, wake) = test_driver(&config);
+        let (conn_index, client) = attach_conn(&mut driver);
+        (driver, wake, conn_index, client)
+    }
+
+    /// More than a loopback socket's buffers take on either side, so the
+    /// write that carries it returns `WouldBlock`.
+    const ROOM_FILL: usize = 16 << 20;
+
+    /// Have `client` read `len` bytes while the driver flushes, until the
+    /// connection's queue is empty.
+    fn drain(driver: &mut Driver, conn_index: u32, client: &mut std::net::TcpStream, len: usize) {
+        let mut reader = client.try_clone().expect("clone the client");
+        let read = std::thread::spawn(move || {
+            let mut got = vec![0u8; len];
+            reader
+                .read_exact(&mut got)
+                .expect("the client reads it all");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !driver.pending_sends[conn_index as usize].is_empty() {
+            driver.flush_sends(conn_index).expect("flush");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queue never drained"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        read.join().expect("the reading thread");
+    }
+
+    /// Under the idle orders mio keeps the flag by the rule io_uring keeps:
+    /// a send queued when a write finds the socket full waited, and an
+    /// awaited send leaves whether the sends since the previous one waited as
+    /// the connection's flag. Here a plain send and an awaited one are both
+    /// queued at the `WouldBlock`, so the drained connection is still not
+    /// idle; an awaited send that completes without waiting makes it idle.
+    #[test]
+    fn an_awaited_send_queued_at_a_full_socket_leaves_the_connection_not_idle() {
+        let (mut driver, _wake, conn_index, mut client) = idle_order_driver();
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(2);
+        driver
+            .make_ctx()
+            .send(conn, &vec![b'f'; ROOM_FILL])
+            .expect("queued");
+        driver
+            .make_ctx()
+            .send_awaited(conn, b"end", ids[0])
+            .expect("queued");
+        let (all_flushed, _) = driver.flush_sends(conn_index).expect("flush");
+        assert!(!all_flushed, "the socket filled");
+        assert!(driver.send_queues[conn_index as usize].room_waited);
+        drain(&mut driver, conn_index, &mut client, ROOM_FILL + 3);
+        assert!(
+            !driver.send_idle(conn_index),
+            "the last awaited send was queued at the full socket"
+        );
+
+        driver
+            .make_ctx()
+            .send_awaited(conn, b"x", ids[1])
+            .expect("queued");
+        drain(&mut driver, conn_index, &mut client, 1);
+        assert!(
+            driver.send_idle(conn_index),
+            "its most recent send did not wait"
+        );
+    }
+
+    /// A send without an id ends no wait: once it drains the connection is
+    /// still not idle, and its wait carries to the next awaited send, as on
+    /// io_uring; the awaited send after that makes it idle.
+    #[test]
+    fn a_send_without_an_id_carries_its_wait_to_the_next_awaited_send() {
+        let (mut driver, _wake, conn_index, mut client) = idle_order_driver();
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(2);
+        driver
+            .make_ctx()
+            .send(conn, &vec![b'f'; ROOM_FILL])
+            .expect("queued");
+        let (all_flushed, _) = driver.flush_sends(conn_index).expect("flush");
+        assert!(!all_flushed, "the socket filled");
+        drain(&mut driver, conn_index, &mut client, ROOM_FILL);
+        assert!(!driver.send_idle(conn_index), "set when the send waited");
+
+        for (id, idle) in [(ids[0], false), (ids[1], true)] {
+            driver
+                .make_ctx()
+                .send_awaited(conn, b"x", id)
+                .expect("queued");
+            drain(&mut driver, conn_index, &mut client, 1);
+            assert_eq!(driver.send_idle(conn_index), idle);
+        }
     }
 
     /// Under `SplitPool` a bounded send that takes a small slot holds a

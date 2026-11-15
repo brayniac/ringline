@@ -152,7 +152,9 @@ pub enum SendAdmissionOrder {
     Bounded,
     /// As `Bounded`, and only a waiter whose connection has no send queued or
     /// in flight and whose most recent send did not wait for room in the
-    /// socket (O4).
+    /// socket (O4). How each backend decides that a send waited is in
+    /// `ConnSendState::room_waited`; with every send on the connection
+    /// awaited, the two agree on this rule.
     BoundedIdle,
     /// A waiter passes while B plus its own slots is at most the smaller of
     /// this many slots and P - H (O7). No latch.

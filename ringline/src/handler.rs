@@ -114,19 +114,36 @@ pub(crate) struct ConnSendState {
     pub disconnect: Disconnect,
     /// The connection's most recent send waited for room in the socket, so
     /// `SendAdmissionOrder::BoundedIdle` and `BudgetIdle` let no send on it
-    /// pass a waiting head. io_uring sets it in `wait_for_room` and when a
-    /// logical send that waited completes; mio when a send completes after a
-    /// write returned `WouldBlock` in the same busy queue. A send that
-    /// completes without having waited clears it. Kept only while the
-    /// driver's `track_room_waits` is set.
+    /// pass a waiting head. Kept only while the driver's `track_room_waits`
+    /// is set.
+    ///
+    /// Both backends keep it by one rule. It is set as soon as a send waits
+    /// for room, and at each completion that settles awaited sends it becomes
+    /// whether any send since the previous such completion waited
+    /// (`send_waited`). When every send on the connection is awaited, as a
+    /// server's replies with `send_admitted` are, that is whether its most
+    /// recent send waited. A send without an id ends nothing: its wait
+    /// carries to the next awaited send, and the flag stays set meanwhile.
+    ///
+    /// What counts as having waited follows how each backend writes. On
+    /// io_uring a send waited if an SQE of it came back short or with
+    /// `EAGAIN` (`wait_for_room`); the sends queued behind it had not been
+    /// submitted. On mio a send waited if it was queued when a `writev`
+    /// returned `WouldBlock` (`waited_entries`), because that write carried
+    /// every queued send.
     pub room_waited: bool,
-    /// The send in progress has waited for room. On io_uring that is any
-    /// SQE of the logical send in progress (since the last completion that
-    /// settled an awaited send on the connection), copied into `room_waited`
-    /// by `Driver::end_logical_send`; on mio, any send queued since the queue
-    /// was last empty, copied when each send completes. Kept only while the
-    /// driver's `track_room_waits` is set.
+    /// A send since the last completion that settled an awaited send waited
+    /// for room. On io_uring `wait_for_room` sets it and
+    /// `Driver::end_logical_send` moves it into `room_waited`; on mio a send
+    /// that completes after waiting sets it, and an awaited one moves it.
+    /// Kept only while the driver's `track_room_waits` is set.
     pub send_waited: bool,
+    /// mio: how many sends at the front of the queue were queued when a
+    /// `writev` last returned `WouldBlock`, and so waited for room; each
+    /// that completes counts one off. Kept only while the driver's
+    /// `track_room_waits` is set.
+    #[cfg(not(has_io_uring))]
+    pub waited_entries: usize,
 }
 
 /// The `IORING_OP_CONNECT` with an `AF_UNSPEC` address that `abort` submits
@@ -188,6 +205,8 @@ impl ConnSendState {
             disconnect: Disconnect::None,
             room_waited: false,
             send_waited: false,
+            #[cfg(not(has_io_uring))]
+            waited_entries: 0,
         }
     }
 
