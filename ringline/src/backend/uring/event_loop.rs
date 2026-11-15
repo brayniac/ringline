@@ -3486,8 +3486,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // A run can span several sends (#628). Those whose bytes are
                 // all on the wire settle now with their own length; only the
                 // rest wait for, or fail with, the remainder.
+                // One completion ends one wait, however many sends it
+                // settles: a second `end_logical_send` would clear what the
+                // first recorded.
+                let mut ended = false;
                 for (id, len) in self.driver.send_slab.take_sent_sends(slab_idx) {
-                    self.driver.end_logical_send(conn_index);
+                    if !std::mem::replace(&mut ended, true) {
+                        self.driver.end_logical_send(conn_index);
+                    }
                     self.settle_send(id, Ok(len));
                 }
                 if self.close_submitted(conn_index) {
@@ -3512,8 +3518,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.defer_finalize_close(conn_index);
             // The carried logical (plaintext) length, not `acked` — see
             // `handle_send`'s success path.
+            let mut ended = false;
             for (id, logical_len) in settles {
-                self.driver.end_logical_send(conn_index);
+                if !std::mem::replace(&mut ended, true) {
+                    self.driver.end_logical_send(conn_index);
+                }
                 self.settle_send(id, Ok(logical_len));
             }
             return;
