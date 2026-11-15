@@ -152,9 +152,12 @@ pub enum SendAdmissionOrder {
     Bounded,
     /// As `Bounded`, and only a waiter whose connection has no send queued or
     /// in flight and whose most recent send did not wait for room in the
-    /// socket (O4). How each backend decides that a send waited is in
-    /// `ConnSendState::room_waited`; with every send on the connection
-    /// awaited, the two agree on this rule.
+    /// socket (O4). Both backends keep the flag by one rule
+    /// (`ConnSendState::room_waited`), but count different sends as having
+    /// waited when replies are pipelined: mio every send queued when a write
+    /// returned `WouldBlock`, io_uring only a send whose own submission came
+    /// back short or with `EAGAIN`. With one reply in flight per connection
+    /// they agree.
     BoundedIdle,
     /// A waiter passes while B plus its own slots is at most the smaller of
     /// this many slots and P - H (O7). No latch.
@@ -450,7 +453,8 @@ pub(crate) struct SendCompletions {
     /// `Strict`.
     next_seq: u32,
     /// The number of the latest scan that looked behind the head, under the
-    /// orders that pass; never 0, which `woken_in` uses for none.
+    /// orders that pass; 0 until the first such scan, and never 0 after it,
+    /// since `woken_in` uses 0 for none.
     scan_epoch: u32,
     /// Under `Bounded` and `BoundedIdle`, the head while whose wait
     /// F + B >= H has been seen: nothing passes it. A later head is another
@@ -461,8 +465,11 @@ pub(crate) struct SendCompletions {
     /// window has to restart at F + B now.
     head_changed: bool,
     /// A [`scan`](Self::scan) is due at the end of the event-loop iteration.
-    /// Set only under an order other than `Strict`, when a waiter leaves the
-    /// waiting state and when a later poll of a waiter is told to wait.
+    /// Set only under an order other than `Strict`: when a waiter leaves the
+    /// waiting state, when a later poll of a waiter is told to wait, when any
+    /// poll is told to wait because an older waiter takes the room
+    /// ([`admit`](Self::admit)), and by a scan that woke passers, for the
+    /// scan after it.
     scan_due: bool,
     /// The task ids a scan wakes, kept between scans by
     /// [`Executor::wake_send_capacity_in`] so that a scan allocates only
@@ -1299,7 +1306,8 @@ impl SendCompletions {
     /// The capacity wake under an order other than `Strict`, and the scan
     /// [`scan_due`](Self::scan_due) asks for: push onto `wakes` the head's
     /// task if the head fits, and otherwise the tasks of the waiters behind
-    /// it that could pass, oldest first. Clears `scan_due`. Under `SplitPool`,
+    /// it that could pass, oldest first. Clears `scan_due`, and sets it again
+    /// if it woke a passer, so that the next scan runs. Under `SplitPool`,
     /// [`scan_split`](Self::scan_split) instead.
     ///
     /// Each waiter woken is counted against the free slots, and against the
