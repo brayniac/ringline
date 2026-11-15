@@ -1319,3 +1319,114 @@ fn a_head_after_a_large_admission_starts_with_its_latch_open() {
         assert_eq!(seen, (true, Some(true), 0), "{order:?}");
     }
 }
+
+// ── An older waiter its task does not poll ──────────────────────────────
+
+/// What [`Unpolled`] saw: whether the older waiter's first poll waited,
+/// whether the newer one's did, and whether the newer one was admitted
+/// while the older one was still held, unpolled.
+static UNPOLLED: Mutex<Option<(bool, bool, Option<bool>)>> = Mutex::new(None);
+
+/// On its connection, whose peer does not read, four slots held and a
+/// 6-slot head waiting, as in [`pass_the_head`]. A 4-slot send to a reading
+/// peer takes the four free slots; a 1-slot waiter on another connection is
+/// polled once and then held unpolled; once the four slots come back, a
+/// 4-slot waiter is parked.
+struct Unpolled;
+
+impl AsyncEventHandler for Unpolled {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            static QUEUED: [u8; SLOT] = [1; SLOT];
+            static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
+            static ONE: [u8; SLOT] = [3; SLOT];
+            static FOUR: [u8; 4 * SLOT] = [4; 4 * SLOT];
+            let (first_addr, second_addr) = PEERS.lock().unwrap().expect("peers");
+            fill(&mut conn);
+            let mut queued = Vec::new();
+            for _ in 0..4 {
+                queued.push(conn.send_admitted(&QUEUED).await.expect("admitted"));
+            }
+            let mut head = conn.send_admitted(&HEAD);
+            let _ = poll_once(&mut head).await;
+            let mut first = ringline::connect(first_addr)
+                .await
+                .expect("connect the first reader");
+            let mut second = ringline::connect(second_addr)
+                .await
+                .expect("connect the second reader");
+            let mut all_four = first.send_admitted(&FOUR);
+            let Poll::Ready(Ok(sent)) = poll_once(&mut all_four).await else {
+                *UNPOLLED.lock().unwrap() = Some((false, false, None));
+                return;
+            };
+            let mut older = second.send_admitted(&ONE);
+            let older_waited = poll_once(&mut older).await.is_pending();
+            let _ = sent.await;
+            let newer = park(first.send_admitted(&FOUR)).await;
+            let newer_waited = newer.first_waited.get();
+            let admitted = resolved_soon(&newer).await;
+            drop(older);
+            drop(head);
+            conn.abort();
+            *UNPOLLED.lock().unwrap() = Some((older_waited, newer_waited, admitted));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        Unpolled
+    }
+}
+
+/// Under `FirstFit` an older waiter that its task holds without polling
+/// keeps the room it was woken for only until the next scan: a newer waiter
+/// that fits is then admitted while the older one is still held.
+#[test]
+fn an_older_waiter_its_task_does_not_poll_does_not_hold_back_a_newer_one() {
+    let _serial = serial();
+    *UNPOLLED.lock().unwrap() = None;
+    let first = TcpListener::bind("127.0.0.1:0").expect("bind the first reader");
+    let second = TcpListener::bind("127.0.0.1:0").expect("bind the second reader");
+    *PEERS.lock().unwrap() = Some((first.local_addr().unwrap(), second.local_addr().unwrap()));
+    // Not joined, as in `run_order`.
+    for listener in [first, second] {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept a reader");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+    }
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .send_admission_order(ringline::SendAdmissionOrder::FirstFit)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Unpolled>()
+        .expect("launch");
+    let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    peer.write_all(b"u").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let seen = loop {
+        if let Some(seen) = UNPOLLED.lock().unwrap().take() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "the task never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(peer);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    assert_eq!(
+        seen,
+        (true, true, Some(true)),
+        "(older waited, newer waited, newer admitted)"
+    );
+}
