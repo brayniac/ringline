@@ -114,9 +114,11 @@ pub(crate) struct ConnSendState {
     pub disconnect: Disconnect,
     /// The connection's most recent send waited for room in the socket, so
     /// `SendAdmissionOrder::BoundedIdle` and `BudgetIdle` let no send on it
-    /// pass a waiting head. Set when a send waits (io_uring's `wait_for_room`, a mio write
-    /// that returns `WouldBlock`) and cleared when a send completes without
-    /// having waited. Kept only while the driver's `track_room_waits` is set.
+    /// pass a waiting head. io_uring sets it in `wait_for_room` and when a
+    /// logical send that waited completes; mio when a send completes after a
+    /// write returned `WouldBlock` in the same busy queue. A send that
+    /// completes without having waited clears it. Kept only while the
+    /// driver's `track_room_waits` is set.
     pub room_waited: bool,
     /// The send in progress has waited for room. On io_uring that is any
     /// SQE of the logical send in progress (since the last completion that

@@ -1085,9 +1085,10 @@ impl Driver {
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
                     // Under `BoundedIdle` and `BudgetIdle` the queued sends
-                    // waited for room (`ConnSendState::room_waited`).
+                    // waited for room: each that completes passes it on to
+                    // `ConnSendState::room_waited`. `send_idle` reads that
+                    // only once the queue is empty, after those completions.
                     if self.track_room_waits {
-                        self.send_queues[idx].room_waited = true;
                         self.send_queues[idx].send_waited = true;
                     }
                     // Queue survives this flush — keep the dirty invariant.
