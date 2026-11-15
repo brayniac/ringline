@@ -1533,6 +1533,7 @@ impl ConnCtx {
                 io::ErrorKind::BrokenPipe,
                 "write half is shut down",
             );
+            executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
         })
     }
 
@@ -1614,6 +1615,7 @@ impl ConnCtx {
                 crate::handler::aborted_error(),
             );
             executor.abort_sends(self.conn_index, self.generation);
+            executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
             driver.abort(self.conn_index);
         });
     }
@@ -4131,8 +4133,14 @@ impl Admission<'_> {
     /// result was parked: without the `cancel` the entry would stay in the
     /// table, and if it were the head it would stall every bounded send on
     /// the worker.
-    fn abandon(&mut self, executor: &mut Executor, id: SendId) -> Poll<io::Result<SendCompletion>> {
+    fn abandon(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+        id: SendId,
+    ) -> Poll<io::Result<SendCompletion>> {
         executor.cancel_send(id);
+        executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
         self.finish(Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "connection closed",
@@ -4257,7 +4265,7 @@ impl Future for Admission<'_> {
                         return this.finish(result);
                     }
                     if driver.connections.generation(this.conn_index) != this.generation {
-                        return this.abandon(executor, id);
+                        return this.abandon(driver, executor, id);
                     }
                     this.poll_waiting(driver, executor, id, false, cx)
                 }
@@ -4330,12 +4338,14 @@ impl Admission<'_> {
                         sent.passed_head = true;
                     }
                 }
+                executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
                 self.finish(Ok(sent))
             }
             Err(e) => {
                 // Nothing was queued and no completion is coming, so the id
                 // has to leave the queue or it holds the head forever.
                 executor.cancel_send(id);
+                executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
                 self.finish(Err(e))
             }
         }
@@ -4357,6 +4367,10 @@ impl Drop for Admission<'_> {
         let executor = unsafe { &mut *state.executor.as_mut() };
         // Removed, and the next waiter takes the head.
         executor.cancel_send(id);
+        // SAFETY: as for the executor above; the driver state is installed
+        // around every poll and teardown that drops a future.
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
     }
 }
 

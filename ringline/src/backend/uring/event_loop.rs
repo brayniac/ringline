@@ -4117,8 +4117,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         crate::runtime::io::with_driver_state(
             &mut self.driver,
             &mut self.executor,
-            |_, executor| {
+            |driver, executor| {
                 executor.remove_connection(conn_index);
+                executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
             },
         );
         // The future just dropped may have owned a half, whose `Drop` finds
