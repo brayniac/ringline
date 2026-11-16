@@ -33,8 +33,9 @@
 //! # Pieces, and `--stream-piece`
 //!
 //! With `--stream-piece p`, a large reply of more than p bytes is sent as
-//! `ceil(n / p)` pieces of p bytes, the last shorter, one unsettled at a
-//! time. The first piece holds the reply's tag and length. For each piece:
+//! `ceil(n / p)` pieces of p bytes but the last, which holds the rest (p
+//! bytes when p divides n), one unsettled at a time. The first piece holds
+//! the reply's tag and length. For each piece:
 //!
 //! - with `--stream-gate`, the task waits until the socket reports room
 //!   (`SendHalf::writable`), bounded by `--settle-limit-ms`;
@@ -46,11 +47,10 @@
 //!
 //! The pieces count as one reply against `--pipeline`. Every wait also races
 //! the watch on the connection's earlier replies, as a whole reply's wait for
-//! admission does. Any failure of a piece aborts the connection. After the
-//! first piece a close would not do: the peer has a prefix of the reply, and a
-//! FIN after it would read as a complete reply. The connection reads no
-//! request while a reply's pieces go out, since the serve loop reads only
-//! between replies.
+//! admission does. Any failure of a piece aborts the connection, the first
+//! piece's included, as a whole reply's admission timeout does. The
+//! connection reads no request while a reply's pieces go out, since the
+//! serve loop reads only between replies.
 //!
 //! # Settling, and `--pipeline`
 //!
@@ -85,13 +85,16 @@
 //!   time to its admission, and the delay from just before the call that
 //!   admits it to that call's result. Admission is the return of `send` for a
 //!   small reply under `--small-send send`, and the result of `send_admitted`
-//!   otherwise. The first delay includes the time the request waited unread
-//!   behind the connection's earlier replies; the second does not.
+//!   otherwise; for a reply in pieces, its first piece's. The first delay
+//!   includes the time the request waited unread behind the connection's
+//!   earlier replies; the second does not, but for a reply in pieces under
+//!   `--stream-gate` it includes the first piece's wait for room.
 //! - By class, the requests that were not admitted, by reason, and the
 //!   admitted replies by how they ended.
 //! - For each large reply: its tag, length and scheduled time, its two delays
 //!   or the reason it was not admitted (for a reply in pieces, its first
-//!   piece's), how it ended once admitted, and the mean of each class's held
+//!   piece's, the second delay from before its first wait for room), how it
+//!   ended once admitted, and the mean of each class's held
 //!   slots (below) over the samples from its scheduled time to its admission
 //!   or removal. Also its pieces (1 for a whole reply), those admitted, those
 //!   whose `SendCompletion` read `waited_for_room` once the task was done
@@ -100,8 +103,14 @@
 //!   error; or discarded with its connection for an earlier reply), the time
 //!   from its scheduled time to its last piece's settlement in microseconds
 //!   (completed replies only; a settlement is seen when the task next polls
-//!   the reply), and the smallest free count of the pool's main region over
-//!   the samples from its scheduled time to its end.
+//!   the reply), the smallest free count of the pool's main region over the
+//!   samples from its scheduled time to its end, and the smallest read just
+//!   after each admission of the reply or of its pieces (a reply in gated
+//!   pieces can take less time than a sample's 10 ms), and its pieces
+//!   admitted past a waiting head.
+//! - Per class, admitted sends that passed a waiting head, and how long each
+//!   held its slots, from admission until it settled. Each piece of a reply
+//!   counts as a send.
 //! - Connections aborted, by cause: admission timeout, a `send` the pool
 //!   refused, room-wait timeout, settlement timeout (a piece's, or an
 //!   unsettled reply's), peer reset, and other send errors.
@@ -123,7 +132,9 @@
 //! would be dropped with the worker thread. One worker, so every connection
 //! shares one send pool and one FIFO. The counters, the configuration
 //! (order, budget, pool, pieces and gate) and the statistics are printed as
-//! one JSON line on SIGINT or SIGTERM.
+//! one JSON line on SIGINT or SIGTERM. With `--summary-file`, the same object
+//! without the per-large-reply records and the free-slot samples, which run
+//! to hundreds of KiB, is written to that file as well, for a log line.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -203,7 +214,7 @@ impl Order {
 #[derive(Parser)]
 #[command(
     name = "admission-server",
-    about = "The contended-case server of Experiments B and C"
+    about = "The contended-case server of Experiments B, C and D"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]
@@ -253,6 +264,10 @@ struct Args {
     /// (`SendHalf::writable`).
     #[arg(long)]
     stream_gate: bool,
+    /// Also write the output, without the per-large-reply records and the
+    /// free-slot samples, to this file.
+    #[arg(long)]
+    summary_file: Option<std::path::PathBuf>,
 }
 
 struct Settings {
@@ -486,6 +501,11 @@ struct LargeRecord {
     /// When it ended: its last piece settled, or it failed.
     done_ns: Option<u64>,
     outcome: Option<Outcome>,
+    /// The fewest free main-region slots read just after an admission of it
+    /// or of one of its pieces.
+    admit_min_free: Option<u64>,
+    /// Its pieces, or the whole reply, admitted past a waiting head.
+    pieces_passed: u32,
 }
 
 impl LargeRecord {
@@ -627,6 +647,22 @@ fn with_large(large: Option<usize>, f: impl FnOnce(&mut LargeRecord)) {
     if let Some(i) = large {
         f(&mut recorder().large[i]);
     }
+}
+
+/// Note in the record of `large` that `sent`, the whole reply or one of its
+/// pieces, was just admitted: the free main-region slots now, and whether it
+/// passed a waiting head.
+fn note_admission(large: Option<usize>, sent: &SendCompletion) {
+    if large.is_none() {
+        return;
+    }
+    let free = ringline::send_admission_counters().main_free;
+    let passed = sent.passed_head();
+    with_large(large, |l| {
+        l.pieces_sent += 1;
+        l.pieces_passed += u32::from(passed);
+        l.admit_min_free = Some(l.admit_min_free.map_or(free, |m| m.min(free)));
+    });
 }
 
 enum Settle {
@@ -840,10 +876,14 @@ async fn serve(conn: Connection) {
         let Some(req) = request.filter(|_| n > 0) else {
             break;
         };
-        reply.clear();
-        reply.extend_from_slice(&req.tag.to_le_bytes());
-        reply.extend_from_slice(&(req.len as u32).to_le_bytes());
-        reply.resize(req.len, b'r');
+        // Refilled only when the length changes: a 7 MiB fill per request
+        // would count in every arm's worker CPU.
+        if reply.len() != req.len {
+            reply.clear();
+            reply.resize(req.len, b'r');
+        }
+        reply[0..4].copy_from_slice(&req.tag.to_le_bytes());
+        reply[4..8].copy_from_slice(&(req.len as u32).to_le_bytes());
         if req.flags & FLAG_OUTSIDE != 0 {
             match tx.send_nowait(&reply) {
                 Ok(()) => count(&OUTSIDE, 0),
@@ -894,28 +934,49 @@ async fn send_reply(
         return send_pieces(tx, unsettled, reply, req).await;
     }
     let called_ns = mono_ns();
+    let mut failed_kind = None;
     let admitted = if class != LARGE && s.use_send {
         match tx.send(reply) {
             Ok(sent) => Ok(sent),
             Err(e) if e.kind() == std::io::ErrorKind::Other && tx.is_alive() => {
                 Err(Unadmitted::Refused)
             }
-            Err(_) => Err(Unadmitted::Failed),
+            Err(e) => {
+                failed_kind = Some(e.kind());
+                Err(Unadmitted::Failed)
+            }
         }
     } else {
         let wait = ringline::timeout(s.admit_limit, tx.send_admitted(reply));
         match ringline::select(wait, unsettled.stalled()).await {
             Either::Left(Ok(Ok(sent))) => Ok(sent),
-            Either::Left(Ok(Err(_))) => Err(Unadmitted::Failed),
+            Either::Left(Ok(Err(e))) => {
+                failed_kind = Some(e.kind());
+                Err(Unadmitted::Failed)
+            }
             Either::Left(Err(_elapsed)) => Err(Unadmitted::AdmitTimeout),
             Either::Right(()) => Err(Unadmitted::SettleAbort),
         }
     };
     let result_ns = mono_ns();
-    let large = req
-        .recorded()
-        .then(|| record(req, class, called_ns, result_ns, admitted.as_ref().err()))
-        .flatten();
+    let large = begin_large(req, class, 1);
+    if let Some(kind) = failed_kind {
+        // Before `record_admission`, whose generic outcome would stand.
+        with_large(large, |l| l.finish(Outcome::of_error(kind)));
+    }
+    if req.recorded() {
+        record_admission(
+            req,
+            class,
+            called_ns,
+            result_ns,
+            admitted.as_ref().err(),
+            large,
+        );
+    }
+    if let Ok(sent) = &admitted {
+        note_admission(large, sent);
+    }
     match admitted {
         Ok(sent) => {
             let slots = reply.len().div_ceil(s.slot_size) as u64;
@@ -1033,12 +1094,13 @@ async fn send_pieces(
                 record_admission(req, LARGE, called_ns, mono_ns(), None, large);
             }
         }
-        with_large(large, |l| l.pieces_sent += 1);
+        note_admission(large, &sent);
         let slots = piece.len().div_ceil(s.slot_size) as u64;
         if i + 1 == n {
             unsettled.push(sent, LARGE, slots, req.recorded(), large);
             return true;
         }
+        let admitted_at = Instant::now();
         let held = Held::new(LARGE, slots);
         let settle = ringline::timeout(s.settle_limit, &mut sent);
         let failure = match ringline::select(settle, unsettled.stalled()).await {
@@ -1050,6 +1112,16 @@ async fn send_pieces(
         let waited = sent.waited_for_room();
         with_large(large, |l| l.pieces_waited += u32::from(waited));
         drop(held);
+        // A piece that passed a head counts as a passing send, as the last
+        // piece does in `Unsettled::push` and `pop`.
+        if sent.passed_head() && req.recorded() {
+            let mut r = recorder();
+            r.passed[LARGE] += 1;
+            if failure.is_none() {
+                let held_us = admitted_at.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                r.passing_hold_us[LARGE].push(held_us);
+            }
+        }
         if let Some(f) = failure {
             return piece_failed(tx, unsettled, req, large, called_ns, admitted, f);
         }
@@ -1075,10 +1147,12 @@ fn piece_failed(
         PieceFailure::Error(kind) => (Outcome::of_error(kind), Unadmitted::Failed),
         PieceFailure::Stalled => (Outcome::Discarded, Unadmitted::SettleAbort),
     };
+    // Before `record_admission`, whose generic outcome for an unadmitted
+    // reply would otherwise stand.
+    with_large(large, |l| l.finish(outcome));
     if !admitted && req.recorded() {
         record_admission(req, LARGE, called_ns, mono_ns(), Some(&unadmitted), large);
     }
-    with_large(large, |l| l.finish(outcome));
     if let PieceFailure::Stalled = failure {
         unsettled.abort_stalled(tx);
         return false;
@@ -1102,23 +1176,10 @@ fn piece_failed(
             _ => Ended::Failed,
         };
         recorder().ended[LARGE][how as usize] += 1;
+        with_large(large, |l| l.ended = Some(how));
     }
     unsettled.discard();
     false
-}
-
-/// Record an in-window request's delays, or why it was not admitted. Returns
-/// the index of its large-reply record, if it is large.
-fn record(
-    req: &Request,
-    class: usize,
-    called_ns: u64,
-    result_ns: u64,
-    unadmitted: Option<&Unadmitted>,
-) -> Option<usize> {
-    let large = begin_large(req, class, 1);
-    record_admission(req, class, called_ns, result_ns, unadmitted, large);
-    large
 }
 
 /// Start the record of an in-window large reply sent in `pieces` pieces, and
@@ -1141,6 +1202,8 @@ fn begin_large(req: &Request, class: usize, pieces: u32) -> Option<usize> {
         pieces_waited: 0,
         done_ns: None,
         outcome: None,
+        admit_min_free: None,
+        pieces_passed: 0,
     });
     Some(r.large.len() - 1)
 }
@@ -1344,6 +1407,8 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
                     l.scheduled_ns,
                     l.done_ns.unwrap_or(u64::MAX),
                 ),
+                "admit_min_free": l.admit_min_free,
+                "pieces_passed": l.pieces_passed,
             })
         })
         .collect();
@@ -1437,9 +1502,7 @@ fn main() {
     let load = |a: &[AtomicU64; 3], i: usize| a[i].load(Relaxed);
     let pair = |a: &[AtomicU64; 3]| [load(a, FAST) + load(a, SLOW), load(a, LARGE)];
     let stats = statistics(&mut recorder(), args.admit_limit_ms);
-    println!(
-        "{}",
-        json!({
+    let out = json!({
             "replies": pair(&c.replies),
             "refused": pair(&c.refused),
             "admit_timeouts": pair(&c.admit_timeouts),
@@ -1478,8 +1541,22 @@ fn main() {
                 .map(|(name, n)| ((*name).to_string(), json!(n.load(Relaxed))))
                 .collect::<serde_json::Map<_, _>>(),
             "statistics": stats,
-        })
-    );
+    });
+    println!("{out}");
+    if let Some(path) = &args.summary_file {
+        let mut summary = out.clone();
+        if let Some(st) = summary["statistics"].as_object_mut() {
+            let larges = st.remove("large_replies");
+            st.remove("main_free_samples");
+            st.insert(
+                "large_replies_count".into(),
+                json!(larges.and_then(|v| v.as_array().map(Vec::len))),
+            );
+        }
+        if let Err(e) = std::fs::write(path, format!("{summary}\n")) {
+            eprintln!("admission-server: --summary-file {}: {e}", path.display());
+        }
+    }
 }
 
 #[cfg(test)]
