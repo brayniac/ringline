@@ -1470,6 +1470,7 @@ impl Driver {
         state.on_send_backstop = false;
         state.writable_task = None;
         state.writable_event = None;
+        state.writable_blocked = false;
         state.send_probe = SendProbe::None;
         if self.track_room_waits {
             state.room_waited = false;

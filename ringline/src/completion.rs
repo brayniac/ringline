@@ -110,9 +110,11 @@ pub enum OpTag {
     Disconnect = 39,
     /// One-shot `POLL_ADD` for `POLLOUT` that a `SendHalf::writable` future
     /// arms while the connection's `SendPollOut` is multishot, which reports
-    /// only changes: it reports whether the socket is writable now. A
-    /// connection arms one at a time (`ConnSendState::send_probe`), and its
-    /// `Close` cancels it. Payload = connection generation.
+    /// only changes. After the peer half-closes it completes at
+    /// once, with `POLLOUT` if the socket is writable then; otherwise it
+    /// completes when the socket becomes writable. A connection arms one at a
+    /// time (`ConnSendState::send_probe`), and its `Close` cancels it.
+    /// Payload = connection generation.
     SendPollProbe = 40,
 }
 

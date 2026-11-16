@@ -1516,6 +1516,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.fail_connection_on_send_error(conn_index, e);
                 continue;
             }
+            // A `writable` future waits until the queue is written.
+            if self.driver.pending_sends[idx].is_empty() {
+                self.wake_writable(conn_index);
+            }
             if !self.driver.pending_sends[idx].is_empty() && !self.driver.sends_dirty_flag[idx] {
                 self.driver.sends_dirty_flag[idx] = true;
                 self.driver.sends_dirty.push(conn_index);
@@ -3808,5 +3812,132 @@ mod tests {
             el.driver.tcp_streams[conn_index as usize].is_none(),
             "the close finalized"
         );
+    }
+
+    // ── `SendHalf::writable` ──────────────────────────────────────────
+
+    /// Write to `conn_index`'s socket directly until a zero-timeout
+    /// `poll(2)` reports it not writable, so that a gate on it waits. macOS
+    /// grows a loopback send buffer that fills, so one write to `WouldBlock`
+    /// is not enough there.
+    fn fill_socket(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let stream = el.driver.tcp_streams[conn_index as usize]
+            .as_mut()
+            .expect("an attached stream");
+        let chunk = [7u8; 1 << 16];
+        for _ in 0..500 {
+            loop {
+                match stream.write(&chunk) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("fill: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            let mut pfd = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd` for the call, and a zero timeout.
+            if unsafe { libc::poll(&mut pfd, 1, 0) } == 0 {
+                return;
+            }
+        }
+        panic!("the socket still polls writable after 500 fills");
+    }
+
+    /// What a `writable` task resolved with, as an error kind.
+    type GateSeen = std::rc::Rc<std::cell::Cell<Option<Result<(), io::ErrorKind>>>>;
+
+    /// Run `ctx.writable()` in a standalone task until it parks or resolves;
+    /// returns its result's cell and the task's id.
+    fn gate_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> (GateSeen, u32) {
+        let seen: GateSeen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let result = ctx.writable().await;
+                record.set(Some(result.map_err(|e| e.kind())));
+            }))
+            .expect("a free standalone slot");
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        (seen, idx | STANDALONE_BIT)
+    }
+
+    /// `abort` wakes a gate waiting in another task: with no event on the
+    /// connection and no release yet, its next poll finds the connection
+    /// aborted.
+    #[test]
+    fn an_abort_wakes_a_waiting_writable_gate() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        fill_socket(&mut el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (seen, _) = gate_task(&mut el, ctx);
+        assert_eq!(seen.get(), None, "the socket is full");
+        in_poll(&mut el, || ctx.abort());
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionAborted)));
+    }
+
+    /// Two gates on one connection: the first registers, the second does,
+    /// the first registers again, and the second is dropped. The drop leaves
+    /// the first's registration, which is not its own.
+    #[test]
+    fn a_second_writable_gate_dropped_leaves_the_first_registered() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        fill_socket(&mut el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (first, first_task) = gate_task(&mut el, ctx);
+        let release = std::rc::Rc::new(std::cell::Cell::new(false));
+        let released = release.clone();
+        let second = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let mut gate = Box::pin(ctx.writable());
+                std::future::poll_fn(|cx| {
+                    if released.get() {
+                        return std::task::Poll::Ready(());
+                    }
+                    let _ = gate.as_mut().poll(cx);
+                    std::task::Poll::Pending
+                })
+                .await;
+            }))
+            .expect("a free standalone slot")
+            | STANDALONE_BIT;
+        el.executor.ready_queue.push_back(second);
+        el.poll_ready_tasks();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(
+            state.writable_task,
+            Some(second),
+            "the second registered last"
+        );
+        assert!(el.executor.wake_task(first_task), "the first is parked");
+        el.poll_ready_tasks();
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].writable_task,
+            Some(first_task)
+        );
+        release.set(true);
+        assert!(el.executor.wake_task(second), "the second is parked");
+        el.poll_ready_tasks();
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].writable_task,
+            Some(first_task),
+            "the second gate's drop cleared the first's registration"
+        );
+        assert_eq!(first.get(), None);
     }
 }
