@@ -942,6 +942,40 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit the one-shot `POLL_ADD` for `POLLOUT` that a
+    /// `SendHalf::writable` future arms while the connection's
+    /// [`submit_send_pollout`](Self::submit_send_pollout) poll is multishot
+    /// (`OpTag::SendPollProbe`).
+    pub fn submit_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Fixed(conn_index),
+                mask: libc::POLLOUT as u32,
+                multi: false,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Cancel the [`submit_send_probe`](Self::submit_send_probe) of
+    /// `conn_index`, if it is still in the kernel.
+    pub fn submit_cancel_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let target = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
+        let entry = Sqe::new(
+            Op::Cancel {
+                target: target.raw(),
+            },
+            ud.raw(),
+        );
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Cancel the armed [`submit_send_pollout`](Self::submit_send_pollout) of
     /// `conn_index`. A multishot poll holds the socket open past its `Close`.
     pub fn submit_cancel_send_pollout(

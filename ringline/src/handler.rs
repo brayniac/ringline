@@ -145,6 +145,35 @@ pub(crate) struct ConnSendState {
     /// `track_room_waits` is set.
     #[cfg(not(has_io_uring))]
     pub waited_entries: usize,
+    /// The task of a `SendHalf::writable` future that waits on this
+    /// connection for room in its socket. Taken when the task is woken: on
+    /// io_uring by the completion that ends the wait (a `POLLOUT`, an error,
+    /// a hangup or a cancel), on mio by any event on the connection, and on
+    /// both by `abort` and at the slot's release. The future registers again
+    /// if it is polled before its wait has ended.
+    pub writable_task: Option<u32>,
+    /// io_uring: what ended a `writable` future's wait, for its next poll:
+    /// `Ok` on a `POLLOUT`, or the errno of an error, a hangup or a cancel.
+    /// The future clears it when it starts to wait, so only an event that
+    /// arrives while it waits counts.
+    #[cfg(has_io_uring)]
+    pub writable_event: Option<Result<(), i32>>,
+    /// io_uring: the state of the connection's `SendPollProbe`, the one-shot
+    /// `POLLOUT` poll a `writable` future arms while the connection's
+    /// `SendPollOut` is multishot.
+    #[cfg(has_io_uring)]
+    pub send_probe: SendProbe,
+}
+
+/// The state of a connection's `SendPollProbe`.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendProbe {
+    None,
+    /// Queued on `Driver::pending_send_probe_retries`: the SQ was full.
+    Pending,
+    /// In the kernel.
+    Armed,
 }
 
 /// The `IORING_OP_CONNECT` with an `AF_UNSPEC` address that `abort` submits
@@ -208,6 +237,11 @@ impl ConnSendState {
             send_waited: false,
             #[cfg(not(has_io_uring))]
             waited_entries: 0,
+            writable_task: None,
+            #[cfg(has_io_uring)]
+            writable_event: None,
+            #[cfg(has_io_uring)]
+            send_probe: SendProbe::None,
         }
     }
 
