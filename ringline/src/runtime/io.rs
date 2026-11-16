@@ -3446,9 +3446,9 @@ impl SendHalf {
     ///
     /// On io_uring it waits on the connection's `POLLOUT` poll, the one a
     /// send waiting for room uses, arming it one shot if none is armed, so
-    /// the cancel that `close` and `abort` issue covers it. A `POLLOUT` on
-    /// which a send that waited for room is resubmitted does not end the
-    /// wait: the send may take the room, so this waits until no send on the
+    /// the cancel that `close` and `abort` issue covers it. When a send that
+    /// waited for room is resubmitted, on a `POLLOUT` or by the backstop,
+    /// the send may take the room, so this waits until no send on the
     /// connection is in the kernel, queued or waiting for room, and then
     /// looks at the socket again. Once the poll is multishot (after the peer
     /// half-closes, or after a send made on a `POLLOUT` got `EAGAIN`), it
@@ -4167,14 +4167,14 @@ struct WritableFuture {
     /// connection's poll, or armed a probe.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     armed: bool,
-    /// io_uring: the wait was ended by a `POLLOUT` on which a send that
-    /// waited for room was resubmitted. Until the future next arms, a send
-    /// in the kernel also blocks it, so that it arms no poll of its own
-    /// while that send may get `EAGAIN` and wait again: the send then
-    /// waits on the poll `wait_for_room` arms, multishot after a resubmit
-    /// on `POLLOUT`, not on the future's one-shot poll, whose `POLLOUT`
-    /// would resubmit it at once, and so on while the socket reports
-    /// `POLLOUT` and refuses the send.
+    /// io_uring: the future got `Recheck`: a send that waited for room, or
+    /// one parked on a retry list, went into the kernel. Until the future
+    /// next arms, a send in the kernel also blocks it, so that it arms no
+    /// poll of its own while that send may get `EAGAIN` and wait again: the
+    /// send then waits on the poll `wait_for_room` arms, multishot after a
+    /// resubmit on `POLLOUT`, not on the future's one-shot poll, whose
+    /// `POLLOUT` would resubmit it at once, and so on while the socket
+    /// reports `POLLOUT` and refuses the send.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     rechecking: bool,
     /// The task the future last registered, whose registration and event it

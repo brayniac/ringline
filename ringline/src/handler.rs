@@ -185,9 +185,11 @@ pub(crate) struct ConnSendState {
 pub(crate) enum WritableEvent {
     /// The socket reported `POLLOUT`.
     Room,
-    /// The socket reported `POLLOUT`, and a send that waited for room was
-    /// resubmitted on it and may take the room: the future looks again,
-    /// from its check for queued and waiting sends.
+    /// A send that waited for room was resubmitted, on the `POLLOUT` the
+    /// future waited for or by the backstop, or a send parked on a retry
+    /// list was pushed, and it may take the room: the future looks again,
+    /// from its check for queued and waiting sends, and waits for that send
+    /// to leave the kernel before it arms.
     Recheck,
     /// An error, a hangup or a cancel, with its errno.
     Failed(i32),
