@@ -152,12 +152,18 @@ pub(crate) struct ConnSendState {
     /// both by `abort` and at the slot's release. The future registers again
     /// if it is polled before its wait has ended.
     pub writable_task: Option<u32>,
-    /// io_uring: what ended a `writable` future's wait, for its next poll:
-    /// `Ok` on a `POLLOUT`, or the errno of an error, a hangup or a cancel.
-    /// The future clears it when it starts to wait, so only an event that
-    /// arrives while it waits counts.
+    /// io_uring: what ended a `writable` future's wait, for its next poll,
+    /// and the task it was for: `Ok` on a `POLLOUT`, or the errno of an
+    /// error, a hangup or a cancel. The future clears its own when it starts
+    /// to wait on the socket, so only an event that arrives while it waits
+    /// counts.
     #[cfg(has_io_uring)]
-    pub writable_event: Option<Result<(), i32>>,
+    pub writable_event: Option<(u32, Result<(), i32>)>,
+    /// io_uring: the registered `writable` future waits for the
+    /// connection's queued and waiting sends, not yet on the socket; the
+    /// completion that leaves none wakes it.
+    #[cfg(has_io_uring)]
+    pub writable_blocked: bool,
     /// io_uring: the state of the connection's `SendPollProbe`, the one-shot
     /// `POLLOUT` poll a `writable` future arms while the connection's
     /// `SendPollOut` is multishot.
@@ -240,6 +246,8 @@ impl ConnSendState {
             writable_task: None,
             #[cfg(has_io_uring)]
             writable_event: None,
+            #[cfg(has_io_uring)]
+            writable_blocked: false,
             #[cfg(has_io_uring)]
             send_probe: SendProbe::None,
         }

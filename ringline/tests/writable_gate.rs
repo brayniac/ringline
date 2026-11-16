@@ -1,7 +1,7 @@
 //! `SendHalf::writable`, the wait for room in a socket that a server awaits
-//! before each piece of a large reply, and `SendCompletion::waited_for_room`
-//! (`docs/send-admission-design.md`, section 4, Experiment D), on whichever
-//! backend the build has.
+//! before each piece of a large reply, so that a piece takes send-pool slots
+//! only once its socket has room, and `SendCompletion::waited_for_room`, on
+//! whichever backend the build has.
 //!
 //! Each test opens one connection to a one-worker server. The first byte the
 //! client writes picks what the server does. Most cases fill the server's
@@ -29,8 +29,10 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
@@ -59,11 +61,28 @@ struct Seen {
     aborted_at: Option<Instant>,
     filled_at: Option<Instant>,
     resolved_at: Option<Instant>,
+    /// When `close` returned.
+    closed_at: Option<Instant>,
+    /// Whether each of two sends made before the gate had settled when it
+    /// resolved.
+    queued_settled: Option<(bool, bool)>,
+    /// Whether a send of the second fill, which should go in whole, waited.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    refill_waited: Option<bool>,
+    /// Why the server gave up before the gate.
+    note: Option<String>,
 }
 
 static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
 /// The server has filled the socket and its gate waits.
 static FILLED: AtomicBool = AtomicBool::new(false);
+/// The bytes the server sent in its first fill.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// The client has read the first fill in full.
+static READ_ALL: AtomicBool = AtomicBool::new(false);
+/// The server has filled the socket a second time, with whole sends.
+static REFILLED: AtomicBool = AtomicBool::new(false);
 
 const CHUNK_LEN: usize = 16 * 1024;
 const SLOT: u32 = 16 * 1024;
@@ -103,6 +122,32 @@ async fn fill(conn: &mut Connection) {
         }
     }
     panic!("no send waited for room after {MAX_ROUNDS} rounds");
+}
+
+/// `fill`, keeping the last send's completion and counting the bytes sent:
+/// before the round whose last send waited for room, and in all.
+async fn fill_keeping(conn: &mut Connection) -> (usize, usize, ringline::SendCompletion) {
+    static CHUNK: [u8; CHUNK_LEN] = [7; CHUNK_LEN];
+    let mut sent = 0;
+    for _ in 0..MAX_ROUNDS {
+        let before = sent;
+        let mut last = None;
+        for _ in 0..8 {
+            last = Some(conn.send(&CHUNK).expect("send"));
+            sent += CHUNK_LEN;
+        }
+        ringline::sleep(Duration::from_millis(1)).await;
+        let last = last.expect("eight sends");
+        if last.waited_for_room() {
+            return (before, sent, last);
+        }
+    }
+    panic!("no send waited for room after {MAX_ROUNDS} rounds");
+}
+
+/// Whether `sent` has settled, from one poll. Poll each completion once.
+async fn settled(sent: &mut ringline::SendCompletion) -> bool {
+    std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *sent).poll(cx).is_ready())).await
 }
 
 /// A 5-byte send to an empty socket settles without waiting for room.
@@ -156,6 +201,11 @@ impl AsyncEventHandler for Gate {
                         s.resolved_at = Some(Instant::now());
                     });
                 }
+                b'q' => queued_bytes_come_first(&mut conn).await,
+                b'p' => probe_on_a_drained_multishot_connection(&mut conn).await,
+                b'c' => close_while_waiting(&mut conn).await,
+                #[cfg(target_os = "linux")]
+                b'f' => whole_sends_fill(&mut conn).await,
                 b's' => {
                     // The gate is polled first after the connection is
                     // released.
@@ -219,6 +269,121 @@ async fn abort_while_waiting(conn: &mut Connection) {
     record(|s| s.pending_while_full = Some(pending));
     conn.abort();
     record(|s| s.aborted_at = Some(Instant::now()));
+}
+
+/// Two 64 KiB sends, then the gate, in one poll: the gate resolves only
+/// once both are written and the socket has room.
+async fn queued_bytes_come_first(conn: &mut Connection) {
+    static PART: [u8; 4 * CHUNK_LEN] = [3; 4 * CHUNK_LEN];
+    let mut a = conn.send(&PART).expect("send");
+    let mut b = conn.send(&PART).expect("send");
+    let gate = ringline::timeout(Duration::from_secs(5), conn.writable()).await;
+    let settled_a = settled(&mut a).await;
+    let settled_b = settled(&mut b).await;
+    record(|s| {
+        s.gate = Some(gate_result(gate));
+        s.queued_settled = Some((settled_a, settled_b));
+    });
+}
+
+/// Fill the socket of a peer that has half-closed and reads, wait for the
+/// last send to settle and the socket to drain, then wait on the gate. On
+/// io_uring the connection's poll is multishot by then and its POLLOUT
+/// changes have been reported, so only the probe reports the room.
+async fn probe_on_a_drained_multishot_connection(conn: &mut Connection) {
+    let (_, _, last) = fill_keeping(conn).await;
+    let settled = ringline::timeout(Duration::from_secs(10), last).await;
+    if !matches!(settled, Ok(Ok(_))) {
+        record(|s| s.note = Some(format!("the fill did not settle: {settled:?}")));
+        return;
+    }
+    ringline::sleep(Duration::from_millis(100)).await;
+    let began = Instant::now();
+    let gate = ringline::timeout(Duration::from_secs(1), conn.writable()).await;
+    let gate = gate_result(gate);
+    record(|s| {
+        s.gate = Some(gate);
+        s.filled_at = Some(began);
+        s.resolved_at = Some(Instant::now());
+    });
+}
+
+/// Fill the socket, wait on the gate from another task, and request a
+/// close, whose drain to a peer that does not read never ends.
+async fn close_while_waiting(conn: &mut Connection) {
+    fill(conn).await;
+    let gate = conn.writable();
+    ringline::spawn(async move {
+        let gate = ringline::timeout(Duration::from_secs(5), gate).await;
+        let gate = gate_result(gate);
+        record(|s| {
+            s.gate = Some(gate);
+            s.resolved_at = Some(Instant::now());
+        });
+    })
+    .expect("spawn");
+    ringline::sleep(Duration::from_millis(200)).await;
+    let pending = SEEN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|s| s.gate.is_none());
+    record(|s| s.pending_while_full = Some(pending));
+    conn.close();
+    record(|s| s.closed_at = Some(Instant::now()));
+}
+
+/// Linux: with the peer half-closed, fill the socket until a send waits,
+/// which leaves the connection's poll multishot; let the client read it all,
+/// so the poll reports POLLOUT; then fill it again with whole sends, to 0.9
+/// of what the first fill held before its first wait, which on Linux leaves
+/// more than two thirds of the send buffer queued and no send waiting. The
+/// gate must wait until the client reads again.
+#[cfg(target_os = "linux")]
+async fn whole_sends_fill(conn: &mut Connection) {
+    static CHUNK: [u8; CHUNK_LEN] = [7; CHUNK_LEN];
+    let (capacity, total, last) = fill_keeping(conn).await;
+    TOTAL.store(total, Ordering::SeqCst);
+    FILLED.store(true, Ordering::SeqCst);
+    let settled = ringline::timeout(Duration::from_secs(15), last).await;
+    if !matches!(settled, Ok(Ok(_))) {
+        record(|s| s.note = Some(format!("the first fill did not settle: {settled:?}")));
+        return;
+    }
+    while !READ_ALL.load(Ordering::SeqCst) {
+        ringline::sleep(Duration::from_millis(1)).await;
+    }
+    let mut refill = Vec::new();
+    for _ in 0..capacity * 9 / 10 / CHUNK_LEN {
+        refill.push(conn.send(&CHUNK).expect("send"));
+    }
+    let mut waited = false;
+    for sent in refill.iter_mut() {
+        let done = ringline::timeout(Duration::from_secs(5), &mut *sent).await;
+        if !matches!(done, Ok(Ok(_))) {
+            record(|s| {
+                s.note = Some(format!(
+                    "a send of the second fill did not settle: {done:?}"
+                ))
+            });
+            return;
+        }
+        waited |= sent.waited_for_room();
+    }
+    let mut gate = std::pin::pin!(conn.writable());
+    let early = ringline::timeout(Duration::from_millis(300), gate.as_mut()).await;
+    record(|s| {
+        s.refill_waited = Some(waited);
+        s.pending_while_full = Some(early.is_err());
+        s.filled_at = Some(Instant::now());
+    });
+    REFILLED.store(true, Ordering::SeqCst);
+    let gate = ringline::timeout(Duration::from_secs(10), gate).await;
+    let gate = gate_result(gate);
+    record(|s| {
+        s.gate = Some(gate);
+        s.resolved_at = Some(Instant::now());
+    });
 }
 
 fn launch() -> (
@@ -285,6 +450,8 @@ fn start(
 ) {
     *SEEN.lock().unwrap() = None;
     FILLED.store(false, Ordering::SeqCst);
+    READ_ALL.store(false, Ordering::SeqCst);
+    REFILLED.store(false, Ordering::SeqCst);
     let (runtime, handles) = launch();
     let addr = runtime.bound_addr().expect("bound");
     let mut client = TcpStream::connect(addr).expect("connect");
@@ -570,4 +737,179 @@ fn time_to_pollout(rcvbuf: Option<i32>) -> Option<Duration> {
     stop.store(true, Ordering::SeqCst);
     reader.join().unwrap();
     took
+}
+
+/// Two sends made just before the gate, in the same poll, are written
+/// before it resolves.
+#[test]
+fn sends_queued_before_the_gate_are_written_first() {
+    let _serial = serial();
+    let (runtime, handles, _client) = start(b'q');
+    let seen = wait_for("resolved the gate", |s| s.gate.is_some());
+    assert_eq!(seen.gate, Some(Ok(())));
+    assert_eq!(
+        seen.queued_settled,
+        Some((true, true)),
+        "the gate resolved before the sends"
+    );
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+/// After the peer half-closes and the socket drains, the gate resolves at
+/// once: on io_uring the multishot poll reports no change, and the probe
+/// reports the room.
+#[test]
+fn a_drained_socket_after_a_half_close_is_writable() {
+    let _serial = serial();
+    let (runtime, handles, mut client) = start(b'p');
+    client.shutdown(Shutdown::Write).unwrap();
+    // Read at about 32 MiB/s, slower than the server fills, until the end.
+    let reader = std::thread::spawn(move || {
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let seen = wait_for("resolved the gate", |s| {
+        s.gate.is_some() || s.note.is_some()
+    });
+    assert_eq!(seen.note, None);
+    assert_eq!(seen.gate, Some(Ok(())));
+    let took = seen.resolved_at.unwrap() - seen.filled_at.unwrap();
+    assert!(took < Duration::from_millis(200), "resolved after {took:?}");
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    reader.join().unwrap();
+}
+
+/// `close` while another task's gate waits fails the gate at once, though
+/// the close's drain to a peer that does not read never ends.
+#[test]
+fn a_close_while_waiting() {
+    let _serial = serial();
+    let (runtime, handles, client) = start(b'c');
+    let seen = wait_for("resolved the gate", |s| s.gate.is_some());
+    assert_eq!(
+        seen.pending_while_full,
+        Some(true),
+        "it resolved before the close"
+    );
+    assert_eq!(seen.gate, Some(Err(io::ErrorKind::NotConnected)));
+    let took = seen.resolved_at.unwrap() - seen.closed_at.unwrap();
+    assert!(
+        took < Duration::from_secs(1),
+        "resolved {took:?} after the close"
+    );
+    drop(client);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+/// Linux: a socket refilled by whole sends, with no send waiting and the
+/// connection's poll multishot after a POLLOUT, is not writable until the
+/// peer reads again. A gate that resolved on the poll's earlier POLLOUT
+/// would let a piece into the full socket.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_socket_filled_by_whole_sends_is_not_writable() {
+    let _serial = serial();
+    *SEEN.lock().unwrap() = None;
+    FILLED.store(false, Ordering::SeqCst);
+    READ_ALL.store(false, Ordering::SeqCst);
+    REFILLED.store(false, Ordering::SeqCst);
+    let (runtime, handles) = launch();
+    let addr = runtime.bound_addr().expect("bound");
+    // Set before the connect, so the window and the server's MSS agree.
+    let mut client = connect_with_rcvbuf(addr, 256 << 10);
+    client.write_all(b"f").unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    wait_filled();
+    client
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut left = TOTAL.load(Ordering::SeqCst);
+    let mut buf = vec![0u8; 1 << 16];
+    while left > 0 {
+        let n = client
+            .read(&mut buf[..left.min(1 << 16)])
+            .expect("read the first fill");
+        assert!(n > 0, "the server closed early");
+        left -= n;
+    }
+    READ_ALL.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !REFILLED.load(Ordering::SeqCst) {
+        if SEEN
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.note.is_some())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server never refilled the socket"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drain(&mut client);
+    let seen = wait_for("resolved the gate", |s| {
+        s.gate.is_some() || s.note.is_some()
+    });
+    assert_eq!(seen.note, None);
+    assert_eq!(
+        seen.refill_waited,
+        Some(false),
+        "precondition: a send of the second fill waited for room"
+    );
+    assert_eq!(
+        seen.pending_while_full,
+        Some(true),
+        "it resolved on a full socket"
+    );
+    assert_eq!(seen.gate, Some(Ok(())));
+    assert_resolved_promptly(&seen);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+/// Connect to `addr` with `SO_RCVBUF` set to `size` before the connect.
+#[cfg(target_os = "linux")]
+fn connect_with_rcvbuf(addr: std::net::SocketAddr, size: i32) -> TcpStream {
+    use std::os::fd::FromRawFd;
+    let std::net::SocketAddr::V4(v4) = addr else {
+        panic!("the test binds IPv4 loopback");
+    };
+    // SAFETY: socket(2) takes no pointers.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+    // SAFETY: `fd` is a socket this function owns; the stream closes it.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    set_rcvbuf(&stream, size);
+    let sin = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: v4.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(v4.ip().octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: `sin` is a valid IPv4 address and outlives the call.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&sin as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "connect: {}", io::Error::last_os_error());
+    stream
 }

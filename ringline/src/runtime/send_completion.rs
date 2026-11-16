@@ -771,10 +771,10 @@ impl SendCompletions {
     /// settled: its bytes, or bytes queued ahead of it on the connection,
     /// are not all in the socket.
     ///
-    /// Called by the backends each time a write on the connection finds the
-    /// socket full: on io_uring every call of `wait_for_room`, on mio every
-    /// `writev` that returns `WouldBlock`. Visits the entries indexed under
-    /// the connection.
+    /// Called by the io_uring event loop at every call of `wait_for_room`;
+    /// mio marks sends by id instead
+    /// ([`mark_send_waited_for_room`](Self::mark_send_waited_for_room)).
+    /// Visits the entries indexed under the connection.
     pub(crate) fn mark_waited_for_room(&mut self, conn_index: u32) {
         let Some(list) = self.by_conn.get(conn_index as usize) else {
             return;
@@ -789,8 +789,9 @@ impl SendCompletions {
     }
 
     /// Mark the send `id` names as having waited for room, if it is in
-    /// flight. mio marks the sends a `writev` found the socket full for one
-    /// by one, by the ids their queued entries carry.
+    /// flight, or settled with its result not yet taken. mio marks the sends
+    /// a `writev` that returned `WouldBlock` carried one by one, by the ids
+    /// their queued entries carry.
     #[cfg_attr(has_io_uring, allow(dead_code))]
     pub(crate) fn mark_send_waited_for_room(&mut self, id: SendId) {
         if let Some(e) = self.entry_mut(id)
