@@ -3,12 +3,14 @@
 
 Each argument is a directory made by `systemslab artifact download-all <id>`
 for one run of send-admission-d.toml. The RUN and WORKER lines come from the
-job's logs.json; admission-load's and admission-server's JSON come from
-results.tgz, or from the LOAD and SERVER lines when there is no results.tgz.
-Runs of workloads other than U are also parsed by send-admission-c0-report.py's
-`one`.
+job's logs.json; admission-load's and admission-server's JSON, worker.txt,
+ss.log and the nstat and sockstat files come from results.tgz. The SERVER log
+line holds only a summary, so a run without results.tgz is skipped, as is a
+run whose files or log lines do not parse; each skip is printed with its
+reason. send-admission-c0-report.py's readers of logs.json and results.tgz
+are used.
 
-An arm is (order, stream_piece, stream_gate). A cell is (workload,
+An arm is (order, budget, stream_piece, stream_gate). A cell is (workload,
 stall_peers, tcp_wmem_max, drainers, drain_read_bps, pipeline, admit_ms,
 host). Runs are grouped by cell and arm and never merged across either. If
 a cell's runs differ in any other RUN parameter (other than rep and
@@ -17,50 +19,60 @@ warning is printed; each part is then a cell of its own, in the decision
 too.
 
 Per cell and arm, over its runs:
-- fast: the median [min-max] of the per-run p99 of the fast small replies'
-  delay from scheduled time to admission, in ms; and the fast small replies
-  beyond admit_ms or not admitted, summed and per run;
+- fast: the per-run p99 of the fast small replies' delay from scheduled time
+  to admission, in ms, as median [min-max] and maximum; and the fast small
+  replies beyond admit_ms or not admitted, summed and per run;
 - 7 MiB: the heads (tag 0xffffffff) the client read in full, of those
   requested, and their time from request to last byte (median, max) over
-  the completed ones, in ms;
+  the completed ones, in ms; in U, the closed loop's replies;
 - drain: the drainers' replies read in full, of those requested (in W5,
   the slow readers of large replies);
-- free: the fewest free main-region slots during a head, from the server's
-  10 ms samples: the minimum over the runs and the median of the per-run
-  minima;
+- free: the fewest free main-region slots during a head: the smaller of the
+  server's 10 ms samples over the head and its reads just after each
+  admission of the head or its pieces; the minimum over the runs, the median
+  of the per-run minima, and the heads with neither figure;
 - waited: pieces whose SendCompletion waited for room, of the pieces sent,
   by connection: stalled peers (tags below 0x80000000), drainers, and other
   (the head);
 - aborts by cause, summed;
 - U: per run the closed loop's median and p99 per reply in microseconds and
   the worker's CPU per byte (cpu_ns from the WORKER line over the bytes of
-  every reply the loop read, its uncounted warmup included); over the runs
-  the median [min-max].
+  every reply the loop read, its uncounted warmup included; a missing or
+  zero cpu_ns counts as no figure); over the runs the median [min-max].
+
+Per run, TcpExtTCPMemoryPressures after the run less before, and the TCP
+memory pages in /proc/net/sockstat before and after.
+
+Calibration runs (workloads CAL and CAL-DRAIN) also get, per run with no
+drainer: the fewest free main-region slots over the load's window and,
+divided over the stalled peers, the slots each held (h for whole replies,
+h_p for pieces); and for every calibration run, from ss.log, the largest
+sk_sndbuf (tb) and wmem_queued (w) seen for the first stalled peer and the
+first drainer.
+
+U's cost comes first: each arm's CPU per byte against O0 whole's, and the
+difference in median time per reply and in CPU per reply divided by the
+pieces per reply, the cost of one piece, with O0 whole's spread beside it.
 
 Decision (docs/send-admission-design.md, section 4, Experiment D), for each
 arm with the gate on:
 - in W1, W2, W4 at tcp_wmem 1 MiB (every k run) and W5, it completes every
   7 MiB reply and every W5 slow reader's reply, keeps the fast small p99 at
-  or below 10 ms (the median over the cell's runs, as Experiment C's report
-  reads it; the maximum is printed beside it), and has no more fast small
-  replies beyond admit_ms than O0 whole (counted per run, since O0 whole has
-  more runs). A cell the arm or O0 whole did not run fails the condition.
-- Among the passing arms, the larger stream_piece is named.
-- U: each gated arm's CPU per byte against O0 whole's; above twice, the arm
-  goes to the owner before it is chosen. The difference in median time per
-  reply and in CPU per reply, divided by the pieces per reply, is the cost of
-  one piece; O0 whole's spread is printed beside it.
+  or below 10 ms in every run (the maximum over the cell's runs; the median
+  is printed beside it), and has no more fast small replies beyond admit_ms
+  than O0 whole (counted per run, since O0 whole has more runs). A cell the
+  arm or O0 whole did not run fails the condition.
+- Among the passing arms, the larger stream_piece is named, with its CPU per
+  byte in U against O0 whole's: above twice, the arm goes to the owner before
+  it is chosen.
+- The runs with memory pressure are listed beside it.
 
-Calibration runs (workload CAL) also get, per run: the fewest free
-main-region slots over the load's window and, divided over the stalled
-peers, the slots each held (h for whole replies, h_p for pieces); and from
-ss.log in results.tgz, the largest sk_sndbuf (tb) and wmem_queued (w) seen
-for the first stalled peer and the first drainer.
-
-Then the prediction's refutation conditions: in any cell, a gated arm's fast
-small p99 (median over runs) above 10 ms, a 7 MiB reply or a W5 slow reader's
-reply not completed, fewer than 3/4 of the pool free during a 7 MiB reply in
-W4, or a stalled peer's gated piece that waited for room in W4.
+Then the prediction's refutation conditions, each printed with its result
+for each gated arm and cell: the fast small p99 above 10 ms in a run, a
+7 MiB reply (in U, a closed-loop reply) or a W5 slow reader's reply not
+completed, fewer than 3/4 of the pool free during a 7 MiB reply in W4 (no
+free-slot figure is reported as such, not as holding), or a stalled peer's
+gated piece that waited for room in W4.
 """
 
 import importlib.util
@@ -89,6 +101,7 @@ ORDERS = {
     "budget": "O7",
     "budget-idle": "O7w",
 }
+BUDGET_ORDERS = {"budget", "budget-idle"}
 CELL_KEYS = (
     "workload",
     "stall_peers",
@@ -99,14 +112,17 @@ CELL_KEYS = (
     "admit_ms",
     "host",
 )
-ARM_KEYS = ("order", "stream_piece", "stream_gate")
+ARM_KEYS = ("order", "budget", "stream_piece", "stream_gate")
+ARM_DEFAULTS = {"order": "strict", "budget": "32", "stream_piece": "0", "stream_gate": "off"}
 NOT_GROUPED = {"rep", "load_rc"}
 DECISION_WORKLOADS = ("W1", "W2", "W4", "W5")
 
 
 def arm_name(arm):
-    order, piece, gate = arm
+    order, budget, piece, gate = arm
     o = ORDERS.get(order, order)
+    if order in BUDGET_ORDERS:
+        o += f"(R={budget})"
     if piece in (None, "0"):
         return f"{o} whole"
     kib = int(piece) // 1024
@@ -114,7 +130,20 @@ def arm_name(arm):
 
 
 def is_o0_whole(arm):
-    return arm[0] == "strict" and arm[1] in (None, "0")
+    return arm[0] == "strict" and arm[2] in (None, "0")
+
+
+def is_gated(arm):
+    return arm[3] == "on"
+
+
+def piece_of(arm):
+    return int(arm[2] or 0)
+
+
+def arm_sort(arm):
+    order, _budget, _piece, gate = arm
+    return (order != "strict", piece_of(arm) != 0, gate == "on", piece_of(arm), order)
 
 
 def fmt(x, spec=".1f"):
@@ -128,64 +157,94 @@ def spread(xs, spec=".1f"):
     return f"{format(median(xs), spec)} [{format(min(xs), spec)}-{format(max(xs), spec)}]"
 
 
-def worker_line(root):
-    """cpu_ns from the run's worker.txt, or from its WORKER log line."""
+def tgz_files(root):
+    """{name: bytes} of the files in the run's results.tgz, or None."""
     for tgz in root.rglob("results.tgz"):
         with tarfile.open(fileobj=io.BytesIO(tgz.read_bytes())) as t:
-            for m in t.getmembers():
-                if m.isfile() and pathlib.Path(m.name).name == "worker.txt":
-                    return parse_worker(t.extractfile(m).read().decode())
-    for text in c0.log_lines(root):
-        if text.startswith("WORKER "):
-            return parse_worker(text)
+            return {
+                pathlib.Path(m.name).name: t.extractfile(m).read()
+                for m in t.getmembers()
+                if m.isfile()
+            }
     return None
 
 
 def parse_worker(text):
     words = dict(w.split("=", 1) for w in text.split() if "=" in w)
     try:
-        return int(words["cpu_ns"])
+        cpu = int(words["cpu_ns"])
     except (KeyError, ValueError):
         return None
+    # A server whose worker thread was not found reads 0.
+    return cpu if cpu > 0 else None
 
 
-def ss_lines(root):
-    """The SS lines of the run's ss.log, if its results.tgz has one."""
-    for tgz in root.rglob("results.tgz"):
-        with tarfile.open(fileobj=io.BytesIO(tgz.read_bytes())) as t:
-            for m in t.getmembers():
-                if m.isfile() and pathlib.Path(m.name).name == "ss.log":
-                    text = t.extractfile(m).read().decode(errors="replace")
-                    return [l for l in text.splitlines() if l.startswith("SS ")]
-    return []
+def nstat_value(data, name):
+    if data is None:
+        return None
+    for line in data.decode(errors="replace").splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[0] == name:
+            try:
+                return int(words[1])
+            except ValueError:
+                return None
+    return None
 
 
-def raw_run(root):
-    """The RUN parameters, and the load's and server's JSON."""
-    run = load = server = None
+def sockstat_mem(data):
+    """The TCP line's mem field of /proc/net/sockstat, in pages."""
+    if data is None:
+        return None
+    m = re.search(r"^TCP:.*\bmem (\d+)", data.decode(errors="replace"), re.M)
+    return int(m.group(1)) if m else None
+
+
+def read_run(root):
+    """The RUN parameters, cpu_ns, and the run's files from results.tgz."""
+    run = worker = None
     for text in c0.log_lines(root):
         if text.startswith("RUN "):
             run = c0.parse_run(text)
-        elif text.startswith("LOAD "):
-            load = json.loads(text[5:])
-        elif text.startswith("SERVER "):
-            server = json.loads(text[7:])
-    got = c0.from_tgz(root)
-    if got:
-        load, server = got
-    if not (run and load and server):
-        raise SystemExit(f"{root}: missing RUN, LOAD or SERVER")
-    return run, load, server
+        elif text.startswith("WORKER "):
+            worker = parse_worker(text)
+    if run is None:
+        raise SystemExit(f"{root}: no RUN line")
+    files = tgz_files(root)
+    if files is None:
+        raise SystemExit(f"{root}: no results.tgz (the SERVER line holds only a summary)")
+    for name in ("load.json", "server.json"):
+        if name not in files:
+            raise SystemExit(f"{root}: results.tgz has no {name}")
+    if "worker.txt" in files:
+        worker = parse_worker(files["worker.txt"].decode(errors="replace"))
+    try:
+        load = json.loads(files["load.json"])
+        server = json.loads(files["server.json"])
+    except ValueError as e:
+        raise SystemExit(f"{root}: load.json or server.json does not parse: {e}")
+    return run, worker, load, server, files
 
 
 def one(root):
     root = pathlib.Path(root)
-    run, load, server = raw_run(root)
+    try:
+        run, cpu_ns, load, server, files = read_run(root)
+        return summarise_run(root, run, cpu_ns, load, server, files)
+    except (KeyError, TypeError, ValueError, IndexError) as e:
+        raise SystemExit(f"{root}: unexpected content: {e!r}")
+
+
+def summarise_run(root, run, cpu_ns, load, server, files):
     st = server["statistics"]
     pool = server["pool_slots"]
     r = dict(root=str(root), run=run, rc=int(run.get("load_rc", "-1")), pool=pool)
-    r["cpu_ns"] = worker_line(root)
+    r["cpu_ns"] = cpu_ns
     r["aborts"] = server.get("aborts", {})
+    before = nstat_value(files.get("nstat-before.txt"), "TcpExtTCPMemoryPressures")
+    after = nstat_value(files.get("nstat-after.txt"), "TcpExtTCPMemoryPressures")
+    r["mem_pressures"] = None if before is None or after is None else after - before
+    r["sock_mem"] = (sockstat_mem(files.get("sockstat-before.txt")), sockstat_mem(files.get("sockstat-after.txt")))
     larges = st["large_replies"]
     heads = [l for l in larges if l["tag"] == HEAD_TAG]
     waited = defaultdict(lambda: [0, 0])
@@ -198,15 +257,22 @@ def one(root):
         waited[kind][0] += l.get("pieces_waited", 0)
         waited[kind][1] += l.get("pieces_sent", 0)
     r["waited"] = dict(waited)
-    frees = [h["min_main_free"] for h in heads if h.get("min_main_free") is not None]
+    frees, none = [], 0
+    for h in heads:
+        figs = [x for x in (h.get("min_main_free"), h.get("admit_min_free")) if x is not None]
+        if figs:
+            frees.append(min(figs))
+        else:
+            none += 1
     r["head_min_free"] = min(frees) if frees else None
-    r["server_heads_completed"] = sum(1 for h in heads if h.get("outcome") == "completed")
-    r["server_heads"] = len(heads)
+    r["heads_no_free"] = none
     lo, hi = load.get("window_ns", [0, 0])
     samples = [f for t, f in st.get("main_free_samples", []) if lo <= t * 1_000_000 <= hi]
     r["window_min_free"] = min(samples) if samples else None
     ss = defaultdict(lambda: [0, 0])
-    for line in ss_lines(root):
+    for line in files.get("ss.log", b"").decode(errors="replace").splitlines():
+        if not line.startswith("SS "):
+            continue
         words = line.split()
         kind = words[2] if len(words) > 2 else "?"
         tb = re.search(r"\btb(\d+)", line)
@@ -220,14 +286,9 @@ def one(root):
         cl = load["closed_loop"]
         r["u"] = cl
         replies = cl["warmup"] + cl["completed"]
-        r["cpu_per_byte"] = (
-            r["cpu_ns"] / (replies * cl["size"])
-            if r["cpu_ns"] is not None and replies
-            else None
-        )
-        r["cpu_per_reply_us"] = (
-            r["cpu_ns"] / replies / 1000 if r["cpu_ns"] is not None and replies else None
-        )
+        ok = cpu_ns is not None and replies > 0
+        r["cpu_per_byte"] = cpu_ns / (replies * cl["size"]) if ok else None
+        r["cpu_per_reply_us"] = cpu_ns / replies / 1000 if ok else None
         r["fast_p99"] = None
         r["fast_bad"] = 0
         r["heads_ok"] = cl["completed"]
@@ -235,9 +296,10 @@ def one(root):
         r["head_times"] = [u / 1000 for u in cl["us"]]
         r["slow_ok"] = r["slow_n"] = 0
         return r
-    base = c0.one(root)
-    r["fast_p99"] = base["fast_p99"]
-    r["fast_bad"] = base["fast_beyond"] + base["fast_na"]
+    fast = st["classes"]["small_fast"]
+    p99 = fast["scheduled_us"]["p99"]
+    r["fast_p99"] = None if p99 is None else p99 / 1000
+    r["fast_bad"] = fast["beyond_admit_limit"] + sum(fast["not_admitted"].values())
     done = load.get("large_completed")
     if done is None:  # a load from before D: a head counts if it has a time
         done = [x is not None for x in load.get("large_ms", [])]
@@ -273,10 +335,7 @@ def group(rows):
         if differ:
             print(f"warning: {cell_name(cell)}: runs differ in {differ}; split", file=sys.stderr)
         for r in rs:
-            arm = tuple(
-                r["run"].get(k, "0" if k == "stream_piece" else "off" if k == "stream_gate" else "-")
-                for k in ARM_KEYS
-            )
+            arm = tuple(r["run"].get(k, ARM_DEFAULTS[k]) for k in ARM_KEYS)
             extra = tuple((k, r["run"].get(k)) for k in differ)
             out[(cell + extra, arm)].append(r)
     return dict(out)
@@ -284,6 +343,10 @@ def group(rows):
 
 def cell_name(cell):
     return " ".join(f"{k}={v}" for k, v in cell)
+
+
+def workload(cell):
+    return dict(cell)["workload"]
 
 
 def summarise(rs):
@@ -302,7 +365,7 @@ def summarise(rs):
     return dict(
         n=len(rs),
         rc_bad=sum(1 for r in rs if r["rc"] != 0),
-        fast_p99=median(p99) if p99 else None,
+        fast_p99_med=median(p99) if p99 else None,
         fast_p99_max=max(p99) if p99 else None,
         fast_p99_runs=p99,
         fast_bad=sum(r["fast_bad"] for r in rs),
@@ -315,6 +378,7 @@ def summarise(rs):
         slow_n=sum(r["slow_n"] for r in rs),
         free_min=min(frees) if frees else None,
         free_med=median(frees) if frees else None,
+        heads_no_free=sum(r["heads_no_free"] for r in rs),
         pool=rs[0]["pool"],
         waited=dict(waited),
         aborts=dict(aborts),
@@ -322,6 +386,7 @@ def summarise(rs):
         u_p99=[x["p99_us"] for x in u],
         u_cpu_b=[r["cpu_per_byte"] for r in rs if r.get("cpu_per_byte") is not None],
         u_cpu_reply=[r["cpu_per_reply_us"] for r in rs if r.get("cpu_per_reply_us") is not None],
+        u_cpu_missing=sum(1 for r in rs if r["u"] and r.get("cpu_per_byte") is None),
         u_rcvbuf=sorted({x["rcvbuf_reported"] for x in u}),
         u_size=u[0]["size"] if u else None,
         u_errors=[x["error"] for x in u if x.get("error")],
@@ -339,55 +404,132 @@ def print_tables(groups):
     for cell in sorted(by_cell):
         arms = by_cell[cell]
         print(f"\n== {cell_name(cell)}")
-        u = dict(cell).get("workload") == "U"
+        u = workload(cell) == "U"
         if u:
-            print("arm                runs | p50 us [range]            p99 us [range]            | CPU ns/B [range]          CPU us/reply | rcvbuf   | completed")
+            print("arm                  runs | p50 us [range]            p99 us [range]            | CPU ns/B [range]          CPU us/reply | rcvbuf   | completed")
         else:
-            print("arm                runs | fast p99 ms [range]  max | fast bad (per run) | 7MiB ok/n  med ms  max ms | drain ok/n | free min med | waited (w/sent) | aborts")
+            print("arm                  runs | fast p99 ms: median [range] max | fast bad (per run) | 7MiB ok/n  med ms  max ms | drain ok/n | free min med none | waited (w/sent) | aborts")
         for arm in sorted(arms, key=arm_sort):
             s = arms[arm]
             if u:
                 print(
-                    f"{arm_name(arm):18} {s['n']:>4} | {spread(s['u_p50'], '.0f'):25} {spread(s['u_p99'], '.0f'):25} | "
+                    f"{arm_name(arm):20} {s['n']:>4} | {spread(s['u_p50'], '.0f'):25} {spread(s['u_p99'], '.0f'):25} | "
                     f"{spread(s['u_cpu_b'], '.3f'):25} {spread(s['u_cpu_reply'], '.0f'):>12} | {s['u_rcvbuf']} | {s['heads_ok']}/{s['heads_n']}"
-                    + (f" errors {s['u_errors']}" if s["u_errors"] else "")
+                    + (f" | no CPU figure in {s['u_cpu_missing']} runs" if s["u_cpu_missing"] else "")
+                    + (f" | errors {s['u_errors']}" if s["u_errors"] else "")
                 )
                 continue
             ab = " ".join(f"{k}={v}" for k, v in sorted(s["aborts"].items()) if v) or "none"
             print(
-                f"{arm_name(arm):18} {s['n']:>4} | {spread(s['fast_p99_runs']):20} {fmt(s['fast_p99_max']):>4} | "
+                f"{arm_name(arm):20} {s['n']:>4} | {spread(s['fast_p99_runs']):20} {fmt(s['fast_p99_max']):>6} | "
                 f"{s['fast_bad']:>4} ({s['fast_bad_per_run']:.1f}) | "
                 f"{s['heads_ok']:>3}/{s['heads_n']:<3} {fmt(s['head_med']):>7} {fmt(s['head_max']):>7} | "
-                f"{s['slow_ok']:>3}/{s['slow_n']:<3}  | {fmt(s['free_min'], '.0f'):>4} {fmt(s['free_med'], '.0f'):>4} | "
+                f"{s['slow_ok']:>3}/{s['slow_n']:<3}  | {fmt(s['free_min'], '.0f'):>4} {fmt(s['free_med'], '.0f'):>4} {s['heads_no_free']:>4} | "
                 f"{waited_str(s['waited'])} | {ab}"
                 + (f" | load_rc!=0 in {s['rc_bad']}" if s["rc_bad"] else "")
             )
     return by_cell
 
 
-def arm_sort(arm):
-    order, piece, gate = arm
-    return (order != "strict", int(piece or 0) != 0, gate == "on", int(piece or 0), order)
+def memory(groups):
+    """Print each run's memory figures; return the runs with pressure."""
+    print("\n== TCP memory per run: TcpExtTCPMemoryPressures delta, sockstat TCP mem pages before -> after")
+    pressured = []
+    for (cell, arm), rs in sorted(groups.items(), key=lambda x: (x[0][0], arm_sort(x[0][1]))):
+        for r in sorted(rs, key=lambda r: r["run"].get("rep", "")):
+            d = r["mem_pressures"]
+            b, a = r["sock_mem"]
+            print(f"{cell_name(cell)} | {arm_name(arm)} rep {r['run'].get('rep')}: pressures {fmt(d, 'd')}, mem {fmt(b, 'd')} -> {fmt(a, 'd')}")
+            if d:
+                pressured.append(f"{cell_name(cell)} | {arm_name(arm)} rep {r['run'].get('rep')} ({d})")
+    return pressured
 
 
-def decision(by_cell):
+def calibration(groups):
+    cal = [(c, a, rs) for (c, a), rs in groups.items() if workload(c).startswith("CAL")]
+    if not cal:
+        return
+    print("\n== calibration: slots held per stalled peer (runs with no drainer), and the sockets' buffers")
+    for cell, arm, rs in sorted(cal, key=lambda x: (x[0], arm_sort(x[1]))):
+        k = int(dict(cell)["stall_peers"])
+        drainers = dict(cell)["drainers"]
+        for r in sorted(rs, key=lambda r: r["run"].get("rep", "")):
+            sock = "; ".join(
+                f"{kind} tb {v[0]} w {v[1]}" for kind, v in sorted(r["ss"].items())
+            ) or "no ss.log"
+            if drainers == "0" and k > 0:
+                held = None if r["window_min_free"] is None else r["pool"] - r["window_min_free"]
+                per = None if held is None else held / k
+                slots = (
+                    f"fewest free {fmt(r['window_min_free'], '.0f')} of {r['pool']}, "
+                    f"held {fmt(held, '.0f')}, per stalled peer {fmt(per, '.1f')}"
+                )
+            else:
+                slots = f"{drainers} drainer(s): no h"
+            print(f"{workload(cell):9} {arm_name(arm):20} k={k} rep {r['run'].get('rep')}: {slots} | {sock}")
+
+
+def u_cost(by_cell):
+    """Print U's cost of pieces; return {arm: [CPU per byte ratios to O0 whole]}."""
+    print("\n== U: cost of pieces against O0 whole")
+    ratios = defaultdict(list)
+    ucells = [c for c in by_cell if workload(c) == "U"]
+    if not ucells:
+        print("no U cell ran")
+    for cell in sorted(ucells):
+        cells = by_cell[cell]
+        o0 = next((v for a, v in cells.items() if is_o0_whole(a)), None)
+        print(cell_name(cell))
+        if o0 is None or not o0["u_cpu_b"]:
+            print("  no O0 whole runs with a CPU figure")
+            continue
+        base_b = median(o0["u_cpu_b"])
+        base_t = median(o0["u_p50"])
+        base_r = median(o0["u_cpu_reply"])
+        print(
+            f"  O0 whole: CPU {base_b:.3f} ns/B (spread {max(o0['u_cpu_b']) - min(o0['u_cpu_b']):.3f}), "
+            f"p50 {base_t:.0f} us (spread {max(o0['u_p50']) - min(o0['u_p50']):.0f}), {len(o0['u_cpu_b'])} runs"
+        )
+        for arm in sorted(cells, key=arm_sort):
+            if is_o0_whole(arm):
+                continue
+            s = cells[arm]
+            if not s["u_cpu_b"]:
+                print(f"  {arm_name(arm)}: no CPU figure")
+                continue
+            ratio = median(s["u_cpu_b"]) / base_b if base_b else None
+            if ratio is not None:
+                ratios[arm].append(ratio)
+            line = f"  {arm_name(arm)}: CPU {median(s['u_cpu_b']):.3f} ns/B, x{fmt(ratio, '.2f')} O0 whole"
+            if piece_of(arm) and s["u_size"]:
+                pieces = -(-s["u_size"] // piece_of(arm))
+                dt = (median(s["u_p50"]) - base_t) / pieces
+                dc = (median(s["u_cpu_reply"]) - base_r) / pieces
+                line += f"; per piece ({pieces} a reply): {dt:+.1f} us of reply time, {dc:+.1f} us of worker CPU"
+            if is_gated(arm) and ratio is not None and ratio > 2:
+                line += "  -> more than twice O0 whole per byte: to the owner before it is chosen"
+            print(line)
+    return ratios
+
+
+def decision(by_cell, ratios, pressured):
     print("\n== decision (design, Experiment D)")
-    arms = sorted({a for cells in by_cell.values() for a in cells if a[2] == "on"}, key=arm_sort)
+    arms = sorted({a for cells in by_cell.values() for a in cells if is_gated(a)}, key=arm_sort)
     if not arms:
         print("no gated arm ran")
     required = [
         c for c in by_cell
-        if dict(c)["workload"] in DECISION_WORKLOADS
-        and not (dict(c)["workload"] == "W4" and dict(c)["tcp_wmem_max"] != "1048576")
+        if workload(c) in DECISION_WORKLOADS
+        and not (workload(c) == "W4" and dict(c)["tcp_wmem_max"] != "1048576")
     ]
     for w in DECISION_WORKLOADS:
-        if not any(dict(c)["workload"] == w for c in required):
+        if not any(workload(c) == w for c in required):
             print(f"  no {w} cell ran: every gated arm fails for want of it")
     passing = []
     for arm in arms:
         reasons, checks = [], 0
         for w in DECISION_WORKLOADS:
-            if not any(dict(c)["workload"] == w for c in required):
+            if not any(workload(c) == w for c in required):
                 reasons.append(f"{w}: not run")
         for cell in sorted(required):
             cells = by_cell[cell]
@@ -402,15 +544,19 @@ def decision(by_cell):
             print(f"  {arm_name(arm)} | {name}: 7 MiB {s['heads_ok']}/{s['heads_n']} {'ok' if ok_heads else 'FAIL'}", end="")
             if not ok_heads:
                 reasons.append(f"{name}: 7 MiB replies completed {s['heads_ok']}/{s['heads_n']}")
-            if dict(cell)["workload"] == "W5":
+            if workload(cell) == "W5":
                 ok_slow = s["slow_n"] > 0 and s["slow_ok"] == s["slow_n"]
                 print(f"; slow readers {s['slow_ok']}/{s['slow_n']} {'ok' if ok_slow else 'FAIL'}", end="")
                 if not ok_slow:
                     reasons.append(f"{name}: slow readers' replies completed {s['slow_ok']}/{s['slow_n']}")
-            ok_p99 = s["fast_p99"] is not None and s["fast_p99"] <= 10.0
-            print(f"; fast p99 {fmt(s['fast_p99'])} ms (max {fmt(s['fast_p99_max'])}) {'ok' if ok_p99 else 'FAIL'}", end="")
+            ok_p99 = s["fast_p99_max"] is not None and s["fast_p99_max"] <= 10.0
+            print(
+                f"; fast p99 max {fmt(s['fast_p99_max'])} ms (median {fmt(s['fast_p99_med'])}) "
+                f"{'ok' if ok_p99 else 'FAIL'}",
+                end="",
+            )
             if not ok_p99:
-                reasons.append(f"{name}: fast p99 {fmt(s['fast_p99'])} ms > 10 ms")
+                reasons.append(f"{name}: fast p99 {fmt(s['fast_p99_max'])} ms in a run > 10 ms")
             if o0 is None:
                 print("; O0 whole did not run: FAIL")
                 reasons.append(f"{name}: no O0 whole runs to compare")
@@ -431,99 +577,90 @@ def decision(by_cell):
         if verdict == "passes":
             passing.append(arm)
     if passing:
-        best = max(passing, key=lambda a: int(a[1]))
-        print(f"larger passing p: {int(best[1]) // 1024} KiB ({arm_name(best)})")
+        best = max(passing, key=piece_of)
+        r = ratios.get(best)
+        if not r:
+            cost = "no U run with a CPU figure: its cost per byte is unknown"
+        elif max(r) > 2:
+            cost = f"U CPU per byte x{max(r):.2f} O0 whole, more than twice: to the owner before it is chosen"
+        else:
+            cost = f"U CPU per byte x{max(r):.2f} O0 whole"
+        print(f"larger passing p: {piece_of(best) // 1024} KiB ({arm_name(best)}); {cost}")
     else:
         print("no gated arm passes: the result goes to the owner, and Experiment C's outcome stands for plaintext")
-    u_cost(by_cell)
-
-
-def u_cost(by_cell):
-    print("\n== U: cost of pieces against O0 whole")
-    ucells = [c for c in by_cell if dict(c)["workload"] == "U"]
-    if not ucells:
-        print("no U cell ran")
-    for cell in sorted(ucells):
-        cells = by_cell[cell]
-        o0 = next((v for a, v in cells.items() if is_o0_whole(a)), None)
-        print(cell_name(cell))
-        if o0 is None or not o0["u_cpu_b"]:
-            print("  no O0 whole runs")
-            continue
-        base_b = median(o0["u_cpu_b"])
-        base_t = median(o0["u_p50"])
-        base_r = median(o0["u_cpu_reply"])
-        print(
-            f"  O0 whole: CPU {base_b:.3f} ns/B (spread {max(o0['u_cpu_b']) - min(o0['u_cpu_b']):.3f}), "
-            f"p50 {base_t:.0f} us (spread {max(o0['u_p50']) - min(o0['u_p50']):.0f}), {len(o0['u_cpu_b'])} runs"
-        )
-        for arm in sorted(cells, key=arm_sort):
-            if is_o0_whole(arm):
-                continue
-            s = cells[arm]
-            if not s["u_cpu_b"]:
-                print(f"  {arm_name(arm)}: no CPU figure")
-                continue
-            ratio = median(s["u_cpu_b"]) / base_b if base_b else None
-            line = f"  {arm_name(arm)}: CPU {median(s['u_cpu_b']):.3f} ns/B, x{fmt(ratio, '.2f')} O0 whole"
-            if arm[1] not in (None, "0") and s["u_size"]:
-                pieces = -(-s["u_size"] // int(arm[1]))
-                dt = (median(s["u_p50"]) - base_t) / pieces
-                dc = (median(s["u_cpu_reply"]) - base_r) / pieces
-                line += f"; per piece ({pieces} a reply): {dt:+.1f} us of reply time, {dc:+.1f} us of worker CPU"
-            if arm[2] == "on" and ratio is not None and ratio > 2:
-                line += "  -> more than twice O0 whole per byte: to the owner before it is chosen"
-            print(line)
-
-
-def calibration(groups):
-    cal = [(c, a, rs) for (c, a), rs in groups.items() if dict(c)["workload"] == "CAL"]
-    if not cal:
-        return
-    print("\n== calibration: slots held per stalled peer, and the sockets' buffers")
-    for cell, arm, rs in sorted(cal, key=lambda x: (x[0], arm_sort(x[1]))):
-        k = int(dict(cell)["stall_peers"])
-        for r in sorted(rs, key=lambda r: r["run"].get("rep", "")):
-            held = None if r["window_min_free"] is None else r["pool"] - r["window_min_free"]
-            per = None if held is None or k == 0 else held / k
-            sock = "; ".join(
-                f"{kind} tb {v[0]} w {v[1]}" for kind, v in sorted(r["ss"].items())
-            ) or "no ss.log"
-            print(
-                f"{arm_name(arm):18} k={k} rep {r['run'].get('rep')}: fewest free {fmt(r['window_min_free'], '.0f')} "
-                f"of {r['pool']}, held {fmt(held, '.0f')}, per stalled peer {fmt(per, '.1f')} | {sock}"
-            )
+    if pressured:
+        print("runs with TCP memory pressure (TcpExtTCPMemoryPressures rose):")
+        for p in pressured:
+            print(f"    {p}")
+    else:
+        print("no run recorded TCP memory pressure")
 
 
 def prediction(by_cell):
-    print("\n== prediction's refutation conditions (gated arms)")
+    print("\n== prediction's refutation conditions, for each gated arm and cell")
     refuted = []
     for cell in sorted(by_cell):
-        c = dict(cell)
-        if c["workload"] in ("U", "CAL"):
+        w = workload(cell)
+        if w.startswith("CAL"):
             continue
-        for arm, s in by_cell[cell].items():
-            if arm[2] != "on":
+        for arm in sorted(by_cell[cell], key=arm_sort):
+            if not is_gated(arm):
                 continue
+            s = by_cell[cell][arm]
             name = f"{arm_name(arm)} | {cell_name(cell)}"
-            if s["fast_p99"] is not None and s["fast_p99"] > 10.0:
-                refuted.append(f"{name}: fast p99 {fmt(s['fast_p99'])} ms > 10 ms")
-            if s["heads_n"] and s["heads_ok"] < s["heads_n"]:
-                refuted.append(f"{name}: 7 MiB replies completed {s['heads_ok']}/{s['heads_n']}")
-            if c["workload"] == "W5" and s["slow_ok"] < s["slow_n"]:
-                refuted.append(f"{name}: slow readers' replies completed {s['slow_ok']}/{s['slow_n']}")
-            if c["workload"] == "W4":
-                if s["free_min"] is not None and s["free_min"] < 0.75 * s["pool"]:
-                    refuted.append(f"{name}: {s['free_min']} of {s['pool']} slots free during a 7 MiB reply")
+            checks = []
+            if w != "U":
+                if s["fast_p99_max"] is None:
+                    checks.append(("fast p99 <= 10 ms in every run", None, "no fast small replies"))
+                else:
+                    checks.append((
+                        "fast p99 <= 10 ms in every run",
+                        s["fast_p99_max"] <= 10.0,
+                        f"max {fmt(s['fast_p99_max'])} ms, median {fmt(s['fast_p99_med'])}",
+                    ))
+            label = "every closed-loop reply completed" if w == "U" else "every 7 MiB reply completed"
+            if s["heads_n"]:
+                checks.append((label, s["heads_ok"] == s["heads_n"], f"{s['heads_ok']}/{s['heads_n']}"))
+            else:
+                checks.append((label, None, "none requested"))
+            if w == "W5":
+                checks.append((
+                    "every slow reader's reply completed",
+                    s["slow_n"] > 0 and s["slow_ok"] == s["slow_n"],
+                    f"{s['slow_ok']}/{s['slow_n']}",
+                ))
+            if w == "W4":
+                quarter = 0.75 * s["pool"]
+                if s["heads_no_free"] or s["free_min"] is None:
+                    checks.append((
+                        "3/4 of the pool free during each 7 MiB reply",
+                        None,
+                        f"no free-slot figure for {s['heads_no_free']} heads; fewest seen {fmt(s['free_min'], '.0f')}",
+                    ))
+                else:
+                    checks.append((
+                        "3/4 of the pool free during each 7 MiB reply",
+                        s["free_min"] >= quarter,
+                        f"fewest {s['free_min']} of {s['pool']}",
+                    ))
                 stalled = s["waited"].get("stalled", [0, 0])
-                if stalled[0] > 0:
-                    refuted.append(f"{name}: {stalled[0]} of {stalled[1]} stalled peers' pieces waited for room")
+                checks.append((
+                    "no stalled peer's piece waited for room",
+                    stalled[0] == 0,
+                    f"{stalled[0]} of {stalled[1]}",
+                ))
+            print(name)
+            for what, ok, detail in checks:
+                result = "no figure" if ok is None else ("holds" if ok else "REFUTES")
+                print(f"    {what}: {result} ({detail})")
+                if ok is False:
+                    refuted.append(f"{name}: {what} ({detail})")
     if refuted:
-        print("refuted:")
+        print("refuted by:")
         for x in refuted:
             print(f"  {x}")
     else:
-        print("no condition met in the cells run")
+        print("no condition refutes the prediction in the cells run")
 
 
 def main():
@@ -537,8 +674,10 @@ def main():
         raise SystemExit("usage: send-admission-d-report.py RUN_DIR...")
     groups = group(rows)
     by_cell = print_tables(groups)
+    pressured = memory(groups)
     calibration(groups)
-    decision(by_cell)
+    ratios = u_cost(by_cell)
+    decision(by_cell, ratios, pressured)
     prediction(by_cell)
 
 
