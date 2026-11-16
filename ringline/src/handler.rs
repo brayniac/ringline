@@ -161,9 +161,10 @@ pub(crate) struct ConnSendState {
     /// counts.
     #[cfg(has_io_uring)]
     pub writable_event: Option<(u32, WritableEvent)>,
-    /// io_uring: the resubmit of the send that waited for room is on a retry
-    /// list, the SQ having had no room for it: as for a queued send, a
-    /// `writable` future waits until its push goes through.
+    /// io_uring: the resubmit of the send that waited for room, or the plain
+    /// re-send of a zero-copy send that got `ENOMEM`, is on a retry list, the
+    /// SQ having had no room for it: as for a queued send, a `writable`
+    /// future waits until its push goes through.
     #[cfg(has_io_uring)]
     pub resubmit_queued: bool,
     /// io_uring: the registered `writable` future waits for the
