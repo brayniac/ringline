@@ -12,6 +12,7 @@ import pathlib, subprocess, sys
 
 IO = "ringline/src/runtime/io.rs"
 EL = "ringline/src/backend/uring/event_loop.rs"
+DRV = "ringline/src/backend/uring/driver.rs"
 MUTATIONS = [
     ("the gate arms no probe on a multishot poll", IO,
      "SendPoll::Multi => driver.arm_send_probe(this.conn_index),",
@@ -55,8 +56,8 @@ MUTATIONS = [
      "",
      ["--lib the_close_cqe_wakes_a_writable_gate"]),
     ("the probe's error and hangup are ignored", EL,
-     "        if hangup {\n            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));\n        } else if pollout {\n            // As on the connection's poll",
-     "        if false {\n            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));\n        } else if pollout && !hangup {\n            // As on the connection's poll",
+     "        if hangup {\n            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));\n        }\n        if resubmitted {\n            self.resubmit_waiting_send(conn_index, true);\n        }\n        if hangup || !self.writable_waits(conn_index) {",
+     "        if resubmitted {\n            self.resubmit_waiting_send(conn_index, true);\n        }\n        if !self.writable_waits(conn_index) {",
      ["--lib a_probe_error_or_hangup_fails_the_writable_gate"]),
     ("the probe's POLLOUT does not resubmit a waiting send", EL,
      "        if resubmitted {\n            self.resubmit_waiting_send(conn_index, true);\n        }\n",
@@ -95,12 +96,25 @@ MUTATIONS = [
     ("the wake after a retry push sends no Recheck", EL,
      "resubmit_queued) {\n            self.recheck_writable_if_unblocked(conn_index);",
      "resubmit_queued) {\n            self.wake_writable_if_unblocked(conn_index);",
-     ["--lib a_writable_gate_waits_for_a_resubmit_on_a_retry_list",
+     ["--lib a_writable_gate_waits_for_a_backstop_resubmit_pushed_by_a_retry",
       "--lib a_writable_gate_waits_for_a_zero_copy_re_send_on_a_retry_list"]),
     ("a zero-copy re-send on a retry list does not block the gate", EL,
      "                    .push((conn_index, generation, slab_idx));\n                self.driver.send_queues[conn_index as usize].resubmit_queued = true;\n",
      "                    .push((conn_index, generation, slab_idx));\n",
      ["--lib a_writable_gate_waits_for_a_zero_copy_re_send_on_a_retry_list"]),
+    ("a close request does not note the gate for a wake", DRV,
+     "        if self.send_queues[conn_index as usize]\n            .writable_task\n            .is_some()\n        {\n            let generation = self.connections.generation(conn_index);\n            self.writable_close_wakes.push((conn_index, generation));\n        }\n",
+     "",
+     ["--lib a_peer_reset_after_a_recheck_fails_a_blocked_writable_gate"]),
+    ("the event loop does not wake gates on a close request", EL,
+     "        self.wake_writable_on_close();\n",
+     "",
+     ["--lib a_peer_reset_after_a_recheck_fails_a_blocked_writable_gate"]),
+    ("a hangup on the send's poll does not end the gate's wait", EL,
+     "        if writable && hangup {\n            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));\n        }\n",
+     "",
+     ["--lib a_reset_s_pollout_and_hangup_fail_a_writable_gate_waiting_for_a_send",
+      "--lib a_hangup_fails_a_writable_gate_waiting_for_a_send"]),
 ]
 
 
