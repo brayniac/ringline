@@ -400,7 +400,7 @@ async fn drop_while_waiting(conn: &mut Connection) {
 /// above two thirds of `sk_sndbuf`), with no send waiting. The gate must
 /// wait until the client reads again. If the gate resolves and the socket
 /// has become writable meanwhile, as when the autotuner grows `sk_sndbuf`,
-/// it fills again and looks again, up to four times.
+/// it fills again and looks again: the second fill and up to three more.
 #[cfg(target_os = "linux")]
 async fn whole_sends_fill(conn: &mut Connection) {
     static CHUNK: [u8; CHUNK_LEN] = [7; CHUNK_LEN];
@@ -944,7 +944,10 @@ fn a_close_while_waiting() {
 
 /// The handler returning while another task's gate waits closes the
 /// connection, and fails the gate at once, though the close's drain to a
-/// peer that does not read never ends.
+/// peer that does not read never ends. On mio this fails without the wake
+/// when a half is dropped (`wake_writable_if_closing`); on io_uring the
+/// handler's return also queues a close wake, which reaches the gate within
+/// a tick, so this test does not separate the two there.
 #[test]
 fn a_close_by_dropping_the_connection_while_waiting() {
     let _serial = serial();

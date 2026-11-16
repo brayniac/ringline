@@ -1696,9 +1696,10 @@ impl Driver {
             return;
         };
         self.forward_zc_consumed[conn_index as usize] = 0;
-        // Every path that ends a connection, an error's or a peer's as much
-        // as the handler's, comes through here: a `writable` future waiting
-        // on it, blocked or armed, is woken and fails.
+        // Every close request except `abort`, which wakes the future itself,
+        // comes through here, an error's or a peer's as much as the
+        // handler's: a `writable` future waiting on it, blocked or armed, is
+        // woken and fails.
         if self.send_queues[conn_index as usize]
             .writable_task
             .is_some()

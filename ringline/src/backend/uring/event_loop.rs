@@ -1105,6 +1105,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
         }
+        // A completion in this batch can close a connection whose own task
+        // waits in `writable`. Wake it now: after the loop's second drain
+        // tasks are polled only if one is ready, and the Close's CQE drops
+        // the connection's task.
+        self.wake_writable_on_close();
     }
 
     /// Commit every close registered on `pending_finalize_closes` this
@@ -1193,6 +1198,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
         self.executor.ready_queue.is_empty()
+            && self.driver.writable_close_wakes.is_empty()
             && self.driver.pending_finalize_closes.is_empty()
             && self.driver.deferred_recv_arms.is_empty()
             && !shutting_down
