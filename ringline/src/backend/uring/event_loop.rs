@@ -19275,6 +19275,42 @@ mod tests {
         assert_eq!(seen.get(), Some(Ok(())));
     }
 
+    /// The sequence on a full socket whose peer has not half-closed: a send
+    /// comes back short and waits on a one-shot poll; the `POLLOUT` resubmits
+    /// it and it gets `EAGAIN`, which arms the multishot poll. A gate then arms
+    /// a probe, which the kernel completes only once the socket is writable,
+    /// since no `POLLRDHUP` is set; here it has not. The multishot poll's
+    /// `POLLOUT` resubmits the send and ends the gate's wait. The `Close` then
+    /// cancels the probe still in the kernel.
+    #[test]
+    fn a_writable_gate_after_eagain_on_a_pollout_wakes_on_the_multishot_pollout() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        let probe = probe_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_waits_on_poll(&el, conn_index, true);
+
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        assert_eq!(seen.get(), None);
+        assert_last_poll(&el, probe, false);
+
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, GATE_F_MORE);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { len: 60, .. }
+        ));
+        assert_eq!(seen.get(), Some(Ok(())));
+
+        el.driver.close_connection(conn_index);
+        el.driver.force_finalize_close(conn_index);
+        assert!(el.driver.ring.pushed_cancels.contains(&probe));
+    }
+
     /// `POLLERR` fails the gate with `ConnectionReset`, and `POLLHUP` alone
     /// with `BrokenPipe`, when the connection recorded no error of its own;
     /// a `POLLOUT` in the same report does not count.
