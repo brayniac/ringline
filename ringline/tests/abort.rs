@@ -1145,6 +1145,29 @@ async fn wake_the_parked(conn: &mut Connection, idle: bool) -> Woken {
     out
 }
 
+/// Return once `stream`'s receive queue has not grown for 50 ms, or after
+/// 10 s. The server's send to this peer then has bytes it cannot send, so it
+/// has waited for room. A read that starts earlier can drain the socket while
+/// the send is in progress, and the send then completes without waiting.
+fn wait_until_full(stream: &TcpStream) {
+    let mut buf = vec![0u8; 32 << 20];
+    stream.set_nonblocking(true).expect("nonblocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut queued = 0;
+    let mut since = Instant::now();
+    while Instant::now() < deadline {
+        let now = stream.peek(&mut buf).unwrap_or(0);
+        if now != queued {
+            queued = now;
+            since = Instant::now();
+        } else if queued > 0 && since.elapsed() >= Duration::from_millis(50) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stream.set_nonblocking(false).expect("blocking");
+}
+
 /// Run [`Wakeful`] under `order`, `part` naming its part, and return what it
 /// saw.
 fn run_wakes(order: ringline::SendAdmissionOrder, part: u8) -> Woken {
@@ -1164,6 +1187,7 @@ fn run_wakes(order: ringline::SendAdmissionOrder, part: u8) -> Woken {
     std::thread::spawn(move || {
         let (mut stream, _) = drainer.accept().expect("accept the drainer");
         if start.recv_timeout(Duration::from_secs(20)).is_ok() {
+            wait_until_full(&stream);
             let mut sink = Vec::new();
             let _ = stream.read_to_end(&mut sink);
         }
