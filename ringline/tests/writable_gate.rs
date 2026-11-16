@@ -69,6 +69,9 @@ struct Seen {
     /// Whether a send of the second fill, which should go in whole, waited.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     refill_waited: Option<bool>,
+    /// The fewest send-pool slots free during the second fill.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    refill_fewest_free: Option<u64>,
     /// Why the server gave up before the gate.
     note: Option<String>,
 }
@@ -353,13 +356,17 @@ async fn whole_sends_fill(conn: &mut Connection) {
     while !READ_ALL.load(Ordering::SeqCst) {
         ringline::sleep(Duration::from_millis(1)).await;
     }
-    let mut refill = Vec::new();
-    for _ in 0..capacity * 9 / 10 / CHUNK_LEN {
-        refill.push(conn.send(&CHUNK).expect("send"));
-    }
+    // One send at a time, each awaited until it settles, so that the
+    // socket fills and the send pool, a few hundred KiB here, does not: a
+    // queued copy send holds its pool slots until its bytes are in the
+    // socket, and the socket can take several MiB.
+    let sends = capacity * 9 / 10 / CHUNK_LEN;
     let mut waited = false;
-    for sent in refill.iter_mut() {
-        let done = ringline::timeout(Duration::from_secs(5), &mut *sent).await;
+    let mut fewest_free = u64::MAX;
+    for _ in 0..sends {
+        let mut sent = conn.send(&CHUNK).expect("send");
+        fewest_free = fewest_free.min(ringline::send_admission_counters().main_free);
+        let done = ringline::timeout(Duration::from_secs(5), &mut sent).await;
         if !matches!(done, Ok(Ok(_))) {
             record(|s| {
                 s.note = Some(format!(
@@ -370,10 +377,16 @@ async fn whole_sends_fill(conn: &mut Connection) {
         }
         waited |= sent.waited_for_room();
     }
+    eprintln!(
+        "whole sends: the first fill held {capacity} B before a send waited; \
+         the second fill sent {sends} sends of {CHUNK_LEN} B, with at fewest \
+         {fewest_free} of {SLOTS} pool slots free"
+    );
     let mut gate = std::pin::pin!(conn.writable());
     let early = ringline::timeout(Duration::from_millis(300), gate.as_mut()).await;
     record(|s| {
         s.refill_waited = Some(waited);
+        s.refill_fewest_free = Some(fewest_free);
         s.pending_while_full = Some(early.is_err());
         s.filled_at = Some(Instant::now());
     });
@@ -869,6 +882,11 @@ fn a_socket_filled_by_whole_sends_is_not_writable() {
         seen.refill_waited,
         Some(false),
         "precondition: a send of the second fill waited for room"
+    );
+    assert!(
+        seen.refill_fewest_free.is_some_and(|free| free > 0),
+        "precondition: the second fill took the whole send pool: {:?} of {SLOTS} free",
+        seen.refill_fewest_free
     );
     assert_eq!(
         seen.pending_while_full,
