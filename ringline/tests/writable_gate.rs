@@ -207,6 +207,7 @@ impl AsyncEventHandler for Gate {
                 b'q' => queued_bytes_come_first(&mut conn).await,
                 b'p' => probe_on_a_drained_multishot_connection(&mut conn).await,
                 b'c' => close_while_waiting(&mut conn).await,
+                b'x' => drop_while_waiting(&mut conn).await,
                 #[cfg(target_os = "linux")]
                 b'f' => whole_sends_fill(&mut conn).await,
                 b's' => {
@@ -334,6 +335,32 @@ async fn close_while_waiting(conn: &mut Connection) {
     record(|s| s.pending_while_full = Some(pending));
     conn.close();
     record(|s| s.closed_at = Some(Instant::now()));
+}
+
+/// Fill the socket, wait on the gate from another task, and return: the
+/// connection's last half drops, which requests the close.
+async fn drop_while_waiting(conn: &mut Connection) {
+    fill(conn).await;
+    let gate = conn.writable();
+    ringline::spawn(async move {
+        let gate = ringline::timeout(Duration::from_secs(5), gate).await;
+        let gate = gate_result(gate);
+        record(|s| {
+            s.gate = Some(gate);
+            s.resolved_at = Some(Instant::now());
+        });
+    })
+    .expect("spawn");
+    ringline::sleep(Duration::from_millis(200)).await;
+    let pending = SEEN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|s| s.gate.is_none());
+    record(|s| {
+        s.pending_while_full = Some(pending);
+        s.closed_at = Some(Instant::now());
+    });
 }
 
 /// Linux: with the peer half-closed, fill the socket until a send waits,
@@ -808,6 +835,30 @@ fn a_drained_socket_after_a_half_close_is_writable() {
 fn a_close_while_waiting() {
     let _serial = serial();
     let (runtime, handles, client) = start(b'c');
+    let seen = wait_for("resolved the gate", |s| s.gate.is_some());
+    assert_eq!(
+        seen.pending_while_full,
+        Some(true),
+        "it resolved before the close"
+    );
+    assert_eq!(seen.gate, Some(Err(io::ErrorKind::NotConnected)));
+    let took = seen.resolved_at.unwrap() - seen.closed_at.unwrap();
+    assert!(
+        took < Duration::from_secs(1),
+        "resolved {took:?} after the close"
+    );
+    drop(client);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+/// The handler returning while another task's gate waits closes the
+/// connection, and fails the gate at once, though the close's drain to a
+/// peer that does not read never ends.
+#[test]
+fn a_close_by_dropping_the_connection_while_waiting() {
+    let _serial = serial();
+    let (runtime, handles, client) = start(b'x');
     let seen = wait_for("resolved the gate", |s| s.gate.is_some());
     assert_eq!(
         seen.pending_while_full,

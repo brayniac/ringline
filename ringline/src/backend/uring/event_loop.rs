@@ -5,7 +5,7 @@ use std::task::Context;
 use std::time::Instant;
 
 use crate::backend::uring::abi::cqueue;
-use crate::handler::{Disconnect, SendPoll, SendProbe};
+use crate::handler::{Disconnect, SendPoll, SendProbe, WritableEvent};
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
@@ -3150,7 +3150,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// End a `writable` future's wait on `conn_index` with `event`, and wake
     /// its task. Does nothing when no future waits.
-    fn end_writable_wait(&mut self, conn_index: u32, event: Result<(), i32>) {
+    fn end_writable_wait(&mut self, conn_index: u32, event: WritableEvent) {
         let state = &mut self.driver.send_queues[conn_index as usize];
         let Some(task) = state.writable_task.take() else {
             return;
@@ -3168,10 +3168,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if state.writable_blocked
             && state.queue.is_empty()
             && state.waiting_send.is_none()
+            && !state.resubmit_queued
             && let Some(task) = state.writable_task.take()
         {
             state.writable_blocked = false;
             self.executor.wake_task(task);
+        }
+    }
+
+    /// The resubmit of `conn_index`'s send that waited for room, parked on a
+    /// retry list, went through: wake a `writable` future that waited for it.
+    fn resubmit_pushed(&mut self, conn_index: u32) {
+        if std::mem::take(&mut self.driver.send_queues[conn_index as usize].resubmit_queued) {
+            self.wake_writable_if_unblocked(conn_index);
         }
     }
 
@@ -3190,10 +3199,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         };
         state.resubmitted_on_pollout = on_pollout;
-        self.wake_writable_if_unblocked(conn_index);
         let ud = UserData(raw);
         let generation = self.driver.connections.generation(conn_index);
-        match ud.tag() {
+        let pushed = match ud.tag() {
             Some(tag @ (OpTag::Send | OpTag::TlsSend)) => {
                 let pool_slot = UserData::send_payload_slot(ud.payload());
                 let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
@@ -3211,20 +3219,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         .pending_copy_retries
                         .push((conn_index, generation, pool_slot, tag));
                 }
+                resubmit.is_ok()
             }
             Some(OpTag::SendMsgCoalesced) => {
                 let slab_idx = ud.payload() as u16;
                 let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                if self
+                let resubmit = self
                     .driver
                     .ring
-                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-                    .is_err()
-                {
+                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx);
+                if resubmit.is_err() {
                     self.driver
                         .pending_coalesced_retries
                         .push((conn_index, generation, slab_idx));
                 }
+                resubmit.is_ok()
             }
             _ => {
                 let slab_idx = ud.payload() as u16;
@@ -3245,7 +3254,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         .pending_zc_retries
                         .push((conn_index, generation, slab_idx));
                 }
+                resubmit.is_ok()
             }
+        };
+        // A `writable` future waiting for this send goes on only once it is
+        // in the kernel; until a retry pushes it, it counts as queued.
+        if pushed {
+            self.wake_writable_if_unblocked(conn_index);
+        } else {
+            self.driver.send_queues[conn_index as usize].resubmit_queued = true;
         }
     }
 
@@ -3291,7 +3308,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(raw) = state.waiting_send.take() {
                 self.fail_waiting_send(UserData(raw), error);
             }
-            self.end_writable_wait(conn_index, Err(-error));
+            self.end_writable_wait(conn_index, WritableEvent::Failed(-error));
             return;
         }
 
@@ -3310,9 +3327,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if writable {
                 if hangup {
                     let errno = writable_errno(mask);
-                    self.end_writable_wait(conn_index, Err(errno));
+                    self.end_writable_wait(conn_index, WritableEvent::Failed(errno));
                 } else if pollout {
-                    self.end_writable_wait(conn_index, Ok(()));
+                    self.end_writable_wait(conn_index, WritableEvent::Room);
                 } else if !more {
                     self.arm_send_poll(conn_index, !multi);
                 }
@@ -3326,11 +3343,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else if !more {
             self.arm_send_poll(conn_index, !multi);
         }
+        // The send just resubmitted on this POLLOUT may take the room, so a
+        // future waiting on the socket looks again rather than resolve.
         if writable {
             if hangup {
-                self.end_writable_wait(conn_index, Err(writable_errno(mask)));
+                self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));
             } else if pollout {
-                self.end_writable_wait(conn_index, Ok(()));
+                self.end_writable_wait(conn_index, WritableEvent::Recheck);
             }
         }
     }
@@ -3355,7 +3374,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         if result < 0 || close_submitted {
             let errno = if result < 0 { -result } else { libc::ECANCELED };
-            self.end_writable_wait(conn_index, Err(errno));
+            self.end_writable_wait(conn_index, WritableEvent::Failed(errno));
             return;
         }
         let mask = result as u32;
@@ -3363,20 +3382,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let hangup = mask & (libc::POLLERR | libc::POLLHUP) as u32 != 0;
         // A send that waits for room goes first, as on the connection's own
         // poll: the probe's report is as good as a multishot poll's edge.
-        if (pollout || hangup)
+        let resubmitted = (pollout || hangup)
             && self.driver.send_queues[conn_index as usize]
                 .waiting_send
-                .is_some()
-        {
+                .is_some();
+        if resubmitted {
             self.resubmit_waiting_send(conn_index, true);
         }
         if !self.writable_waits(conn_index) {
             return;
         }
         if hangup {
-            self.end_writable_wait(conn_index, Err(writable_errno(mask)));
+            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));
         } else if pollout {
-            self.end_writable_wait(conn_index, Ok(()));
+            // As on the connection's poll: a send just resubmitted may take
+            // the room.
+            let event = if resubmitted {
+                WritableEvent::Recheck
+            } else {
+                WritableEvent::Room
+            };
+            self.end_writable_wait(conn_index, event);
         } else if self.driver.send_queues[conn_index as usize].send_poll == SendPoll::None {
             self.arm_send_poll(conn_index, true);
         }
@@ -4222,7 +4248,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         // A `writable` future on another task than the connection's, which
         // `remove_connection` drops, polls again and finds the slot released.
-        self.end_writable_wait(conn_index, Err(libc::ECANCELED));
+        self.end_writable_wait(conn_index, WritableEvent::Failed(libc::ECANCELED));
 
         let was_established = self
             .driver
@@ -4949,6 +4975,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver
                     .pending_zc_retries
                     .push((conn_index, generation, slab_idx));
+            } else {
+                self.resubmit_pushed(conn_index);
             }
         }
         self.driver.zc_retry_scratch.clear();
@@ -5008,6 +5036,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver
                     .pending_coalesced_retries
                     .push((conn_index, generation, slab_idx));
+            } else {
+                self.resubmit_pushed(conn_index);
             }
         }
         self.driver.coalesced_retry_scratch.clear();
@@ -5065,6 +5095,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver
                     .pending_copy_retries
                     .push((conn_index, generation, pool_slot, op));
+            } else {
+                self.resubmit_pushed(conn_index);
             }
         }
         self.driver.copy_retry_scratch.clear();
@@ -19634,8 +19666,9 @@ mod tests {
     }
 
     /// A send made while the gate waits on a probe comes back short and waits
-    /// on the multishot poll. The probe's `POLLOUT` resubmits it, and ends the
-    /// gate's wait.
+    /// on the multishot poll. The probe's `POLLOUT` resubmits it, and the
+    /// gate, since the send may take the room, looks again: it arms a new
+    /// probe, whose `POLLOUT` after the send has finished ends its wait.
     #[test]
     fn a_probe_pollout_resubmits_a_send_waiting_for_room() {
         let mut el = make_test_loop();
@@ -19660,12 +19693,82 @@ mod tests {
                 .is_some()
         );
 
-        dispatch_and_poll(&mut el, probe, (libc::POLLRDHUP | libc::POLLOUT) as i32, 0);
+        let ready = (libc::POLLRDHUP | libc::POLLOUT) as i32;
+        el.test_dispatch_cqe(probe, ready, 0);
         assert!(matches!(
             last_pushed_op(&el),
             crate::backend::uring::sqe::Op::Send { len: 60, .. }
         ));
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+        assert_last_poll(&el, probe, false);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        dispatch_and_poll(&mut el, probe, ready, 0);
         assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// On a stalled peer: a send waits on a one-shot poll and the gate waits
+    /// for it. The backstop resubmits the send, which wakes the gate, and the
+    /// gate joins the armed poll. The send gets `EAGAIN` and waits on that
+    /// poll again. The poll's `POLLOUT` resubmits the send; the gate looks
+    /// again instead of resolving, and arms a poll of its own.
+    #[test]
+    fn a_writable_gate_does_not_resolve_on_the_pollout_that_resubmits_a_send() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+
+        el.handle_send_backstop();
+        el.poll_ready_tasks();
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.waiting_send.is_some(), "the send waits again");
+        assert_eq!(
+            state.send_poll,
+            SendPoll::OneShot,
+            "on the poll the gate joined"
+        );
+        assert_eq!(seen.get(), None);
+
+        el.driver.ring.last_pushed = None;
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+        assert_last_poll(&el, poll, false);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// A resubmit the SQ refuses waits on a retry list. Until the retry
+    /// pushes it the gate counts it as queued and arms nothing; the push
+    /// wakes the gate, which then arms its poll.
+    #[test]
+    fn a_writable_gate_waits_for_a_resubmit_on_a_retry_list() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+
+        el.driver.ring.force_push_failures(1);
+        el.driver.ring.last_pushed = None;
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert!(el.driver.send_queues[conn_index as usize].resubmit_queued);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "nothing is armed while the resubmit waits"
+        );
+        assert_eq!(seen.get(), None);
+
+        el.drain_copy_retries();
+        assert!(!el.driver.send_queues[conn_index as usize].resubmit_queued);
+        el.poll_ready_tasks();
+        assert_last_poll(&el, poll, false);
+        assert_eq!(seen.get(), None);
     }
 
     /// A `SendPollOut` the SQ had no room for is armed by the retry drain
