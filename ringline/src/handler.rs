@@ -148,17 +148,24 @@ pub(crate) struct ConnSendState {
     /// The task of a `SendHalf::writable` future that waits on this
     /// connection for room in its socket. Taken when the task is woken: on
     /// io_uring by the completion that ends the wait (a `POLLOUT`, an error,
-    /// a hangup or a cancel), on mio by any event on the connection, and on
-    /// both by `abort` and at the slot's release. The future registers again
-    /// if it is polled before its wait has ended.
+    /// a hangup or a cancel) and by the completion or push that leaves no
+    /// send queued or waiting, on mio by any event on the connection and by
+    /// the flush that empties its queue, and on both by `abort`, by `close`,
+    /// by a close that dropping the last half requests, and at the slot's
+    /// release. The future registers again if it is polled before its wait
+    /// has ended.
     pub writable_task: Option<u32>,
     /// io_uring: what ended a `writable` future's wait, for its next poll,
-    /// and the task it was for: `Ok` on a `POLLOUT`, or the errno of an
-    /// error, a hangup or a cancel. The future clears its own when it starts
-    /// to wait on the socket, so only an event that arrives while it waits
+    /// and the task it was for. The future clears its own when it starts to
+    /// wait on the socket, so only an event that arrives while it waits
     /// counts.
     #[cfg(has_io_uring)]
-    pub writable_event: Option<(u32, Result<(), i32>)>,
+    pub writable_event: Option<(u32, WritableEvent)>,
+    /// io_uring: the resubmit of the send that waited for room is on a retry
+    /// list, the SQ having had no room for it: as for a queued send, a
+    /// `writable` future waits until its push goes through.
+    #[cfg(has_io_uring)]
+    pub resubmit_queued: bool,
     /// io_uring: the registered `writable` future waits for the
     /// connection's queued and waiting sends, not yet on the socket; the
     /// completion that leaves none wakes it.
@@ -169,6 +176,20 @@ pub(crate) struct ConnSendState {
     /// `SendPollOut` is multishot.
     #[cfg(has_io_uring)]
     pub send_probe: SendProbe,
+}
+
+/// What ended a `writable` future's wait on io_uring.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WritableEvent {
+    /// The socket reported `POLLOUT`.
+    Room,
+    /// The socket reported `POLLOUT`, and a send that waited for room was
+    /// resubmitted on it and may take the room: the future looks again,
+    /// from its check for queued and waiting sends.
+    Recheck,
+    /// An error, a hangup or a cancel, with its errno.
+    Failed(i32),
 }
 
 /// The state of a connection's `SendPollProbe`.
@@ -248,6 +269,8 @@ impl ConnSendState {
             writable_event: None,
             #[cfg(has_io_uring)]
             writable_blocked: false,
+            #[cfg(has_io_uring)]
+            resubmit_queued: false,
             #[cfg(has_io_uring)]
             send_probe: SendProbe::None,
         }

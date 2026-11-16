@@ -3430,7 +3430,8 @@ impl SendHalf {
     /// Bytes this connection has queued and not yet handed to the socket
     /// come first: while sends are queued (on io_uring, behind the one in the
     /// kernel, or waiting for room), the connection is not writable, and this
-    /// waits until they are written before it looks at the socket.
+    /// waits until they have been handed to the kernel (io_uring) or written
+    /// (mio) before it looks at the socket.
     ///
     /// Resolves `Ok` when the socket reports `POLLOUT`, and `Err` when it
     /// reports an error or a hangup: the error the connection recorded for
@@ -3444,24 +3445,24 @@ impl SendHalf {
     ///
     /// On io_uring it waits on the connection's `POLLOUT` poll, the one a
     /// send waiting for room uses, arming it one shot if none is armed, so
-    /// the cancel that `close` and `abort` issue covers it. A send that waits
-    /// for room at the same time ends its wait on the same `POLLOUT`: the
-    /// send is resubmitted, and this resolves, though the send may have
-    /// taken the room again. Once the poll is multishot (after the peer
-    /// half-closes, or after a send made on a `POLLOUT` got `EAGAIN`), it
-    /// reports only changes, so this also arms a one-shot poll of its own.
-    /// After the peer half-closes that poll completes at once, with `POLLOUT`
-    /// if the socket is writable then; otherwise it completes when the socket
-    /// becomes writable. On mio it checks the socket with a zero-timeout
+    /// the cancel that `close` and `abort` issue covers it. A `POLLOUT` on
+    /// which a send that waited for room is resubmitted does not end the
+    /// wait: the send may take the room, so this looks again. Once the poll
+    /// is multishot (after the peer half-closes, or after a send made on a
+    /// `POLLOUT` got `EAGAIN`), it reports only changes, so this also arms a
+    /// one-shot poll of its own. After the peer half-closes that poll
+    /// completes at once, with `POLLOUT` if the socket is writable then;
+    /// otherwise it completes when the socket becomes writable. On mio it checks the socket with a zero-timeout
     /// `poll(2)`, and otherwise waits for the connection's next event, or for
     /// its queue to be written, and checks again.
     ///
     /// Bound the wait: a socket whose peer never reads never reports room,
-    /// and no backstop ends the wait. `close` and `abort` end it with an
-    /// error. One future waits per connection; if two do, the task of the one
-    /// polled last is woken, and dropping either leaves the other's wait in
-    /// place. Dropping the future ends its wait, and leaves an armed poll to
-    /// complete as a waiting send's would.
+    /// and no backstop ends the wait. `close`, a close that dropping the
+    /// last half requests, and `abort` end it with an error. One future
+    /// waits per connection: if two wait, only the one polled last is
+    /// registered; dropping it leaves the other unregistered until something
+    /// else polls it. Dropping the future ends its wait, and leaves an armed
+    /// poll to complete as a waiting send's would.
     #[doc(hidden)]
     pub fn writable(&self) -> impl Future<Output = io::Result<()>> + use<> {
         self.conn.writable()
@@ -3747,12 +3748,31 @@ pub(crate) fn release_half(
     driver.close_connection(conn_index);
 }
 
+/// After a half's release: if the connection's close is now requested, wake
+/// a `writable` future waiting on it, which then fails; the close's drain to
+/// a peer that does not read may never commit the `Close` that would.
+pub(crate) fn wake_writable_if_closing(
+    driver: &mut Driver,
+    executor: &mut Executor,
+    conn_index: u32,
+    generation: u32,
+) {
+    let closing = driver
+        .connections
+        .get(conn_index)
+        .is_some_and(|c| c.generation == generation && c.close_requested());
+    if closing && let Some(task) = driver.send_queues[conn_index as usize].writable_task.take() {
+        executor.wake_task(task);
+    }
+}
+
 /// Run [`release_half`] now, or queue it if the half was dropped outside a task
 /// poll, as at connection teardown or in the synchronous body of `on_accept`.
 fn drop_half(conn: ConnCtx, half: Half) {
     let abrupt = std::thread::panicking();
-    let released = try_with_state(|driver, _executor| {
+    let released = try_with_state(|driver, executor| {
         release_half(driver, conn.conn_index, conn.generation, half, abrupt);
+        wake_writable_if_closing(driver, executor, conn.conn_index, conn.generation);
     });
     if released.is_none() {
         crate::runtime::defer_release(crate::runtime::Orphan::ConnHalf {
@@ -4294,59 +4314,51 @@ impl Future for WritableFuture {
             let task = CURRENT_TASK_ID.with(|c| c.get());
             #[cfg(has_io_uring)]
             {
-                use crate::handler::SendPoll;
+                use crate::handler::{SendPoll, WritableEvent};
                 let ci = this.conn_index as usize;
                 let state = &mut driver.send_queues[ci];
-                let ours = matches!(state.writable_event, Some((owner, _)) if owner == task);
-                // Bytes queued behind a send in the kernel, or a send
-                // waiting for room, go first: until they are in the kernel
-                // the connection is not writable. The completion that
-                // empties the queue wakes the task.
-                if !state.queue.is_empty() || state.waiting_send.is_some() {
-                    // A `POLLOUT` is no use yet; an error or a hangup ends
-                    // the wait as it would on the socket.
-                    if ours {
-                        let (_, event) = state.writable_event.take().expect("checked above");
-                        if let Err(errno) = event {
-                            let e = writable_error(
-                                driver,
-                                executor,
-                                this.conn_index,
-                                this.generation,
-                                errno,
-                            );
-                            this.stop_waiting(driver);
-                            return Poll::Ready(Err(e));
-                        }
-                    }
+                let ours =
+                    matches!(state.writable_event, Some((owner, _)) if Some(owner) == this.task);
+                let event = if ours {
+                    state.writable_event.take().map(|(_, event)| event)
+                } else {
+                    None
+                };
+                // An error, a hangup or a cancel ends the wait, whatever is
+                // queued.
+                if let Some(WritableEvent::Failed(errno)) = event {
+                    let e =
+                        writable_error(driver, executor, this.conn_index, this.generation, errno);
+                    this.stop_waiting(driver);
+                    return Poll::Ready(Err(e));
+                }
+                // A send was resubmitted on the `POLLOUT` and may take the
+                // room: look again, from the check below.
+                if event == Some(WritableEvent::Recheck) {
+                    this.armed = false;
+                }
+                // Bytes queued behind a send in the kernel, a send waiting
+                // for room, or its resubmit parked on a retry list go first:
+                // until they are in the kernel the connection is not
+                // writable. The completion or push that leaves none wakes the
+                // task. A `POLLOUT` meanwhile is no use.
+                let state = &driver.send_queues[ci];
+                if !state.queue.is_empty() || state.waiting_send.is_some() || state.resubmit_queued
+                {
                     this.armed = false;
                     this.register(driver, task, true);
                     return pending(cx);
                 }
                 if this.armed {
-                    if ours {
-                        let (_, event) = state.writable_event.take().expect("checked above");
-                        let result = match event {
-                            Ok(()) => Ok(()),
-                            Err(errno) => Err(writable_error(
-                                driver,
-                                executor,
-                                this.conn_index,
-                                this.generation,
-                                errno,
-                            )),
-                        };
+                    if event == Some(WritableEvent::Room) {
                         this.stop_waiting(driver);
-                        return Poll::Ready(result);
+                        return Poll::Ready(Ok(()));
                     }
                     this.register(driver, task, false);
                     return pending(cx);
                 }
-                // Start the wait on the socket: only an event from now on
-                // counts.
-                if ours {
-                    state.writable_event = None;
-                }
+                // Start the wait on the socket. An event taken above came
+                // before it and does not count.
                 let poll = driver.send_queues[ci].send_poll;
                 match poll {
                     SendPoll::None => driver.arm_send_poll(this.conn_index, false),

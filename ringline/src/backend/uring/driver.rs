@@ -1471,6 +1471,7 @@ impl Driver {
         state.writable_task = None;
         state.writable_event = None;
         state.writable_blocked = false;
+        state.resubmit_queued = false;
         state.send_probe = SendProbe::None;
         if self.track_room_waits {
             state.room_waited = false;
