@@ -5,7 +5,7 @@ use std::task::Context;
 use std::time::Instant;
 
 use crate::backend::uring::abi::cqueue;
-use crate::handler::{Disconnect, SendPoll};
+use crate::handler::{Disconnect, SendPoll, SendProbe};
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
@@ -98,6 +98,18 @@ fn choose_park_target(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -
         Some(min_idx)
     } else {
         None
+    }
+}
+
+/// The errno a `writable` future reports for a poll's error or hangup when
+/// the connection has recorded no error of its own: `ECONNRESET` for
+/// `POLLERR`, and `EPIPE` for `POLLHUP` alone, which TCP reports once both
+/// halves are shut or the socket is closed, when a send fails `EPIPE`.
+fn writable_errno(mask: u32) -> i32 {
+    if mask & libc::POLLERR as u32 != 0 {
+        libc::ECONNRESET
+    } else {
+        libc::EPIPE
     }
 }
 
@@ -1871,6 +1883,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
+            OpTag::SendPollProbe => self.handle_send_poll_probe(ud, result),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
@@ -3088,7 +3101,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     ///
     /// `-EAGAIN` from a send made on a `POLLOUT` arms the multishot poll too. A
     /// socket reporting both would otherwise repeat a poll and a send forever.
+    ///
+    /// A `SendHalf::writable` future waits on the same poll: it arms it one
+    /// shot when none is armed, and `handle_send_pollout` wakes it on the
+    /// `POLLOUT` or error that ends the wait. A multishot poll reports only
+    /// changes, so on a connection whose poll is multishot the future also
+    /// arms a one-shot `SendPollProbe`, which reports whether the socket is
+    /// writable now (`handle_send_poll_probe`).
+    ///
+    /// Every call marks the awaited sends in flight on the connection as
+    /// having waited for room (`SendCompletion::waited_for_room`).
     fn wait_for_room(&mut self, conn_index: u32, ud: UserData, eagain: bool) {
+        self.executor.mark_sends_waited_for_room(conn_index);
         let generation = self.driver.connections.generation(conn_index);
         let state = &mut self.driver.send_queues[conn_index as usize];
         state.waiting_send = Some(ud.raw());
@@ -3117,22 +3141,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Arm the connection's `SendPollOut`, or queue it if the SQ is full.
     fn arm_send_poll(&mut self, conn_index: u32, multi: bool) {
-        let generation = self.driver.connections.generation(conn_index);
-        let armed = self
-            .driver
-            .ring
-            .submit_send_pollout(conn_index, generation, multi);
+        self.driver.arm_send_poll(conn_index, multi);
+    }
+
+    /// End a `writable` future's wait on `conn_index` with `event`, and wake
+    /// its task. Does nothing when no future waits.
+    fn end_writable_wait(&mut self, conn_index: u32, event: Result<(), i32>) {
         let state = &mut self.driver.send_queues[conn_index as usize];
-        state.send_poll = match (armed.is_ok(), multi) {
-            (true, true) => SendPoll::Multi,
-            (true, false) => SendPoll::OneShot,
-            (false, _) => {
-                self.driver
-                    .pending_send_pollout_retries
-                    .push((conn_index, generation, multi));
-                SendPoll::Pending
-            }
+        let Some(task) = state.writable_task.take() else {
+            return;
         };
+        state.writable_event = Some(event);
+        self.executor.wake_task(task);
+    }
+
+    /// Whether a `writable` future waits on `conn_index`.
+    fn writable_waits(&self, conn_index: u32) -> bool {
+        self.driver.send_queues[conn_index as usize]
+            .writable_task
+            .is_some()
     }
 
     /// Resubmit the rest of the connection's waiting send, if it has one. With
@@ -3243,21 +3270,80 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(raw) = state.waiting_send.take() {
                 self.fail_waiting_send(UserData(raw), error);
             }
+            self.end_writable_wait(conn_index, Err(-error));
             return;
         }
 
         let mask = result as u32;
         let pollout = mask & libc::POLLOUT as u32 != 0;
+        let hangup = mask & (libc::POLLERR | libc::POLLHUP) as u32 != 0;
+        // A `writable` future ends its wait on the `POLLOUT` or the error or
+        // hangup that ends a waiting send's, after the send is resubmitted.
+        // A one-shot poll that reports neither, after the peer half-closed,
+        // gives way to a multishot poll, as for a waiting send.
+        let writable = self.writable_waits(conn_index);
+        let state = &mut self.driver.send_queues[conn_index as usize];
         if state.waiting_send.is_none() {
             state.pollout_seen = pollout && state.in_flight;
+            if writable {
+                if hangup {
+                    let errno = writable_errno(mask);
+                    self.end_writable_wait(conn_index, Err(errno));
+                } else if pollout {
+                    self.end_writable_wait(conn_index, Ok(()));
+                } else if !more {
+                    self.arm_send_poll(conn_index, !multi);
+                }
+            }
             return;
         }
         // On an error or a hangup, the resubmit returns the socket's error. A
         // multishot poll's edge does not fire again, so this cannot spin.
-        if pollout || (multi && mask & (libc::POLLERR | libc::POLLHUP) as u32 != 0) {
+        if pollout || (multi && hangup) {
             self.resubmit_waiting_send(conn_index, true);
         } else if !more {
             self.arm_send_poll(conn_index, !multi);
+        }
+        if writable {
+            if hangup {
+                self.end_writable_wait(conn_index, Err(writable_errno(mask)));
+            } else if pollout {
+                self.end_writable_wait(conn_index, Ok(()));
+            }
+        }
+    }
+
+    /// Handle a `SendPollProbe` CQE: the one-shot poll a `writable` future
+    /// arms while the connection's `SendPollOut` is multishot. It reports
+    /// whether the socket is writable now. A `POLLOUT`, an error or a hangup
+    /// ends the future's wait; without them the future waits for the
+    /// multishot poll's next `POLLOUT`, and a multishot poll that has ended
+    /// meanwhile is armed again.
+    fn handle_send_poll_probe(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        if self.driver.connections.generation(conn_index) != ud.payload() {
+            return;
+        }
+        let close_submitted = self.close_submitted(conn_index);
+        let state = &mut self.driver.send_queues[conn_index as usize];
+        if state.send_probe == SendProbe::Armed {
+            state.send_probe = SendProbe::None;
+        }
+        if !self.writable_waits(conn_index) {
+            return;
+        }
+        if result < 0 || close_submitted {
+            let errno = if result < 0 { -result } else { libc::ECANCELED };
+            self.end_writable_wait(conn_index, Err(errno));
+            return;
+        }
+        let mask = result as u32;
+        if mask & (libc::POLLERR | libc::POLLHUP) as u32 != 0 {
+            self.end_writable_wait(conn_index, Err(writable_errno(mask)));
+        } else if mask & libc::POLLOUT as u32 != 0 {
+            self.end_writable_wait(conn_index, Ok(()));
+        } else if self.driver.send_queues[conn_index as usize].send_poll == SendPoll::None {
+            self.arm_send_poll(conn_index, true);
         }
     }
 
@@ -4097,6 +4183,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             self.fail_waiting_send(UserData(raw), -libc::ECANCELED);
         }
+        // A `writable` future on another task than the connection's, which
+        // `remove_connection` drops, polls again and finds the slot released.
+        self.end_writable_wait(conn_index, Err(libc::ECANCELED));
 
         let was_established = self
             .driver
@@ -5067,8 +5156,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Arm the `SendPollOut`s the SQ had no room for. An entry is stale if its
-    /// connection went, or if the wait ended without it.
+    /// Arm the `SendPollOut`s and `SendPollProbe`s the SQ had no room for. An
+    /// entry is stale if its connection went, or if the wait ended without
+    /// it: no send waits for room and no `writable` future waits.
     fn drain_send_pollout_retries(&mut self) {
         for (conn_index, generation, multi) in
             std::mem::take(&mut self.driver.pending_send_pollout_retries)
@@ -5080,11 +5170,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if state.send_poll != SendPoll::Pending {
                 continue;
             }
-            if state.waiting_send.is_none() || state.close_submitted {
+            if (state.waiting_send.is_none() && state.writable_task.is_none())
+                || state.close_submitted
+            {
                 state.send_poll = SendPoll::None;
                 continue;
             }
             self.arm_send_poll(conn_index, multi);
+        }
+        for (conn_index, generation) in std::mem::take(&mut self.driver.pending_send_probe_retries)
+        {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            let state = &mut self.driver.send_queues[conn_index as usize];
+            if state.send_probe != SendProbe::Pending {
+                continue;
+            }
+            state.send_probe = SendProbe::None;
+            if state.writable_task.is_none() || state.close_submitted {
+                continue;
+            }
+            self.driver.arm_send_probe(conn_index);
         }
     }
 
@@ -18966,6 +19073,426 @@ mod tests {
             !el.driver.send_copy_pool.in_use(slot),
             "the late CQE is still the kernel's last reference to the slot"
         );
+    }
+
+    // ── `SendHalf::writable` and `SendCompletion::waited_for_room` ──────
+    //
+    // Experiment D's gate and flag (`docs/send-admission-design.md`, section
+    // 4). The gate runs in a task of its own; a completion that ends its wait
+    // wakes the task through `wake_task`, and `poll_ready_tasks` then polls
+    // it.
+
+    const GATE_F_MORE: u32 = 2; // IORING_CQE_F_MORE
+
+    /// What a `writable` task resolved with, as an error kind.
+    type GateSeen = std::rc::Rc<std::cell::Cell<Option<Result<(), io::ErrorKind>>>>;
+
+    /// Run `ctx.writable()` in a task of its own until it parks or resolves.
+    fn gate_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> GateSeen {
+        let seen: GateSeen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        run_task(el, async move {
+            let result = ctx.writable().await;
+            record.set(Some(result.map_err(|e| e.kind())));
+        });
+        seen
+    }
+
+    /// Dispatch one CQE, then poll the tasks it woke.
+    fn dispatch_and_poll(el: &mut AsyncEventLoop<NoopHandler>, ud: u64, result: i32, flags: u32) {
+        el.test_dispatch_cqe(ud, result, flags);
+        el.poll_ready_tasks();
+    }
+
+    /// The `SendPollProbe` CQE of `conn_index`.
+    fn probe_ud(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> u64 {
+        let generation = el.driver.connections.generation(conn_index);
+        UserData::encode(OpTag::SendPollProbe, conn_index, generation).raw()
+    }
+
+    /// The last SQE is a one-shot or multishot `POLLOUT` poll with user_data
+    /// `ud`.
+    fn assert_last_poll(el: &AsyncEventLoop<NoopHandler>, ud: u64, multi: bool) {
+        let sqe = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .expect("an SQE was pushed");
+        assert_eq!(sqe.user_data, ud, "the poll's tag");
+        match sqe.op {
+            crate::backend::uring::sqe::Op::PollAdd {
+                mask, multi: armed, ..
+            } => {
+                assert_eq!(mask, libc::POLLOUT as u32);
+                assert_eq!(armed, multi);
+            }
+            op => panic!("expected a POLLOUT poll, got {op:?}"),
+        }
+    }
+
+    /// A connection whose `SendPollOut` is multishot and whose send no longer
+    /// waits: a send came back short, the peer had half-closed, and the
+    /// multishot poll's `POLLOUT` let the rest of the send finish.
+    fn multishot_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
+        let (conn_index, slot, ud) = stage_send(el, &[7u8; 100]);
+        let poll = pollout_ud(el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        el.test_dispatch_cqe(poll, libc::POLLRDHUP as i32, 0);
+        el.test_dispatch_cqe(poll, (libc::POLLRDHUP | libc::POLLOUT) as i32, GATE_F_MORE);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(state.send_poll, SendPoll::Multi);
+        assert!(state.waiting_send.is_none() && !state.in_flight);
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        conn_index
+    }
+
+    /// With no poll armed, the gate arms the connection's `SendPollOut` one
+    /// shot, and resolves on its `POLLOUT`.
+    #[test]
+    fn a_writable_gate_arms_a_one_shot_poll_and_resolves_on_pollout() {
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let conn_index = ctx.conn_index;
+        let seen = gate_task(&mut el, ctx);
+        assert_eq!(seen.get(), None);
+        assert_last_poll(&el, pollout_ud(&el, conn_index), false);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::OneShot
+        );
+
+        let poll = pollout_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), Some(Ok(())));
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(state.send_poll, SendPoll::None);
+        assert!(state.writable_task.is_none());
+        assert!(!state.pollout_seen, "no send was in flight");
+    }
+
+    /// After the peer half-closes, the one-shot poll completes with
+    /// `POLLRDHUP` and no `POLLOUT`; the gate then waits on a multishot poll,
+    /// whose report of the FIN alone does not end the wait.
+    #[test]
+    fn a_writable_gate_after_a_half_close_waits_on_the_multishot_poll() {
+        let rdhup = libc::POLLRDHUP as i32;
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let conn_index = ctx.conn_index;
+        let poll = pollout_ud(&el, conn_index);
+        let seen = gate_task(&mut el, ctx);
+
+        dispatch_and_poll(&mut el, poll, rdhup, 0);
+        assert_eq!(seen.get(), None);
+        assert_last_poll(&el, poll, true);
+        dispatch_and_poll(&mut el, poll, rdhup, GATE_F_MORE);
+        assert_eq!(seen.get(), None);
+        dispatch_and_poll(&mut el, poll, rdhup | libc::POLLOUT as i32, GATE_F_MORE);
+        assert_eq!(seen.get(), Some(Ok(())));
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::Multi,
+            "a multishot poll stays armed until the connection closes"
+        );
+    }
+
+    /// On a connection whose poll is multishot, which reports only changes,
+    /// the gate arms a one-shot probe with its own tag, and resolves on the
+    /// probe's `POLLOUT`.
+    #[test]
+    fn a_writable_gate_on_a_multishot_connection_probes_the_socket() {
+        let mut el = make_test_loop();
+        let conn_index = multishot_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        assert_eq!(seen.get(), None);
+        assert_last_poll(&el, probe_ud(&el, conn_index), false);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_probe,
+            SendProbe::Armed
+        );
+
+        let ready = (libc::POLLRDHUP | libc::POLLOUT) as i32;
+        let probe = probe_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, probe, ready, 0);
+        assert_eq!(seen.get(), Some(Ok(())));
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(state.send_probe, SendProbe::None);
+        assert_eq!(state.send_poll, SendPoll::Multi);
+    }
+
+    /// The multishot poll reported a `POLLOUT` before the gate started, and
+    /// whole sends have since filled the socket. The probe reports no
+    /// `POLLOUT`, so the gate waits, and the multishot poll's next `POLLOUT`
+    /// ends the wait. A gate that trusted the earlier `POLLOUT` would let a
+    /// piece into the full socket.
+    #[test]
+    fn a_writable_gate_on_a_multishot_connection_waits_when_the_probe_finds_no_room() {
+        let rdhup = libc::POLLRDHUP as i32;
+        let mut el = make_test_loop();
+        let conn_index = multishot_connection(&mut el);
+        let poll = pollout_ud(&el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+
+        let probe = probe_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, probe, rdhup, 0);
+        assert_eq!(seen.get(), None, "the probe found the socket full");
+        el.driver.ring.last_pushed = None;
+        dispatch_and_poll(&mut el, poll, rdhup, GATE_F_MORE);
+        assert_eq!(seen.get(), None);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "nothing more is armed"
+        );
+        dispatch_and_poll(&mut el, poll, rdhup | libc::POLLOUT as i32, GATE_F_MORE);
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// A multishot poll that ends while a gate waits, after the probe found
+    /// no room, is armed again, as for a waiting send: one shot, which after
+    /// the half-close reports `POLLRDHUP` at once and gives way to a new
+    /// multishot poll, whose `POLLOUT` ends the wait.
+    #[test]
+    fn a_multishot_poll_that_ends_under_a_writable_gate_is_armed_again() {
+        let rdhup = libc::POLLRDHUP as i32;
+        let mut el = make_test_loop();
+        let conn_index = multishot_connection(&mut el);
+        let poll = pollout_ud(&el, conn_index);
+        let probe = probe_ud(&el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        dispatch_and_poll(&mut el, probe, rdhup, 0);
+        // No IORING_CQE_F_MORE: the multishot poll has ended.
+        dispatch_and_poll(&mut el, poll, rdhup, 0);
+        assert_last_poll(&el, poll, false);
+        dispatch_and_poll(&mut el, poll, rdhup, 0);
+        assert_last_poll(&el, poll, true);
+        assert_eq!(seen.get(), None);
+        dispatch_and_poll(&mut el, poll, rdhup | libc::POLLOUT as i32, GATE_F_MORE);
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// `POLLERR` fails the gate with `ConnectionReset`, and `POLLHUP` alone
+    /// with `BrokenPipe`, when the connection recorded no error of its own;
+    /// a `POLLOUT` in the same report does not count.
+    #[test]
+    fn a_writable_gate_fails_on_an_error_or_a_hangup() {
+        let mut el = make_test_loop();
+        for (mask, kind) in [
+            (
+                libc::POLLERR | libc::POLLHUP | libc::POLLOUT,
+                io::ErrorKind::ConnectionReset,
+            ),
+            (libc::POLLHUP | libc::POLLOUT, io::ErrorKind::BrokenPipe),
+        ] {
+            let ctx = bounded_conn(&mut el);
+            let poll = pollout_ud(&el, ctx.conn_index);
+            let seen = gate_task(&mut el, ctx);
+            dispatch_and_poll(&mut el, poll, mask as i32, 0);
+            assert_eq!(seen.get(), Some(Err(kind)), "mask {mask:#x}");
+        }
+    }
+
+    /// A send waiting for room and a gate on one connection wait on one poll:
+    /// the gate arms nothing, and the `POLLOUT` resubmits the send and
+    /// resolves the gate.
+    #[test]
+    fn a_writable_gate_and_a_waiting_send_end_on_one_pollout() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+        el.driver.ring.last_pushed = None;
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "the gate joins the armed poll"
+        );
+
+        let poll = pollout_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { len: 60, .. }
+        ));
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// `abort` fails a waiting gate as it fails a parked reader: the gate's
+    /// task is woken and resolves `ConnectionAborted` before the cancel of the
+    /// poll lands. The `Close` cancels the poll the gate armed.
+    #[test]
+    fn an_abort_fails_a_waiting_writable_gate() {
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let poll = pollout_ud(&el, ctx.conn_index);
+        let seen = gate_task(&mut el, ctx);
+        run_task(&mut el, async move { ctx.abort() });
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionAborted)));
+        assert!(
+            el.driver.ring.pushed_cancels.contains(&poll),
+            "the abort's Close cancels the gate's poll"
+        );
+        dispatch_and_poll(&mut el, poll, -libc::ECANCELED, 0);
+    }
+
+    /// The `Close` of a connection whose gate armed a probe cancels the probe
+    /// as well as the multishot poll; the probe's cancelled CQE fails the gate.
+    #[test]
+    fn a_close_cancels_the_writable_probe() {
+        let mut el = make_test_loop();
+        let conn_index = multishot_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        let probe = probe_ud(&el, conn_index);
+        el.driver.close_connection(conn_index);
+        el.driver.force_finalize_close(conn_index);
+        let cancels = &el.driver.ring.pushed_cancels;
+        assert!(
+            cancels.contains(&pollout_ud(&el, conn_index)),
+            "{cancels:?}"
+        );
+        assert!(cancels.contains(&probe), "{cancels:?}");
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_probe,
+            SendProbe::None
+        );
+        dispatch_and_poll(&mut el, probe, -libc::ECANCELED, 0);
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::NotConnected)));
+    }
+
+    /// A gate for a connection that is gone fails at once and arms nothing.
+    #[test]
+    fn a_stale_writable_gate_fails_not_connected() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.ring.last_pushed = None;
+        let seen = gate_task(
+            &mut el,
+            ConnCtx::new(conn_index, generation.wrapping_add(1)),
+        );
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::NotConnected)));
+        assert!(el.driver.ring.last_pushed.is_none());
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::None
+        );
+    }
+
+    /// The SendCompletion a task sends `data` with, kept for later reads.
+    type Sent = std::rc::Rc<std::cell::RefCell<Option<crate::SendCompletion>>>;
+
+    /// Send `data` on `ctx` from a task; returns the completion and the
+    /// send's user_data.
+    fn send_from_task(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        ctx: ConnCtx,
+        data: &'static [u8],
+    ) -> (Sent, u64) {
+        let sent: Sent = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let keep = sent.clone();
+        el.driver.ring.last_pushed = None;
+        run_task(el, async move {
+            *keep.borrow_mut() = Some(ctx.send(data).expect("send"));
+        });
+        let ud = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .map(|sqe| sqe.user_data)
+            .unwrap_or(0);
+        (sent, ud)
+    }
+
+    /// `waited_for_room` of `sent`, read inside a task as a caller reads it.
+    fn read_waited(el: &mut AsyncEventLoop<NoopHandler>, sent: &Sent) -> bool {
+        let out = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (out2, sent) = (out.clone(), sent.clone());
+        run_task(el, async move {
+            out2.set(sent.borrow().as_ref().expect("sent").waited_for_room());
+        });
+        out.get()
+    }
+
+    /// Await `sent` in a task, so the completion takes its result.
+    fn settle_in_task(el: &mut AsyncEventLoop<NoopHandler>, sent: &Sent) -> io::Result<u32> {
+        let out = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (out2, sent) = (out.clone(), sent.clone());
+        run_task(el, async move {
+            let mut taken = sent.borrow_mut().take().expect("sent");
+            let result = (&mut taken).await;
+            *sent.borrow_mut() = Some(taken);
+            *out2.borrow_mut() = Some(result);
+        });
+        out.borrow_mut().take().expect("the send has settled")
+    }
+
+    /// A send that comes back short has waited for room, from that
+    /// completion on, before and after it settles.
+    #[test]
+    fn a_short_send_has_waited_for_room() {
+        static DATA: [u8; 100] = [7; 100];
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let (sent, ud) = send_from_task(&mut el, ctx, &DATA);
+        assert_eq!(UserData(ud).tag(), Some(OpTag::Send));
+        assert!(!read_waited(&mut el, &sent));
+        el.test_dispatch_cqe(ud, 40, 0);
+        assert!(read_waited(&mut el, &sent), "before it settles");
+        let poll = pollout_ud(&el, ctx.conn_index);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud, 60, 0);
+        assert_eq!(settle_in_task(&mut el, &sent).unwrap(), 100);
+        assert!(read_waited(&mut el, &sent), "after it settles");
+    }
+
+    /// A send refused with `EAGAIN` before any byte went in has waited for
+    /// room.
+    #[test]
+    fn a_send_refused_with_eagain_has_waited_for_room() {
+        static DATA: [u8; 100] = [7; 100];
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let (sent, ud) = send_from_task(&mut el, ctx, &DATA);
+        el.test_dispatch_cqe(ud, -libc::EAGAIN, 0);
+        assert!(read_waited(&mut el, &sent));
+    }
+
+    /// A send that goes into the socket whole has not waited for room.
+    #[test]
+    fn a_whole_send_has_not_waited_for_room() {
+        static DATA: [u8; 100] = [7; 100];
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let (sent, ud) = send_from_task(&mut el, ctx, &DATA);
+        el.test_dispatch_cqe(ud, 100, 0);
+        assert_eq!(settle_in_task(&mut el, &sent).unwrap(), 100);
+        assert!(!read_waited(&mut el, &sent));
+    }
+
+    /// A wait for room marks every awaited send in flight on the connection:
+    /// the one that came back short and the one queued behind it. A send on
+    /// another connection is not marked.
+    #[test]
+    fn a_wait_for_room_marks_the_sends_queued_behind_it() {
+        static DATA: [u8; 100] = [7; 100];
+        let mut el = make_test_loop();
+        let ctx = bounded_conn(&mut el);
+        let other = bounded_conn(&mut el);
+        let (first, ud) = send_from_task(&mut el, ctx, &DATA);
+        let (second, _) = send_from_task(&mut el, ctx, &DATA);
+        let (elsewhere, _) = send_from_task(&mut el, other, &DATA);
+        el.test_dispatch_cqe(ud, 40, 0);
+        assert!(read_waited(&mut el, &first));
+        assert!(read_waited(&mut el, &second));
+        assert!(!read_waited(&mut el, &elsewhere));
     }
 
     // ── Property-based tests (proptest) ────────────────────────────

@@ -108,6 +108,12 @@ pub enum OpTag {
     /// completion releases the hold on the `Close`. Payload = connection
     /// generation.
     Disconnect = 39,
+    /// One-shot `POLL_ADD` for `POLLOUT` that a `SendHalf::writable` future
+    /// arms while the connection's `SendPollOut` is multishot, which reports
+    /// only changes: it reports whether the socket is writable now. A
+    /// connection arms one at a time (`ConnSendState::send_probe`), and its
+    /// `Close` cancels it. Payload = connection generation.
+    SendPollProbe = 40,
 }
 
 impl OpTag {
@@ -140,6 +146,7 @@ impl OpTag {
             37 => Some(OpTag::HangupPoll),
             38 => Some(OpTag::HangupPeek),
             39 => Some(OpTag::Disconnect),
+            40 => Some(OpTag::SendPollProbe),
             _ => None,
         }
     }
@@ -180,6 +187,7 @@ impl OpTag {
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
             OpTag::Disconnect => "disconnect",
+            OpTag::SendPollProbe => "send_poll_probe",
         }
     }
 }

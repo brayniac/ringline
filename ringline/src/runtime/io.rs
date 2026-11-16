@@ -1442,6 +1442,16 @@ impl ConnCtx {
         }
     }
 
+    /// See [`SendHalf::writable`].
+    pub(crate) fn writable(&self) -> impl Future<Output = io::Result<()>> + use<> {
+        WritableFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            waiting: false,
+            _not_send: PhantomData,
+        }
+    }
+
     // ── Connect ──────────────────────────────────────────────────────
 
     // ── Send chain ────────────────────────────────────────────────────
@@ -1617,6 +1627,11 @@ impl ConnCtx {
             executor.abort_sends(self.conn_index, self.generation);
             executor.restart_send_window_if_head_changed(&mut driver.send_copy_pool);
             driver.abort(self.conn_index);
+            // A `writable` future fails as the parked reader does: its next
+            // poll finds the connection aborted.
+            if let Some(task) = driver.send_queues[idx].writable_task.take() {
+                executor.wake_task(task);
+            }
         });
     }
 
@@ -2983,6 +2998,12 @@ impl Connection {
         self.tx.send_admitted(data)
     }
 
+    /// See [`SendHalf::writable`].
+    #[doc(hidden)]
+    pub fn writable(&self) -> impl Future<Output = io::Result<()>> + use<> {
+        self.tx.writable()
+    }
+
     // ── lifecycle and identity ──────────────────────────────────────────
 
     /// See [`SendHalf::close`].
@@ -3382,6 +3403,48 @@ impl SendHalf {
     /// ```
     pub fn send_admitted<'a>(&mut self, data: &'a [u8]) -> Admission<'a> {
         self.conn.send_admitted(data)
+    }
+
+    /// Wait until the connection's socket reports room for more bytes
+    /// (`POLLOUT`). Sends nothing and takes no send-pool slot.
+    ///
+    /// Experimental, for the send-admission experiments: a server that sends
+    /// a large reply in pieces awaits this before each piece, so that a piece
+    /// takes pool slots only once its socket has room for it
+    /// (`docs/send-admission-design.md`, section 4, Experiment D). TCP
+    /// reports `POLLOUT` once the memory queued in the socket is at most two
+    /// thirds of its send buffer, so a piece whose bytes and per-segment
+    /// overhead fit in a third of the buffer goes into the socket whole.
+    ///
+    /// Resolves `Ok` when the socket reports `POLLOUT`, and `Err` when it
+    /// reports an error or a hangup: the error the connection recorded for
+    /// its reader if there is one, otherwise `ConnectionReset` for an error
+    /// and `BrokenPipe` for a hangup. The socket's pending error is not read,
+    /// which would take it from the reader. Also `Err` for a connection that
+    /// is aborted, before or while this waits (`ConnectionAborted`), one
+    /// whose close is requested or committed, or that has been released (the
+    /// error recorded for its reader, or `NotConnected`), and one whose write
+    /// half is shut down (`BrokenPipe`).
+    ///
+    /// On io_uring it waits on the connection's `POLLOUT` poll, the one a
+    /// send waiting for room uses, arming it one shot if none is armed, so
+    /// the cancel that `close` and `abort` issue covers it. A send that waits
+    /// for room at the same time ends its wait on the same `POLLOUT`: the
+    /// send is resubmitted, and this resolves, though the send may have
+    /// taken the room again. Once the peer has half-closed the poll is
+    /// multishot, which reports only changes, so this also arms a one-shot
+    /// poll that reports whether the socket is writable now. On mio it
+    /// checks the socket with a zero-timeout `poll(2)`, and otherwise waits
+    /// for the connection's next event and checks again.
+    ///
+    /// Bound the wait: a socket whose peer never reads never reports room,
+    /// and no backstop ends the wait. One future waits per connection; if
+    /// two do, the task of the one polled last is woken. Dropping the
+    /// future ends its wait, and leaves an armed poll to complete as a
+    /// waiting send's would.
+    #[doc(hidden)]
+    pub fn writable(&self) -> impl Future<Output = io::Result<()>> + use<> {
+        self.conn.writable()
     }
 
     /// Close this connection now, without draining its sends: for a peer
@@ -4047,6 +4110,231 @@ impl Future for RecvReadyFuture {
     }
 }
 
+// ── Writable ────────────────────────────────────────────────────────────
+
+/// Future returned by [`SendHalf::writable`].
+struct WritableFuture {
+    conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
+    /// The future has started its wait: on io_uring it armed or joined the
+    /// connection's poll, and on both backends its task is registered as the
+    /// connection's `writable_task`.
+    waiting: bool,
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's tables.
+    _not_send: PhantomData<*const ()>,
+}
+
+/// The error a `writable` future on `conn_index` resolves with before it
+/// looks at the socket, or `None` if it may wait. See
+/// [`SendHalf::writable`].
+fn writable_refusal(
+    driver: &Driver,
+    executor: &Executor,
+    conn_index: u32,
+    generation: u32,
+) -> Option<io::Error> {
+    let Some(conn) = driver
+        .connections
+        .get(conn_index)
+        .filter(|c| c.generation == generation)
+    else {
+        // Released: the error recorded for this generation's reader, if any,
+        // as a reader that polls after the release reads it.
+        return Some(
+            recorded_error(driver, executor, conn_index, generation)
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stale connection")),
+        );
+    };
+    let state = &driver.send_queues[conn_index as usize];
+    if state.aborted {
+        return Some(crate::handler::aborted_error());
+    }
+    if state.close_submitted || !matches!(conn.lifecycle, crate::connection::Lifecycle::Open) {
+        return Some(
+            recorded_error(driver, executor, conn_index, generation).unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "connection closing")
+            }),
+        );
+    }
+    if conn.write != crate::connection::WriteHalf::Open {
+        return Some(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "write half is shut down",
+        ));
+    }
+    None
+}
+
+/// The error the connection recorded for its reader, copied and left in
+/// place: on io_uring the error a hangup peek took from the socket, and on
+/// both backends the receive error `fail_recv` stored for this generation,
+/// which outlives the slot's release (`Executor::recv_errors`).
+fn recorded_error(
+    #[allow(unused_variables)] driver: &Driver,
+    executor: &Executor,
+    conn_index: u32,
+    generation: u32,
+) -> Option<io::Error> {
+    #[cfg(has_io_uring)]
+    if let Some(conn) = driver.connections.get(conn_index)
+        && conn.generation == generation
+        && conn.hangup_error != 0
+    {
+        return Some(io::Error::from_raw_os_error(conn.hangup_error));
+    }
+    match executor.recv_errors.get(conn_index as usize) {
+        Some(Some((g, e))) if *g == generation => Some(match e.raw_os_error() {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(e.kind(), e.to_string()),
+        }),
+        _ => None,
+    }
+}
+
+/// The error a `writable` future resolves with for `errno`, from a poll's
+/// error, hangup or cancel: a refusal if the connection has one now, then
+/// the error the connection recorded, then `errno`.
+fn writable_error(
+    driver: &Driver,
+    executor: &Executor,
+    conn_index: u32,
+    generation: u32,
+    errno: i32,
+) -> io::Error {
+    writable_refusal(driver, executor, conn_index, generation)
+        .or_else(|| recorded_error(driver, executor, conn_index, generation))
+        .unwrap_or_else(|| io::Error::from_raw_os_error(errno))
+}
+
+impl WritableFuture {
+    /// End the wait, so that nothing wakes this future's task for it again.
+    fn stop_waiting(&mut self, driver: &mut Driver) {
+        if !std::mem::take(&mut self.waiting) {
+            return;
+        }
+        if driver.connections.generation(self.conn_index) != self.generation {
+            return;
+        }
+        let state = &mut driver.send_queues[self.conn_index as usize];
+        state.writable_task = None;
+        #[cfg(has_io_uring)]
+        {
+            state.writable_event = None;
+        }
+    }
+}
+
+impl Future for WritableFuture {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        with_state(|driver, executor| {
+            if let Some(e) = writable_refusal(driver, executor, this.conn_index, this.generation) {
+                this.stop_waiting(driver);
+                return Poll::Ready(Err(e));
+            }
+            let task = CURRENT_TASK_ID.with(|c| c.get());
+            #[cfg(has_io_uring)]
+            {
+                use crate::handler::SendPoll;
+                let ci = this.conn_index as usize;
+                if this.waiting {
+                    if let Some(event) = driver.send_queues[ci].writable_event.take() {
+                        let result = match event {
+                            Ok(()) => Ok(()),
+                            Err(errno) => Err(writable_error(
+                                driver,
+                                executor,
+                                this.conn_index,
+                                this.generation,
+                                errno,
+                            )),
+                        };
+                        this.stop_waiting(driver);
+                        return Poll::Ready(result);
+                    }
+                    driver.send_queues[ci].writable_task = Some(task);
+                    return pending(cx);
+                }
+                // Start the wait: only an event from now on counts.
+                driver.send_queues[ci].writable_event = None;
+                let poll = driver.send_queues[ci].send_poll;
+                match poll {
+                    SendPoll::None => driver.arm_send_poll(this.conn_index, false),
+                    // A poll is armed, or queued for retry: its completion
+                    // ends this wait too.
+                    SendPoll::Pending | SendPoll::OneShot => {}
+                    // It reports only changes: ask the socket now.
+                    SendPoll::Multi => driver.arm_send_probe(this.conn_index),
+                }
+                driver.send_queues[ci].writable_task = Some(task);
+                this.waiting = true;
+                pending(cx)
+            }
+            #[cfg(not(has_io_uring))]
+            {
+                use std::os::fd::AsRawFd;
+                let ci = this.conn_index as usize;
+                let Some(fd) = driver.tcp_streams[ci].as_ref().map(|s| s.as_raw_fd()) else {
+                    this.stop_waiting(driver);
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "connection closed",
+                    )));
+                };
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one valid `pollfd` for the call, and a zero timeout.
+                let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if n < 0 {
+                    this.stop_waiting(driver);
+                    return Poll::Ready(Err(io::Error::last_os_error()));
+                }
+                let revents = pfd.revents;
+                if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    let errno = if revents & libc::POLLHUP != 0 && revents & libc::POLLERR == 0 {
+                        libc::EPIPE
+                    } else {
+                        libc::ECONNRESET
+                    };
+                    let e =
+                        writable_error(driver, executor, this.conn_index, this.generation, errno);
+                    this.stop_waiting(driver);
+                    return Poll::Ready(Err(e));
+                }
+                if revents & libc::POLLOUT != 0 {
+                    this.stop_waiting(driver);
+                    return Poll::Ready(Ok(()));
+                }
+                driver.send_queues[ci].writable_task = Some(task);
+                this.waiting = true;
+                pending(cx)
+            }
+        })
+    }
+}
+
+impl Drop for WritableFuture {
+    fn drop(&mut self) {
+        if !self.waiting {
+            return;
+        }
+        // Drop can run outside a poll, where the thread-local may be gone.
+        let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
+            return;
+        };
+        let state = unsafe { non_null.as_mut() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        self.stop_waiting(driver);
+    }
+}
+
 // ── Admission ───────────────────────────────────────────────────────────
 
 /// Where an [`Admission`] is in the admission handshake.
@@ -4537,6 +4825,9 @@ pub struct SendCompletion {
     /// The send was admitted past a waiting head; see
     /// [`passed_head`](Self::passed_head).
     passed_head: bool,
+    /// The table's [`waited_for_room`](Self::waited_for_room) flag, copied
+    /// when the poll takes the result and the entry leaves the table.
+    waited_for_room: bool,
     /// Makes the type `!Send`: a poll on another worker would index that
     /// worker's table.
     _not_send: PhantomData<*const ()>,
@@ -4557,6 +4848,7 @@ impl SendCompletion {
             generation,
             state: SendCompletionState::Pending(id),
             passed_head: false,
+            waited_for_room: false,
             _not_send: PhantomData,
         }
     }
@@ -4568,6 +4860,7 @@ impl SendCompletion {
             generation,
             state: SendCompletionState::Ready(Some(result)),
             passed_head: false,
+            waited_for_room: false,
             _not_send: PhantomData,
         }
     }
@@ -4579,6 +4872,36 @@ impl SendCompletion {
     #[doc(hidden)]
     pub fn passed_head(&self) -> bool {
         self.passed_head
+    }
+
+    /// Whether the send has waited for room in its socket: a write on its
+    /// connection found the socket full while the send was in flight, that
+    /// is, admitted and not settled. On io_uring that is a send of the
+    /// connection that came back short or with `EAGAIN`, including one
+    /// that took no byte; on mio a `writev` that returned `WouldBlock`.
+    /// Once true it stays true, and it can be read before the send settles.
+    ///
+    /// The flag is per connection at the moment of the write: every awaited
+    /// send then in flight on the connection is marked, the one whose bytes
+    /// met the full socket and the ones queued behind it. With one send in
+    /// flight per connection, it is whether that send's own bytes waited.
+    /// Sends without a `SendCompletion` (`send_nowait`) are not marked, and a
+    /// `send_chain`, which never waits for room this way, reads false.
+    ///
+    /// Read outside a task on the send's worker, it returns what the
+    /// future last saw. Experimental, for the send-admission experiments
+    /// (`docs/send-admission-design.md`, section 4).
+    #[doc(hidden)]
+    pub fn waited_for_room(&self) -> bool {
+        if self.waited_for_room {
+            return true;
+        }
+        match self.state {
+            SendCompletionState::Pending(id) => {
+                try_with_state(|_, executor| executor.send_waited_for_room(id)).unwrap_or(false)
+            }
+            SendCompletionState::Ready(_) => false,
+        }
     }
 }
 
@@ -4602,9 +4925,11 @@ impl Future for SendCompletion {
             // (moved into a `join!`, handed to a spawned task) is woken where
             // it now lives.
             executor.set_send_owner(id, CURRENT_TASK_ID.with(|c| c.get()));
+            let waited_for_room = executor.send_waited_for_room(id);
             match executor.take_send_result(id) {
                 Some(result) => {
                     this.state = SendCompletionState::Ready(None);
+                    this.waited_for_room = waited_for_room;
                     Poll::Ready(result)
                 }
                 // A recycled slot means teardown ran and left no result for

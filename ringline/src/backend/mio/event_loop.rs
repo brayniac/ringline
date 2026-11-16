@@ -378,6 +378,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         if writable {
                             self.handle_writable(conn_index);
                         }
+                        // A `writable` future checks the socket again on any
+                        // event: room, an error, a hangup, or a close the
+                        // handlers above requested.
+                        self.wake_writable(conn_index);
                     }
                 }
             }
@@ -1334,6 +1338,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Wake the task of a `writable` future waiting on `conn_index`, which
+    /// polls the socket again.
+    fn wake_writable(&mut self, conn_index: u32) {
+        if let Some(task) = self
+            .driver
+            .send_queues
+            .get_mut(conn_index as usize)
+            .and_then(|state| state.writable_task.take())
+        {
+            self.executor.wake_task(task);
+        }
+    }
+
+    /// Mark in the completion table the awaited sends a `writev` found the
+    /// socket full for (`Driver::room_waited_sends`), before any task reads
+    /// `SendCompletion::waited_for_room`.
+    fn mark_room_waited_sends(&mut self) {
+        for id in self.driver.room_waited_sends.drain(..) {
+            self.executor.send_completions.mark_send_waited_for_room(id);
+        }
+    }
+
     /// A hard write error (EPIPE/ECONNRESET/peer-closed) during a flush:
     /// fail the awaiting sender, wake the recv side so the owning task
     /// observes the close, and tear the connection down. Previously the
@@ -1588,6 +1614,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.forward_done[idx] = Some(Ok(st.forwarded));
             }
             self.driver.forward_resume_flag[idx] = false;
+            // A `writable` future on another task than the connection's,
+            // which `remove_connection` drops, polls again and finds the slot
+            // released.
+            self.wake_writable(conn_index);
 
             // Drops the connection's task if it is still alive, with the
             // driver state installed so the futures it holds clean up as
@@ -1637,6 +1667,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// `capacity_released` wherever a permit goes back, and the run loop
     /// issues one `wake_send_capacity` per iteration (see step 8a).
     fn drain_send_completions(&mut self) {
+        self.mark_room_waited_sends();
         loop {
             let mut delivered = false;
             while let Some((id, result)) = self.driver.settled_sends.pop_front() {
@@ -1754,6 +1785,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // behind (for example, a closed connection's timer slot), so tasks
         // polled in this pass can reuse it.
         crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+        self.mark_room_waited_sends();
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
         // violations: accessing self.driver or self.executor directly after
