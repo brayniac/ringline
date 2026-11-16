@@ -19539,25 +19539,37 @@ mod tests {
         seen
     }
 
-    /// A reset reaped by a drain, with no poll armed, leaves the gate in the
-    /// connection's own task ready to poll when the drain returns. After its
-    /// second drain the loop polls tasks only if the ready queue is not empty,
-    /// and the Close can then complete and drop the task before the next pass.
+    /// A reset on a resubmitted send, with no poll armed, closes the
+    /// connection. The loop polls tasks after its second drain only if the
+    /// ready queue is not empty, then commits the Close, and the Close's CQE
+    /// drops the connection's task. The gate in that task fails before then.
     #[test]
-    fn a_reset_reaped_by_a_drain_readies_the_connection_s_writable_gate() {
+    fn a_reset_reaped_by_a_drain_fails_the_connection_s_writable_gate() {
         let mut el = make_test_loop();
         let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
         el.test_dispatch_cqe(ud.raw(), 40, 0);
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let generation = el.driver.connections.generation(conn_index);
+        let ctx = ConnCtx::new(conn_index, generation);
         let seen = conn_gate_task(&mut el, ctx);
         let poll = pollout_ud(&el, conn_index);
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
         assert_eq!(seen.get(), None, "blocked on the resubmitted send");
-        el.inject_and_dispatch(ud.raw(), -libc::ECONNRESET);
+        // The second drain: the reset, then nothing else is reaped.
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+        el.drain_completions();
+        if !el.executor.ready_queue.is_empty() {
+            el.poll_ready_tasks();
+        }
+        el.finalize_pending_closes();
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Close, conn_index, generation).raw(),
+            0,
+            0,
+        );
         assert!(
-            el.executor.ready_queue.contains(&conn_index),
-            "the gate's task is ready after the drain: {:?}",
-            el.executor.ready_queue
+            matches!(seen.get(), Some(Err(_))),
+            "the gate failed before its task was dropped: {:?}",
+            seen.get()
         );
     }
 
