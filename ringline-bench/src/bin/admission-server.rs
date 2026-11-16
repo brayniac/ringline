@@ -547,9 +547,9 @@ struct Recorder {
     samples: Vec<Sample>,
     /// The earliest and latest scheduled time of a recorded request.
     window_ns: Option<(u64, u64)>,
-    /// Per class, admitted replies the runtime admitted past a head, and
-    /// how long each held its slots: from admission until it settled, in
-    /// microseconds (settled ones only).
+    /// Per class, admitted sends (a whole reply or one piece) the runtime
+    /// admitted past a head, and how long each held its slots: from
+    /// admission until it settled, in microseconds (settled ones only).
     passed: [u64; 3],
     passing_hold_us: [Vec<u32>; 3],
     /// The runtime's admission counters at the last sample.
