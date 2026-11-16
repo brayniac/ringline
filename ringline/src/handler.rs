@@ -161,9 +161,10 @@ pub(crate) struct ConnSendState {
     /// counts.
     #[cfg(has_io_uring)]
     pub writable_event: Option<(u32, WritableEvent)>,
-    /// io_uring: the resubmit of the send that waited for room is on a retry
-    /// list, the SQ having had no room for it: as for a queued send, a
-    /// `writable` future waits until its push goes through.
+    /// io_uring: the resubmit of the send that waited for room, or the plain
+    /// re-send of a zero-copy send that got `ENOMEM`, is on a retry list, the
+    /// SQ having had no room for it: as for a queued send, a `writable`
+    /// future waits until its push goes through.
     #[cfg(has_io_uring)]
     pub resubmit_queued: bool,
     /// io_uring: the registered `writable` future waits for the
@@ -184,9 +185,11 @@ pub(crate) struct ConnSendState {
 pub(crate) enum WritableEvent {
     /// The socket reported `POLLOUT`.
     Room,
-    /// The socket reported `POLLOUT`, and a send that waited for room was
-    /// resubmitted on it and may take the room: the future looks again,
-    /// from its check for queued and waiting sends.
+    /// A send that waited for room was resubmitted, on the `POLLOUT` the
+    /// future waited for or by the backstop, or a send parked on a retry
+    /// list was pushed, and it may take the room: the future looks again,
+    /// from its check for queued and waiting sends, and waits for that send
+    /// to leave the kernel before it arms.
     Recheck,
     /// An error, a hangup or a cancel, with its errno.
     Failed(i32),

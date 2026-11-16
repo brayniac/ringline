@@ -1449,6 +1449,7 @@ impl ConnCtx {
             generation: self.generation,
             waiting: false,
             armed: false,
+            rechecking: false,
             task: None,
             _not_send: PhantomData,
         }
@@ -3445,16 +3446,18 @@ impl SendHalf {
     ///
     /// On io_uring it waits on the connection's `POLLOUT` poll, the one a
     /// send waiting for room uses, arming it one shot if none is armed, so
-    /// the cancel that `close` and `abort` issue covers it. A `POLLOUT` on
-    /// which a send that waited for room is resubmitted does not end the
-    /// wait: the send may take the room, so this looks again. Once the poll
-    /// is multishot (after the peer half-closes, or after a send made on a
-    /// `POLLOUT` got `EAGAIN`), it reports only changes, so this also arms a
-    /// one-shot poll of its own. After the peer half-closes that poll
-    /// completes at once, with `POLLOUT` if the socket is writable then;
-    /// otherwise it completes when the socket becomes writable. On mio it checks the socket with a zero-timeout
-    /// `poll(2)`, and otherwise waits for the connection's next event, or for
-    /// its queue to be written, and checks again.
+    /// the cancel that `close` and `abort` issue covers it. When a send that
+    /// waited for room is resubmitted, on a `POLLOUT` or by the backstop,
+    /// the send may take the room, so this waits until no send on the
+    /// connection is in the kernel, queued or waiting for room, and then
+    /// looks at the socket again. Once the poll is multishot (after the peer
+    /// half-closes, or after a send made on a `POLLOUT` got `EAGAIN`), it
+    /// reports only changes, so this also arms a one-shot poll of its own.
+    /// After the peer half-closes that poll completes at once, with
+    /// `POLLOUT` if the socket is writable then; otherwise it completes when
+    /// the socket becomes writable. On mio it checks the socket with a
+    /// zero-timeout `poll(2)`, and otherwise waits for the connection's next
+    /// event, or for its queue to be written, and checks again.
     ///
     /// Bound the wait: a socket whose peer never reads never reports room,
     /// and no backstop ends the wait. `close`, a close that dropping the
@@ -4164,6 +4167,16 @@ struct WritableFuture {
     /// connection's poll, or armed a probe.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     armed: bool,
+    /// io_uring: the future got `Recheck`: a send that waited for room, or
+    /// one parked on a retry list, went into the kernel. Until the future
+    /// next arms, a send in the kernel also blocks it, so that it arms no
+    /// poll of its own while that send may get `EAGAIN` and wait again: the
+    /// send then waits on the poll `wait_for_room` arms, multishot after a
+    /// resubmit on `POLLOUT`, not on the future's one-shot poll, whose
+    /// `POLLOUT` would resubmit it at once, and so on while the socket
+    /// reports `POLLOUT` and refuses the send.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    rechecking: bool,
     /// The task the future last registered, whose registration and event it
     /// may clear.
     task: Option<u32>,
@@ -4279,6 +4292,7 @@ impl WritableFuture {
     /// future on the connection keeps its own.
     fn stop_waiting(&mut self, driver: &mut Driver) {
         self.armed = false;
+        self.rechecking = false;
         let task = self.task.take();
         if !std::mem::take(&mut self.waiting) {
             return;
@@ -4333,17 +4347,23 @@ impl Future for WritableFuture {
                     return Poll::Ready(Err(e));
                 }
                 // A send was resubmitted on the `POLLOUT` and may take the
-                // room: look again, from the check below.
+                // room: look again, from the check below, once it has left
+                // the kernel (`rechecking`).
                 if event == Some(WritableEvent::Recheck) {
                     this.armed = false;
+                    this.rechecking = true;
                 }
                 // Bytes queued behind a send in the kernel, a send waiting
                 // for room, or its resubmit parked on a retry list go first:
                 // until they are in the kernel the connection is not
-                // writable. The completion or push that leaves none wakes the
+                // writable. After a `Recheck`, so does the send in the
+                // kernel. The completion or push that leaves none wakes the
                 // task. A `POLLOUT` meanwhile is no use.
                 let state = &driver.send_queues[ci];
-                if !state.queue.is_empty() || state.waiting_send.is_some() || state.resubmit_queued
+                if !state.queue.is_empty()
+                    || state.waiting_send.is_some()
+                    || state.resubmit_queued
+                    || (this.rechecking && state.in_flight)
                 {
                     this.armed = false;
                     this.register(driver, task, true);
@@ -4369,6 +4389,7 @@ impl Future for WritableFuture {
                     SendPoll::Multi => driver.arm_send_probe(this.conn_index),
                 }
                 this.armed = true;
+                this.rechecking = false;
                 this.register(driver, task, false);
                 pending(cx)
             }

@@ -31,7 +31,7 @@ use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,16 @@ struct Seen {
     /// The fewest send-pool slots free during the second fill.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     refill_fewest_free: Option<u64>,
+    /// The server socket's (`sk_wmem_queued`, `sk_sndbuf`) when the gate
+    /// started, after the second fill.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    skmem_at_gate: Option<(u32, u32)>,
+    /// The same, read just after the gate resolved, if it resolved early.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    skmem_at_early: Option<(u32, u32)>,
+    /// Whether a send was queued behind the one waiting for room when the
+    /// close was requested.
+    queued_at_close: Option<bool>,
     /// Why the server gave up before the gate.
     note: Option<String>,
 }
@@ -86,6 +96,12 @@ static TOTAL: AtomicUsize = AtomicUsize::new(0);
 static READ_ALL: AtomicBool = AtomicBool::new(false);
 /// The server has filled the socket a second time, with whole sends.
 static REFILLED: AtomicBool = AtomicBool::new(false);
+/// The listener's port and the client's, for reading the server socket's
+/// memory through `NETLINK_SOCK_DIAG`; 0 until the test thread sets them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static SERVER_PORT: AtomicU16 = AtomicU16::new(0);
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static CLIENT_PORT: AtomicU16 = AtomicU16::new(0);
 
 const CHUNK_LEN: usize = 16 * 1024;
 const SLOT: u32 = 16 * 1024;
@@ -337,10 +353,16 @@ async fn close_while_waiting(conn: &mut Connection) {
     record(|s| s.closed_at = Some(Instant::now()));
 }
 
-/// Fill the socket, wait on the gate from another task, and return: the
-/// connection's last half drops, which requests the close.
+/// Fill the socket, queue two more sends behind the one waiting for room,
+/// wait on the gate from another task, and return: the connection's last
+/// half drops, which requests the close. While the first of the two has not
+/// completed the second is queued, so the backstop's resubmit of the
+/// waiting send does not unblock the gate: only the close's wake ends it.
 async fn drop_while_waiting(conn: &mut Connection) {
+    static CHUNK: [u8; CHUNK_LEN] = [7; CHUNK_LEN];
     fill(conn).await;
+    let mut first = conn.send(&CHUNK).expect("send");
+    let _second = conn.send(&CHUNK).expect("send");
     let gate = conn.writable();
     ringline::spawn(async move {
         let gate = ringline::timeout(Duration::from_secs(5), gate).await;
@@ -352,6 +374,9 @@ async fn drop_while_waiting(conn: &mut Connection) {
     })
     .expect("spawn");
     ringline::sleep(Duration::from_millis(200)).await;
+    let queued = ringline::timeout(Duration::from_millis(1), &mut first)
+        .await
+        .is_err();
     let pending = SEEN
         .lock()
         .unwrap()
@@ -359,16 +384,17 @@ async fn drop_while_waiting(conn: &mut Connection) {
         .is_none_or(|s| s.gate.is_none());
     record(|s| {
         s.pending_while_full = Some(pending);
+        s.queued_at_close = Some(queued);
         s.closed_at = Some(Instant::now());
     });
 }
 
 /// Linux: with the peer half-closed, fill the socket until a send waits,
 /// which leaves the connection's poll multishot; let the client read it all,
-/// so the poll reports POLLOUT; then fill it again with whole sends, to 0.9
-/// of what the first fill held before its first wait, which on Linux leaves
-/// more than two thirds of the send buffer queued and no send waiting. The
-/// gate must wait until the client reads again.
+/// so the poll reports POLLOUT; then fill it again with whole sends until
+/// the kernel's figures say the socket is not writable (`sk_wmem_queued`
+/// above two thirds of `sk_sndbuf`), with no send waiting. The gate must
+/// wait until the client reads again.
 #[cfg(target_os = "linux")]
 async fn whole_sends_fill(conn: &mut Connection) {
     static CHUNK: [u8; CHUNK_LEN] = [7; CHUNK_LEN];
@@ -386,11 +412,40 @@ async fn whole_sends_fill(conn: &mut Connection) {
     // One send at a time, each awaited until it settles, so that the
     // socket fills and the send pool, a few hundred KiB here, does not: a
     // queued copy send holds its pool slots until its bytes are in the
-    // socket, and the socket can take several MiB.
-    let sends = capacity * 9 / 10 / CHUNK_LEN;
+    // socket, and the socket can take several MiB. The kernel's figures
+    // decide when to stop: the first fill's size counts the client's
+    // receive buffer as well, and `sk_sndbuf` autotunes between the fills.
+    let ports = (
+        SERVER_PORT.load(Ordering::SeqCst),
+        CLIENT_PORT.load(Ordering::SeqCst),
+    );
+    let limit = 4 * capacity / CHUNK_LEN + 64;
+    let mut sends = 0;
     let mut waited = false;
     let mut fewest_free = u64::MAX;
-    for _ in 0..sends {
+    let at_gate = loop {
+        let mem = match server_skmem(ports.0, ports.1) {
+            Ok(Some(mem)) => mem,
+            other => {
+                record(|s| {
+                    s.note = Some(format!(
+                        "no memory figures for the server socket {ports:?}: {other:?}"
+                    ))
+                });
+                return;
+            }
+        };
+        if !kernel_writable(mem) {
+            break mem;
+        }
+        if sends == limit {
+            record(|s| {
+                s.note = Some(format!(
+                    "{sends} whole sends left the socket writable: (wmem_queued, sndbuf) {mem:?}"
+                ))
+            });
+            return;
+        }
         let mut sent = conn.send(&CHUNK).expect("send");
         fewest_free = fewest_free.min(ringline::send_admission_counters().main_free);
         let done = ringline::timeout(Duration::from_secs(5), &mut sent).await;
@@ -403,17 +458,26 @@ async fn whole_sends_fill(conn: &mut Connection) {
             return;
         }
         waited |= sent.waited_for_room();
-    }
+        sends += 1;
+    };
     eprintln!(
         "whole sends: the first fill held {capacity} B before a send waited; \
-         the second fill sent {sends} sends of {CHUNK_LEN} B, with at fewest \
-         {fewest_free} of {SLOTS} pool slots free"
+         the second fill sent {sends} sends of {CHUNK_LEN} B, leaving \
+         (wmem_queued, sndbuf) {at_gate:?}, with at fewest {fewest_free} of \
+         {SLOTS} pool slots free"
     );
     let mut gate = std::pin::pin!(conn.writable());
     let early = ringline::timeout(Duration::from_millis(300), gate.as_mut()).await;
+    let at_early = if early.is_ok() {
+        server_skmem(ports.0, ports.1).ok().flatten()
+    } else {
+        None
+    };
     record(|s| {
         s.refill_waited = Some(waited);
         s.refill_fewest_free = Some(fewest_free);
+        s.skmem_at_gate = Some(at_gate);
+        s.skmem_at_early = at_early;
         s.pending_while_full = Some(early.is_err());
         s.filled_at = Some(Instant::now());
     });
@@ -861,6 +925,11 @@ fn a_close_by_dropping_the_connection_while_waiting() {
     let (runtime, handles, client) = start(b'x');
     let seen = wait_for("resolved the gate", |s| s.gate.is_some());
     assert_eq!(
+        seen.queued_at_close,
+        Some(true),
+        "precondition: no send was queued behind the waiting one"
+    );
+    assert_eq!(
         seen.pending_while_full,
         Some(true),
         "it resolved before the close"
@@ -892,6 +961,8 @@ fn a_socket_filled_by_whole_sends_is_not_writable() {
     let addr = runtime.bound_addr().expect("bound");
     // Set before the connect, so the window and the server's MSS agree.
     let mut client = connect_with_rcvbuf(addr, 256 << 10);
+    SERVER_PORT.store(addr.port(), Ordering::SeqCst);
+    CLIENT_PORT.store(client.local_addr().unwrap().port(), Ordering::SeqCst);
     client.write_all(b"f").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     wait_filled();
@@ -939,15 +1010,184 @@ fn a_socket_filled_by_whole_sends_is_not_writable() {
         "precondition: the second fill took the whole send pool: {:?} of {SLOTS} free",
         seen.refill_fewest_free
     );
-    assert_eq!(
-        seen.pending_while_full,
-        Some(true),
-        "it resolved on a full socket"
+    let at_gate = seen.skmem_at_gate.expect("recorded with the refill");
+    assert!(
+        !kernel_writable(at_gate),
+        "precondition: the socket was writable when the gate started"
     );
+    if seen.pending_while_full != Some(true) {
+        let verdict = match seen.skmem_at_early {
+            Some(mem) if kernel_writable(mem) => {
+                "the kernel reported it writable by then: the socket changed, not the gate"
+            }
+            Some(_) => {
+                "the kernel still reported it not writable: the gate resolved on a full socket"
+            }
+            None => "its figures could not be read then",
+        };
+        panic!(
+            "the gate resolved within 300 ms of starting on a socket the kernel reported \
+             not writable, (wmem_queued, sndbuf) {at_gate:?}; when it resolved, {:?}: {verdict}",
+            seen.skmem_at_early
+        );
+    }
     assert_eq!(seen.gate, Some(Ok(())));
     assert_resolved_promptly(&seen);
     runtime.shutdown();
     common::join_workers(&runtime, handles);
+}
+
+/// Whether the kernel reports `POLLOUT` for a TCP socket with
+/// (`sk_wmem_queued`, `sk_sndbuf`) `mem`: `__sk_stream_is_writeable`, free
+/// space at least half of what is queued (`tcp_notsent_lowat` at its
+/// default, which never binds).
+#[cfg(target_os = "linux")]
+fn kernel_writable((queued, sndbuf): (u32, u32)) -> bool {
+    i64::from(sndbuf) - i64::from(queued) >= i64::from(queued >> 1)
+}
+
+/// The (`sk_wmem_queued`, `sk_sndbuf`) of the IPv4 TCP socket from local
+/// port `local` to remote port `remote`, read as `ss -tmi` reads them: an
+/// `inet_diag` dump over `NETLINK_SOCK_DIAG` with `INET_DIAG_SKMEMINFO`. On
+/// io_uring the runtime's sockets are fixed files, with no fd to read
+/// `SO_MEMINFO` from. `None` if there is no such socket.
+#[cfg(target_os = "linux")]
+fn server_skmem(local: u16, remote: u16) -> io::Result<Option<(u32, u32)>> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    const AF_NETLINK: i32 = 16;
+    const SOCK_CLOEXEC: i32 = 0o2000000;
+    const NETLINK_SOCK_DIAG: i32 = 4;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_DUMP: u16 = 0x300;
+    const NLMSG_ERROR: u16 = 2;
+    const NLMSG_DONE: u16 = 3;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    const INET_DIAG_SKMEMINFO: u16 = 7;
+    const SK_MEMINFO_SNDBUF: usize = 3;
+    const SK_MEMINFO_WMEM_QUEUED: usize = 5;
+    /// The size of `struct nlmsghdr`.
+    const NLMSG_HDRLEN: usize = 16;
+    /// The size of `struct inet_diag_req_v2`.
+    const REQ_LEN: usize = 56;
+    /// The size of `struct inet_diag_msg`.
+    const DIAG_MSG_LEN: usize = 72;
+    /// `struct sockaddr_nl`.
+    #[repr(C)]
+    struct SockaddrNl {
+        family: u16,
+        pad: u16,
+        pid: u32,
+        groups: u32,
+    }
+    fn word(b: &[u8], at: usize) -> u32 {
+        u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn half(b: &[u8], at: usize) -> u16 {
+        u16::from_ne_bytes(b[at..at + 2].try_into().unwrap())
+    }
+
+    // SAFETY: socket(2) takes no pointers.
+    let fd = unsafe {
+        libc::socket(
+            AF_NETLINK,
+            libc::SOCK_DGRAM | SOCK_CLOEXEC,
+            NETLINK_SOCK_DIAG,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a socket this function owns; dropping it closes it.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    // nlmsghdr, then inet_diag_req_v2: family, protocol, the extensions
+    // wanted, a pad byte, the states (all), and a zero inet_diag_sockid (48
+    // bytes), which a dump does not use.
+    let mut req = Vec::with_capacity(NLMSG_HDRLEN + REQ_LEN);
+    req.extend_from_slice(&((NLMSG_HDRLEN + REQ_LEN) as u32).to_ne_bytes());
+    req.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    req.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    req.extend_from_slice(&1u32.to_ne_bytes());
+    req.extend_from_slice(&0u32.to_ne_bytes());
+    req.extend_from_slice(&[
+        libc::AF_INET as u8,
+        libc::IPPROTO_TCP as u8,
+        1 << (INET_DIAG_SKMEMINFO - 1),
+        0,
+    ]);
+    req.extend_from_slice(&u32::MAX.to_ne_bytes());
+    req.extend_from_slice(&[0u8; 48]);
+    assert_eq!(req.len(), NLMSG_HDRLEN + REQ_LEN);
+    let kernel = SockaddrNl {
+        family: AF_NETLINK as u16,
+        pad: 0,
+        pid: 0,
+        groups: 0,
+    };
+    // SAFETY: `req` and `kernel` are live for the call, with their lengths.
+    let sent = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            req.as_ptr().cast(),
+            req.len(),
+            0,
+            (&kernel as *const SockaddrNl).cast(),
+            std::mem::size_of::<SockaddrNl>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0u8; 1 << 16];
+    let mut found = None;
+    loop {
+        // SAFETY: `buf` is live and writable for its length.
+        let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        let mut at = 0;
+        while at + NLMSG_HDRLEN <= n {
+            let len = word(&buf, at) as usize;
+            if len < NLMSG_HDRLEN || at + len > n {
+                return Err(io::Error::other("a truncated netlink message"));
+            }
+            match half(&buf, at + 4) {
+                NLMSG_DONE => return Ok(found),
+                NLMSG_ERROR => {
+                    let errno = word(&buf, at + NLMSG_HDRLEN) as i32;
+                    return Err(io::Error::from_raw_os_error(-errno));
+                }
+                SOCK_DIAG_BY_FAMILY if len >= NLMSG_HDRLEN + DIAG_MSG_LEN => {
+                    let msg = &buf[at + NLMSG_HDRLEN..at + len];
+                    // inet_diag_msg: family, state, timer, retrans, then the
+                    // sockid, whose ports are in network order.
+                    let sport = u16::from_be_bytes([msg[4], msg[5]]);
+                    let dport = u16::from_be_bytes([msg[6], msg[7]]);
+                    if sport == local && dport == remote {
+                        let mut a = DIAG_MSG_LEN;
+                        while a + 4 <= msg.len() {
+                            let alen = half(msg, a) as usize;
+                            if alen < 4 || a + alen > msg.len() {
+                                break;
+                            }
+                            if half(msg, a + 2) == INET_DIAG_SKMEMINFO
+                                && alen >= 4 + 4 * (SK_MEMINFO_WMEM_QUEUED + 1)
+                            {
+                                found = Some((
+                                    word(msg, a + 4 + 4 * SK_MEMINFO_WMEM_QUEUED),
+                                    word(msg, a + 4 + 4 * SK_MEMINFO_SNDBUF),
+                                ));
+                            }
+                            a += (alen + 3) & !3;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            at += (len + 3) & !3;
+        }
+    }
 }
 
 /// Connect to `addr` with `SO_RCVBUF` set to `size` before the connect.

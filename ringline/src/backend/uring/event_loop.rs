@@ -3164,6 +3164,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// socket. A future already waiting on the socket is left to the poll's
     /// completion.
     fn wake_writable_if_unblocked(&mut self, conn_index: u32) {
+        self.unblock_writable(conn_index, None);
+    }
+
+    /// As `wake_writable_if_unblocked`, when what unblocked the future is a
+    /// send that waited for room, or one parked on a retry list, going into
+    /// the kernel: that send may take the room, so the future gets
+    /// `Recheck`, as on the `POLLOUT` of a poll it waits on, and waits for
+    /// the send to leave the kernel before it arms.
+    fn recheck_writable_if_unblocked(&mut self, conn_index: u32) {
+        self.unblock_writable(conn_index, Some(WritableEvent::Recheck));
+    }
+
+    fn unblock_writable(&mut self, conn_index: u32, event: Option<WritableEvent>) {
         let state = &mut self.driver.send_queues[conn_index as usize];
         if state.writable_blocked
             && state.queue.is_empty()
@@ -3172,15 +3185,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && let Some(task) = state.writable_task.take()
         {
             state.writable_blocked = false;
+            if let Some(event) = event {
+                state.writable_event = Some((task, event));
+            }
             self.executor.wake_task(task);
         }
     }
 
-    /// The resubmit of `conn_index`'s send that waited for room, parked on a
-    /// retry list, went through: wake a `writable` future that waited for it.
+    /// A send of `conn_index` parked on a retry list went through: clear
+    /// `resubmit_queued`, and wake a `writable` future that waited for it.
     fn resubmit_pushed(&mut self, conn_index: u32) {
         if std::mem::take(&mut self.driver.send_queues[conn_index as usize].resubmit_queued) {
-            self.wake_writable_if_unblocked(conn_index);
+            self.recheck_writable_if_unblocked(conn_index);
         }
     }
 
@@ -3258,9 +3274,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         };
         // A `writable` future waiting for this send goes on only once it is
-        // in the kernel; until a retry pushes it, it counts as queued.
+        // in the kernel, and then waits for it to leave; until a retry
+        // pushes it, it counts as queued.
         if pushed {
-            self.wake_writable_if_unblocked(conn_index);
+            self.recheck_writable_if_unblocked(conn_index);
         } else {
             self.driver.send_queues[conn_index as usize].resubmit_queued = true;
         }
@@ -3939,10 +3956,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .is_err()
             {
                 // SQ full: retry next tick (`drain_zc_retries`), as for a partial.
+                // Until it goes, a `writable` future counts it as queued.
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_zc_retries
                     .push((conn_index, generation, slab_idx));
+                self.driver.send_queues[conn_index as usize].resubmit_queued = true;
             }
             return;
         }
@@ -19352,11 +19371,11 @@ mod tests {
     /// comes back short and waits on a one-shot poll; the `POLLOUT` resubmits
     /// it and it gets `EAGAIN`, which arms the multishot poll. A gate waits
     /// for the send, arming nothing. The multishot poll's `POLLOUT` resubmits
-    /// the send and wakes the gate, which arms a probe: on a peer that has
-    /// not half-closed the kernel completes it only once the socket is
-    /// writable, and here it does not. The multishot poll's next `POLLOUT`
-    /// ends the gate's wait, and the `Close` cancels the probe still in the
-    /// kernel.
+    /// the send and wakes the gate, which waits for the send to finish and
+    /// then arms a probe: on a peer that has not half-closed the kernel
+    /// completes it only once the socket is writable, and here it does not.
+    /// The multishot poll's next `POLLOUT` ends the gate's wait, and the
+    /// `Close` cancels the probe still in the kernel.
     #[test]
     fn a_writable_gate_after_eagain_on_a_pollout_wakes_on_the_multishot_pollout() {
         let mut el = make_test_loop();
@@ -19384,9 +19403,16 @@ mod tests {
                 .waiting_send
                 .is_none()
         );
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 60, .. }
+            ),
+            "no poll while the send is in the kernel"
+        );
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
         assert_last_poll(&el, probe, false);
         assert_eq!(seen.get(), None);
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, GATE_F_MORE);
         assert_eq!(seen.get(), Some(Ok(())));
 
@@ -19418,7 +19444,8 @@ mod tests {
 
     /// A gate on a connection whose send waits for room waits for the send:
     /// it arms nothing, the send's `POLLOUT` resubmits it and wakes the gate,
-    /// which then waits on the socket, and the next `POLLOUT` ends its wait.
+    /// which arms nothing while the send is in the kernel and then waits on
+    /// the socket, and the next `POLLOUT` ends its wait.
     #[test]
     fn a_writable_gate_waits_for_a_send_waiting_for_room() {
         let mut el = make_test_loop();
@@ -19441,7 +19468,16 @@ mod tests {
             "the send was resubmitted"
         );
         assert_eq!(seen.get(), None, "the send's POLLOUT is not the gate's");
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 60, .. }
+            ),
+            "no poll while the send is in the kernel"
+        );
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
         assert_last_poll(&el, poll, false);
+        assert_eq!(seen.get(), None);
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
         assert_eq!(seen.get(), Some(Ok(())));
     }
@@ -19667,8 +19703,8 @@ mod tests {
 
     /// A send made while the gate waits on a probe comes back short and waits
     /// on the multishot poll. The probe's `POLLOUT` resubmits it, and the
-    /// gate, since the send may take the room, looks again: it arms a new
-    /// probe, whose `POLLOUT` after the send has finished ends its wait.
+    /// gate, since the send may take the room, waits for it to finish, then
+    /// arms a new probe, whose `POLLOUT` ends its wait.
     #[test]
     fn a_probe_pollout_resubmits_a_send_waiting_for_room() {
         let mut el = make_test_loop();
@@ -19701,50 +19737,185 @@ mod tests {
         ));
         el.poll_ready_tasks();
         assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 60, .. }
+            ),
+            "no probe while the send is in the kernel"
+        );
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
         assert_last_poll(&el, probe, false);
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
         dispatch_and_poll(&mut el, probe, ready, 0);
         assert_eq!(seen.get(), Some(Ok(())));
     }
 
     /// On a stalled peer: a send waits on a one-shot poll and the gate waits
-    /// for it. The backstop resubmits the send, which wakes the gate, and the
-    /// gate joins the armed poll. The send gets `EAGAIN` and waits on that
-    /// poll again. The poll's `POLLOUT` resubmits the send; the gate looks
-    /// again instead of resolving, and arms a poll of its own.
-    #[test]
-    fn a_writable_gate_does_not_resolve_on_the_pollout_that_resubmits_a_send() {
-        let mut el = make_test_loop();
-        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
-        let poll = pollout_ud(&el, conn_index);
+    /// for it. The backstop resubmits the send, which wakes the gate with a
+    /// `Recheck`, and the gate waits for the send to leave the kernel. The
+    /// send gets `EAGAIN` and waits on its poll again. Returns the
+    /// connection, the send and the gate.
+    fn gate_joined_a_waiting_send(
+        el: &mut AsyncEventLoop<NoopHandler>,
+    ) -> (u32, UserData, GateSeen) {
+        let (conn_index, _slot, ud) = stage_send(el, &[7u8; 100]);
         el.test_dispatch_cqe(ud.raw(), 40, 0);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let seen = gate_task(&mut el, ctx);
+        let seen = gate_task(el, ctx);
 
         el.handle_send_backstop();
         el.poll_ready_tasks();
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
         let state = &el.driver.send_queues[conn_index as usize];
         assert!(state.waiting_send.is_some(), "the send waits again");
-        assert_eq!(
-            state.send_poll,
-            SendPoll::OneShot,
-            "on the poll the gate joined"
-        );
+        assert_eq!(state.send_poll, SendPoll::OneShot, "on its own poll");
         assert_eq!(seen.get(), None);
+        (conn_index, ud, seen)
+    }
 
-        el.driver.ring.last_pushed = None;
+    /// The poll's `POLLOUT` resubmits the send the gate waits for; the gate
+    /// does not resolve, and arms nothing while the send is in the kernel. Once
+    /// the send has finished it arms a poll of its own, and resolves on its
+    /// `POLLOUT`.
+    #[test]
+    fn a_writable_gate_does_not_resolve_on_the_pollout_that_resubmits_a_send() {
+        let mut el = make_test_loop();
+        let (conn_index, ud, seen) = gate_joined_a_waiting_send(&mut el);
+        let poll = pollout_ud(&el, conn_index);
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
         assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 60, .. }
+            ),
+            "no poll while the send is in the kernel"
+        );
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
         assert_last_poll(&el, poll, false);
-        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        assert_eq!(seen.get(), None);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// A socket that reports `POLLOUT` and refuses the send (`EAGAIN`, as
+    /// under TCP memory pressure): the send resubmitted on the poll's
+    /// `POLLOUT` gets `EAGAIN` again, and waits on a multishot poll, which
+    /// reports only changes. Had the gate armed a one-shot poll meanwhile,
+    /// the send would wait on that, whose `POLLOUT` resubmits it at once,
+    /// and the two would loop. Once the multishot poll lets the send finish,
+    /// the gate probes the socket.
+    #[test]
+    fn a_send_refused_after_a_gate_s_recheck_waits_on_a_multishot_poll() {
+        let mut el = make_test_loop();
+        let (conn_index, ud, seen) = gate_joined_a_waiting_send(&mut el);
+        let poll = pollout_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        dispatch_and_poll(&mut el, ud.raw(), -libc::EAGAIN, 0);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::Multi,
+            "the send waits on a multishot poll, not on one the gate armed"
+        );
+        assert_waits_on_poll(&el, conn_index, true);
+        assert_eq!(seen.get(), None);
+
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, GATE_F_MORE);
+        assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
+        let probe = probe_ud(&el, conn_index);
+        assert_last_poll(&el, probe, false);
+        dispatch_and_poll(&mut el, probe, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// The loop a re-arm on `Recheck` made, on a socket that reports
+    /// `POLLOUT` and refuses the send (`EAGAIN`, as under TCP memory
+    /// pressure): the gate arms its one-shot poll while a send is in the
+    /// kernel, the send gets `EAGAIN` and waits on that poll, and the poll's
+    /// `POLLOUT` resubmits it. The gate neither resolves nor arms while the
+    /// send is in the kernel, so the send's next `EAGAIN` arms the multishot
+    /// poll, which reports only changes.
+    #[test]
+    fn a_send_refused_on_a_writable_gate_s_poll_moves_to_the_multishot_poll() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        let poll = pollout_ud(&el, conn_index);
+        assert_last_poll(&el, poll, false);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::OneShot,
+            "the send waits on the gate's poll"
+        );
+
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 100, .. }
+            ),
+            "no poll while the send is in the kernel"
+        );
+        dispatch_and_poll(&mut el, ud.raw(), -libc::EAGAIN, 0);
+        assert_waits_on_poll(&el, conn_index, true);
+        assert_eq!(seen.get(), None);
+    }
+
+    /// A zero-copy send that gets `-ENOMEM` is re-sent with plain sends; with
+    /// the SQ full that re-send waits on a retry list, and the gate counts it
+    /// as queued: a `POLLOUT` meanwhile does not end its wait. The push wakes
+    /// the gate, which arms its poll again once the re-send has finished.
+    #[test]
+    fn a_writable_gate_waits_for_a_zero_copy_re_send_on_a_retry_list() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let data = Box::new([7u8; 100]);
+        let iovecs = [libc::iovec {
+            iov_base: data.as_ptr() as *mut _,
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        assert_eq!(slab_idx, 0, "assert_plain_drain expects entry 0");
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let seen = gate_task(&mut el, ConnCtx::new(conn_index, generation));
+        let poll = pollout_ud(&el, conn_index);
+        assert_last_poll(&el, poll, false);
+
+        let zc = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.driver.ring.force_push_failures(1);
+        dispatch_and_poll(&mut el, zc.raw(), -libc::ENOMEM, F_MORE);
+        assert!(el.driver.send_queues[conn_index as usize].resubmit_queued);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), None, "the re-send is not in the kernel yet");
+
+        el.driver.ring.last_pushed = None;
+        el.drain_zc_retries();
+        assert_plain_drain(&el, conn_index);
+        assert!(!el.driver.send_queues[conn_index as usize].resubmit_queued);
+        el.poll_ready_tasks();
+        assert_plain_drain(&el, conn_index);
+        let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, slab_idx as u32);
+        dispatch_and_poll(&mut el, drain.raw(), 100, 0);
+        assert_last_poll(&el, poll, false);
+        assert_eq!(seen.get(), None);
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
         assert_eq!(seen.get(), Some(Ok(())));
     }
 
     /// A resubmit the SQ refuses waits on a retry list. Until the retry
     /// pushes it the gate counts it as queued and arms nothing; the push
-    /// wakes the gate, which then arms its poll.
+    /// wakes the gate, which arms its poll once the send has finished.
     #[test]
     fn a_writable_gate_waits_for_a_resubmit_on_a_retry_list() {
         let mut el = make_test_loop();
@@ -19767,6 +19938,14 @@ mod tests {
         el.drain_copy_retries();
         assert!(!el.driver.send_queues[conn_index as usize].resubmit_queued);
         el.poll_ready_tasks();
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 60, .. }
+            ),
+            "no poll while the send is in the kernel"
+        );
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
         assert_last_poll(&el, poll, false);
         assert_eq!(seen.get(), None);
     }
