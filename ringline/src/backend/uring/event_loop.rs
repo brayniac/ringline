@@ -19521,6 +19521,46 @@ mod tests {
         assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionReset)));
     }
 
+    /// Run `ctx.writable()` as the connection's own task, which the Close
+    /// CQE drops, until it parks or resolves.
+    fn conn_gate_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> GateSeen {
+        let seen: GateSeen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        el.executor.owner_task[ctx.conn_index as usize] = Some(ctx.conn_index);
+        el.executor.task_slab.spawn(
+            ctx.conn_index,
+            Box::pin(async move {
+                let result = ctx.writable().await;
+                record.set(Some(result.map_err(|e| e.kind())));
+            }),
+        );
+        el.executor.ready_queue.push_back(ctx.conn_index);
+        el.poll_ready_tasks();
+        seen
+    }
+
+    /// A reset reaped by a drain, with no poll armed, leaves the gate in the
+    /// connection's own task ready to poll when the drain returns. After its
+    /// second drain the loop polls tasks only if the ready queue is not empty,
+    /// and the Close can then complete and drop the task before the next pass.
+    #[test]
+    fn a_reset_reaped_by_a_drain_readies_the_connection_s_writable_gate() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = conn_gate_task(&mut el, ctx);
+        let poll = pollout_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), None, "blocked on the resubmitted send");
+        el.inject_and_dispatch(ud.raw(), -libc::ECONNRESET);
+        assert!(
+            el.executor.ready_queue.contains(&conn_index),
+            "the gate's task is ready after the drain: {:?}",
+            el.executor.ready_queue
+        );
+    }
+
     /// A reset's report on the poll of a send waiting for room holds
     /// `POLLOUT` as well as `POLLERR` and `POLLHUP`: the send is resubmitted,
     /// and the gate that waits for it fails at once, not after the resubmit.
