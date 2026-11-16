@@ -1,12 +1,12 @@
 {
-  "about": "Experiment D's arms and cells for send-admission-d.toml (docs/send-admission-design.md, section 4). An experiment is one cell's parameters with one arm's, plus bins_artifact, host and rep. W4's k values are the model's (docs/journal/2026-11-send-admission-d.md on branch docs/send-admission-expC, section C1-D) and follow from the calibration's h_p: the ungated limit is floor(504 / h_p). The arm with Experiment C's order runs after C's decision; replace its order (and budget) with that order's.",
+  "about": "Experiment D's arms and cells for send-admission-d.toml (docs/send-admission-design.md, section 4). An experiment is one cell's parameters with one arm's, plus bins_artifact, host and rep. W4's k values are the model's (docs/journal/2026-11-send-admission-d.md on branch docs/send-admission-expC, section C1-D) and follow from the calibration's h_p: the ungated limit is floor(504 / h_p). The arm with Experiment C's order uses O7w (budget-idle, R = 32), which the owner chose on 2026-11-15 from the orders C's rule passes.",
   "arms": {
     "O0-whole": {"order": "strict", "stream_piece": "0", "stream_gate": "off"},
     "O7w-whole": {"order": "budget-idle", "budget": "32", "stream_piece": "0", "stream_gate": "off"},
     "O0-ungated-128k": {"order": "strict", "stream_piece": "131072", "stream_gate": "off"},
     "O0-gated-64k": {"order": "strict", "stream_piece": "65536", "stream_gate": "on"},
     "O0-gated-128k": {"order": "strict", "stream_piece": "131072", "stream_gate": "on"},
-    "C-order-gated-128k": {"order": "REPLACE-WITH-C-ORDER", "stream_piece": "131072", "stream_gate": "on"}
+    "C-order-gated-128k": {"order": "budget-idle", "budget": "32", "stream_piece": "131072", "stream_gate": "on"}
   },
   "cells": {
     "U": {"workload": "U", "closed_loop": "1000", "closed_warmup": "10", "head_rcvbuf": "524288", "large_size": "7340032", "small_conns": "0", "small_rate": "0", "stall_peers": "0", "tcp_wmem_max": "1048576"},
