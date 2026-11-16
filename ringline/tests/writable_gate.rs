@@ -79,6 +79,10 @@ struct Seen {
     /// The same, read just after the gate resolved, if it resolved early.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     skmem_at_early: Option<(u32, u32)>,
+    /// The refills the second fill took: one, and one more each time the
+    /// socket became writable while the gate waited.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    refill_attempts: Option<u32>,
     /// Whether a send was queued behind the one waiting for room when the
     /// close was requested.
     queued_at_close: Option<bool>,
@@ -394,7 +398,9 @@ async fn drop_while_waiting(conn: &mut Connection) {
 /// so the poll reports POLLOUT; then fill it again with whole sends until
 /// the kernel's figures say the socket is not writable (`sk_wmem_queued`
 /// above two thirds of `sk_sndbuf`), with no send waiting. The gate must
-/// wait until the client reads again.
+/// wait until the client reads again. If the gate resolves and the socket
+/// has become writable meanwhile, as when the autotuner grows `sk_sndbuf`,
+/// it fills again and looks again, up to four times.
 #[cfg(target_os = "linux")]
 async fn whole_sends_fill(conn: &mut Connection) {
     static CHUNK: [u8; CHUNK_LEN] = [7; CHUNK_LEN];
@@ -419,70 +425,90 @@ async fn whole_sends_fill(conn: &mut Connection) {
         SERVER_PORT.load(Ordering::SeqCst),
         CLIENT_PORT.load(Ordering::SeqCst),
     );
+    // The autotuner can grow `sk_sndbuf`, up to tcp_wmem's maximum, while
+    // the gate waits, which makes the socket writable again: that says
+    // nothing of the gate, so fill again and look again, a few times.
+    const REFILL_ATTEMPTS: u32 = 4;
     let limit = 4 * capacity / CHUNK_LEN + 64;
     let mut sends = 0;
     let mut waited = false;
     let mut fewest_free = u64::MAX;
-    let at_gate = loop {
-        let mem = match server_skmem(ports.0, ports.1) {
-            Ok(Some(mem)) => mem,
-            other => {
+    let mut attempts = 0;
+    let (at_gate, at_early, gate, early) = loop {
+        attempts += 1;
+        let at_gate = loop {
+            let mem = match server_skmem(ports.0, ports.1) {
+                Ok(Some(mem)) => mem,
+                other => {
+                    record(|s| {
+                        s.note = Some(format!(
+                            "no memory figures for the server socket {ports:?}: {other:?}"
+                        ))
+                    });
+                    return;
+                }
+            };
+            if !kernel_writable(mem) {
+                break mem;
+            }
+            if sends == limit {
                 record(|s| {
                     s.note = Some(format!(
-                        "no memory figures for the server socket {ports:?}: {other:?}"
+                        "{sends} whole sends left the socket writable: (wmem_queued, sndbuf) {mem:?}"
                     ))
                 });
                 return;
             }
+            let mut sent = conn.send(&CHUNK).expect("send");
+            fewest_free = fewest_free.min(ringline::send_admission_counters().main_free);
+            let done = ringline::timeout(Duration::from_secs(5), &mut sent).await;
+            if !matches!(done, Ok(Ok(_))) {
+                record(|s| {
+                    s.note = Some(format!(
+                        "a send of the second fill did not settle: {done:?}"
+                    ))
+                });
+                return;
+            }
+            waited |= sent.waited_for_room();
+            sends += 1;
         };
-        if !kernel_writable(mem) {
-            break mem;
+        eprintln!(
+            "whole sends: the first fill held {capacity} B before a send waited; \
+             after {sends} sends of {CHUNK_LEN} B in the second (attempt {attempts}), \
+             (wmem_queued, sndbuf) {at_gate:?}, with at fewest {fewest_free} of \
+             {SLOTS} pool slots free"
+        );
+        let mut gate = Box::pin(conn.writable());
+        let early = ringline::timeout(Duration::from_millis(300), gate.as_mut()).await;
+        if early.is_err() {
+            break (at_gate, None, gate, early);
         }
-        if sends == limit {
-            record(|s| {
-                s.note = Some(format!(
-                    "{sends} whole sends left the socket writable: (wmem_queued, sndbuf) {mem:?}"
-                ))
-            });
-            return;
+        let at_early = server_skmem(ports.0, ports.1).ok().flatten();
+        if at_early.is_some_and(kernel_writable) && attempts < REFILL_ATTEMPTS {
+            eprintln!(
+                "whole sends: the gate resolved and the socket became writable, \
+                 {at_gate:?} -> {at_early:?}: filling again"
+            );
+            continue;
         }
-        let mut sent = conn.send(&CHUNK).expect("send");
-        fewest_free = fewest_free.min(ringline::send_admission_counters().main_free);
-        let done = ringline::timeout(Duration::from_secs(5), &mut sent).await;
-        if !matches!(done, Ok(Ok(_))) {
-            record(|s| {
-                s.note = Some(format!(
-                    "a send of the second fill did not settle: {done:?}"
-                ))
-            });
-            return;
-        }
-        waited |= sent.waited_for_room();
-        sends += 1;
-    };
-    eprintln!(
-        "whole sends: the first fill held {capacity} B before a send waited; \
-         the second fill sent {sends} sends of {CHUNK_LEN} B, leaving \
-         (wmem_queued, sndbuf) {at_gate:?}, with at fewest {fewest_free} of \
-         {SLOTS} pool slots free"
-    );
-    let mut gate = std::pin::pin!(conn.writable());
-    let early = ringline::timeout(Duration::from_millis(300), gate.as_mut()).await;
-    let at_early = if early.is_ok() {
-        server_skmem(ports.0, ports.1).ok().flatten()
-    } else {
-        None
+        break (at_gate, at_early, gate, early);
     };
     record(|s| {
         s.refill_waited = Some(waited);
         s.refill_fewest_free = Some(fewest_free);
+        s.refill_attempts = Some(attempts);
         s.skmem_at_gate = Some(at_gate);
         s.skmem_at_early = at_early;
         s.pending_while_full = Some(early.is_err());
         s.filled_at = Some(Instant::now());
     });
     REFILLED.store(true, Ordering::SeqCst);
-    let gate = ringline::timeout(Duration::from_secs(10), gate).await;
+    let gate = if early.is_ok() {
+        early
+    } else {
+        ringline::timeout(Duration::from_secs(10), gate).await
+    };
     let gate = gate_result(gate);
     record(|s| {
         s.gate = Some(gate);
@@ -1016,14 +1042,17 @@ fn a_socket_filled_by_whole_sends_is_not_writable() {
         "precondition: the socket was writable when the gate started"
     );
     if seen.pending_while_full != Some(true) {
+        let attempts = seen.refill_attempts.unwrap_or(0);
         let verdict = match seen.skmem_at_early {
-            Some(mem) if kernel_writable(mem) => {
-                "the kernel reported it writable by then: the socket changed, not the gate"
-            }
+            Some(mem) if kernel_writable(mem) => format!(
+                "the kernel reported it writable by then, as in each of {attempts} refills: \
+                 inconclusive, the socket changed, not the gate"
+            ),
             Some(_) => {
                 "the kernel still reported it not writable: the gate resolved on a full socket"
+                    .to_string()
             }
-            None => "its figures could not be read then",
+            None => "its figures could not be read then".to_string(),
         };
         panic!(
             "the gate resolved within 300 ms of starting on a socket the kernel reported \
