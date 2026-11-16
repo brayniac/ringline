@@ -4,11 +4,17 @@
 Each argument is a directory made by `systemslab artifact download-all <id>`
 for one run of send-admission-d.toml. The RUN and WORKER lines come from the
 job's logs.json; admission-load's and admission-server's JSON, worker.txt,
-ss.log and the nstat and sockstat files come from results.tgz. The SERVER log
-line holds only a summary, so a run without results.tgz is skipped, as is a
-run whose files or log lines do not parse; each skip is printed with its
-reason. send-admission-c0-report.py's readers of logs.json and results.tgz
-are used.
+ss.log and the nstat and sockstat files come from results.tgz.
+send-admission-c0-report.py's logs.json reader and RUN parser are used.
+
+A run whose logs.json has no RUN line is skipped. A run with a RUN line whose
+results cannot be read is a failed run, counted in its cell and arm with its
+reason: the server had no rl-work-0 thread (named from the job's "no
+rl-work-0 thread" line), there is no results.tgz (the SERVER log line holds
+only a summary), results.tgz is truncated or not a gzip tar, it has no
+load.json or server.json, or they do not parse or lack a field. Every skip
+and failed run is printed on stdout with its reason. A failed run's figures
+are unknown, so every figure below is over the runs that did not fail.
 
 An arm is (order, budget, stream_piece, stream_gate). A cell is (workload,
 stall_peers, tcp_wmem_max, drainers, drain_read_bps, pipeline, admit_ms,
@@ -61,7 +67,8 @@ arm with the gate on:
   or below 10 ms in every run (the maximum over the cell's runs; the median
   is printed beside it), and has no more fast small replies beyond admit_ms
   than O0 whole (counted per run, since O0 whole has more runs). A cell the
-  arm or O0 whole did not run fails the condition.
+  arm or O0 whole did not run, or in which a run of the arm failed, fails
+  the condition.
 - Among the passing arms, the larger stream_piece is named, with its CPU per
   byte in U against O0 whole's: above twice, the arm goes to the owner before
   it is chosen.
@@ -70,9 +77,10 @@ arm with the gate on:
 Then the prediction's refutation conditions, each printed with its result
 for each gated arm and cell: the fast small p99 above 10 ms in a run, a
 7 MiB reply (in U, a closed-loop reply) or a W5 slow reader's reply not
-completed, fewer than 3/4 of the pool free during a 7 MiB reply in W4 (no
-free-slot figure is reported as such, not as holding), or a stalled peer's
-gated piece that waited for room in W4.
+completed, fewer than 3/4 of the pool free during a 7 MiB reply in W4 (a
+head measured below 3/4 refutes it even if other heads have no free-slot
+figure; with none below, a head with no figure is reported as such, not as
+holding), or a stalled peer's gated piece that waited for room in W4.
 """
 
 import importlib.util
@@ -82,7 +90,8 @@ import pathlib
 import re
 import sys
 import tarfile
-from collections import defaultdict
+import zlib
+from collections import Counter, defaultdict
 from statistics import median
 
 here = pathlib.Path(__file__).resolve().parent
@@ -200,39 +209,70 @@ def sockstat_mem(data):
     return int(m.group(1)) if m else None
 
 
-def read_run(root):
-    """The RUN parameters, cpu_ns, and the run's files from results.tgz."""
-    run = worker = None
-    for text in c0.log_lines(root):
+class RunFailed(Exception):
+    """A run with a RUN line whose results cannot be read."""
+
+
+def read_logs(root):
+    """The RUN parameters, cpu_ns from the WORKER line, and the job's "no
+    rl-work-0 thread" line if it printed one. SystemExit if there is no RUN
+    line."""
+    run = worker = no_thread = None
+    try:
+        lines = c0.log_lines(root)
+    except (ValueError, KeyError, TypeError, OSError) as e:
+        raise SystemExit(f"{root}: logs.json does not read: {e!r}")
+    for text in lines:
         if text.startswith("RUN "):
             run = c0.parse_run(text)
         elif text.startswith("WORKER "):
             worker = parse_worker(text)
+        elif text.startswith("no rl-work-0 thread"):
+            no_thread = text.strip()
     if run is None:
-        raise SystemExit(f"{root}: no RUN line")
-    files = tgz_files(root)
+        raise SystemExit(f"{root}: no RUN line" + (f" ({no_thread})" if no_thread else ""))
+    return run, worker, no_thread
+
+
+def read_files(root, worker):
+    """cpu_ns, load.json, server.json and the run's files from results.tgz.
+    RunFailed if they cannot be read."""
+    try:
+        files = tgz_files(root)
+    except (tarfile.TarError, EOFError, OSError, zlib.error) as e:
+        raise RunFailed(f"results.tgz does not read: {e!r}")
     if files is None:
-        raise SystemExit(f"{root}: no results.tgz (the SERVER line holds only a summary)")
+        raise RunFailed("no results.tgz (the SERVER line holds only a summary)")
     for name in ("load.json", "server.json"):
         if name not in files:
-            raise SystemExit(f"{root}: results.tgz has no {name}")
+            raise RunFailed(f"results.tgz has no {name}")
     if "worker.txt" in files:
         worker = parse_worker(files["worker.txt"].decode(errors="replace"))
     try:
         load = json.loads(files["load.json"])
         server = json.loads(files["server.json"])
     except ValueError as e:
-        raise SystemExit(f"{root}: load.json or server.json does not parse: {e}")
-    return run, worker, load, server, files
+        raise RunFailed(f"load.json or server.json does not parse: {e}")
+    return worker, load, server, files
 
 
 def one(root):
+    """A run's row: its summary, or, for a failed run, its RUN parameters
+    and the reason in "failed"."""
     root = pathlib.Path(root)
+    run, worker, no_thread = read_logs(root)
     try:
-        run, cpu_ns, load, server, files = read_run(root)
-        return summarise_run(root, run, cpu_ns, load, server, files)
-    except (KeyError, TypeError, ValueError, IndexError) as e:
-        raise SystemExit(f"{root}: unexpected content: {e!r}")
+        if no_thread:
+            raise RunFailed(no_thread)
+        cpu_ns, load, server, files = read_files(root, worker)
+        try:
+            row = summarise_run(root, run, cpu_ns, load, server, files)
+        except (KeyError, TypeError, ValueError, IndexError) as e:
+            raise RunFailed(f"unexpected content: {e!r}")
+    except RunFailed as e:
+        return dict(root=str(root), run=run, failed=str(e))
+    row["failed"] = None
+    return row
 
 
 def summarise_run(root, run, cpu_ns, load, server, files):
@@ -336,7 +376,7 @@ def group(rows):
             print(f"warning: {cell_name(cell)}: runs differ in {differ}; split", file=sys.stderr)
         for r in rs:
             arm = tuple(r["run"].get(k, ARM_DEFAULTS[k]) for k in ARM_KEYS)
-            extra = tuple((k, r["run"].get(k)) for k in differ)
+            extra = tuple((k, r["run"].get(k, "-")) for k in differ)
             out[(cell + extra, arm)].append(r)
     return dict(out)
 
@@ -349,7 +389,17 @@ def workload(cell):
     return dict(cell)["workload"]
 
 
-def summarise(rs):
+def failed_str(reasons):
+    return "; ".join(f"{n} x {why}" if n > 1 else why for why, n in Counter(reasons).items())
+
+
+def summarise(all_rs):
+    """The arm's figures over its runs that did not fail; n counts those
+    runs, and failed lists the reasons of the others."""
+    rs = [r for r in all_rs if not r["failed"]]
+    failed = [r["failed"] for r in all_rs if r["failed"]]
+    if not rs:
+        return dict(n=0, failed=failed)
     p99 = [r["fast_p99"] for r in rs if r["fast_p99"] is not None]
     times = [t for r in rs for t in r["head_times"]]
     frees = [r["head_min_free"] for r in rs if r["head_min_free"] is not None]
@@ -364,6 +414,7 @@ def summarise(rs):
     u = [r["u"] for r in rs if r["u"]]
     return dict(
         n=len(rs),
+        failed=failed,
         rc_bad=sum(1 for r in rs if r["rc"] != 0),
         fast_p99_med=median(p99) if p99 else None,
         fast_p99_max=max(p99) if p99 else None,
@@ -411,12 +462,17 @@ def print_tables(groups):
             print("arm                  runs | fast p99 ms: median [range] max | fast bad (per run) | 7MiB ok/n  med ms  max ms | drain ok/n | free min med none | waited (w/sent) | aborts")
         for arm in sorted(arms, key=arm_sort):
             s = arms[arm]
+            failed = f" | FAILED {len(s['failed'])}: {failed_str(s['failed'])}" if s["failed"] else ""
+            if s["n"] == 0:
+                print(f"{arm_name(arm):20} {0:>4} | no run produced results{failed}")
+                continue
             if u:
                 print(
                     f"{arm_name(arm):20} {s['n']:>4} | {spread(s['u_p50'], '.0f'):25} {spread(s['u_p99'], '.0f'):25} | "
                     f"{spread(s['u_cpu_b'], '.3f'):25} {spread(s['u_cpu_reply'], '.0f'):>12} | {s['u_rcvbuf']} | {s['heads_ok']}/{s['heads_n']}"
                     + (f" | no CPU figure in {s['u_cpu_missing']} runs" if s["u_cpu_missing"] else "")
                     + (f" | errors {s['u_errors']}" if s["u_errors"] else "")
+                    + failed
                 )
                 continue
             ab = " ".join(f"{k}={v}" for k, v in sorted(s["aborts"].items()) if v) or "none"
@@ -427,22 +483,29 @@ def print_tables(groups):
                 f"{s['slow_ok']:>3}/{s['slow_n']:<3}  | {fmt(s['free_min'], '.0f'):>4} {fmt(s['free_med'], '.0f'):>4} {s['heads_no_free']:>4} | "
                 f"{waited_str(s['waited'])} | {ab}"
                 + (f" | load_rc!=0 in {s['rc_bad']}" if s["rc_bad"] else "")
+                + failed
             )
     return by_cell
 
 
 def memory(groups):
-    """Print each run's memory figures; return the runs with pressure."""
+    """Print each run's memory figures; return the runs with pressure, and
+    the number of runs that did not fail and have no pressure figure."""
     print("\n== TCP memory per run: TcpExtTCPMemoryPressures delta, sockstat TCP mem pages before -> after")
-    pressured = []
+    pressured, no_figure = [], 0
     for (cell, arm), rs in sorted(groups.items(), key=lambda x: (x[0][0], arm_sort(x[0][1]))):
         for r in sorted(rs, key=lambda r: r["run"].get("rep", "")):
+            if r["failed"]:
+                print(f"{cell_name(cell)} | {arm_name(arm)} rep {r['run'].get('rep')}: failed ({r['failed']})")
+                continue
             d = r["mem_pressures"]
+            if d is None:
+                no_figure += 1
             b, a = r["sock_mem"]
             print(f"{cell_name(cell)} | {arm_name(arm)} rep {r['run'].get('rep')}: pressures {fmt(d, 'd')}, mem {fmt(b, 'd')} -> {fmt(a, 'd')}")
             if d:
                 pressured.append(f"{cell_name(cell)} | {arm_name(arm)} rep {r['run'].get('rep')} ({d})")
-    return pressured
+    return pressured, no_figure
 
 
 def calibration(groups):
@@ -454,6 +517,9 @@ def calibration(groups):
         k = int(dict(cell)["stall_peers"])
         drainers = dict(cell)["drainers"]
         for r in sorted(rs, key=lambda r: r["run"].get("rep", "")):
+            if r["failed"]:
+                print(f"{workload(cell):9} {arm_name(arm):20} k={k} rep {r['run'].get('rep')}: failed ({r['failed']})")
+                continue
             sock = "; ".join(
                 f"{kind} tb {v[0]} w {v[1]}" for kind, v in sorted(r["ss"].items())
             ) or "no ss.log"
@@ -480,7 +546,7 @@ def u_cost(by_cell):
         cells = by_cell[cell]
         o0 = next((v for a, v in cells.items() if is_o0_whole(a)), None)
         print(cell_name(cell))
-        if o0 is None or not o0["u_cpu_b"]:
+        if o0 is None or not o0.get("u_cpu_b"):
             print("  no O0 whole runs with a CPU figure")
             continue
         base_b = median(o0["u_cpu_b"])
@@ -494,7 +560,9 @@ def u_cost(by_cell):
             if is_o0_whole(arm):
                 continue
             s = cells[arm]
-            if not s["u_cpu_b"]:
+            if s["failed"]:
+                print(f"  {arm_name(arm)}: {len(s['failed'])} runs failed ({failed_str(s['failed'])})")
+            if not s.get("u_cpu_b"):
                 print(f"  {arm_name(arm)}: no CPU figure")
                 continue
             ratio = median(s["u_cpu_b"]) / base_b if base_b else None
@@ -512,7 +580,7 @@ def u_cost(by_cell):
     return ratios
 
 
-def decision(by_cell, ratios, pressured):
+def decision(by_cell, ratios, pressured, no_figure):
     print("\n== decision (design, Experiment D)")
     arms = sorted({a for cells in by_cell.values() for a in cells if is_gated(a)}, key=arm_sort)
     if not arms:
@@ -539,6 +607,11 @@ def decision(by_cell, ratios, pressured):
             if s is None:
                 reasons.append(f"{name}: this arm did not run")
                 continue
+            if s["failed"]:
+                print(f"  {arm_name(arm)} | {name}: FAILED runs {len(s['failed'])}: {failed_str(s['failed'])}")
+                reasons.append(f"{name}: failed runs {len(s['failed'])}")
+            if s["n"] == 0:
+                continue
             checks += 1
             ok_heads = s["heads_n"] > 0 and s["heads_ok"] == s["heads_n"]
             print(f"  {arm_name(arm)} | {name}: 7 MiB {s['heads_ok']}/{s['heads_n']} {'ok' if ok_heads else 'FAIL'}", end="")
@@ -557,8 +630,8 @@ def decision(by_cell, ratios, pressured):
             )
             if not ok_p99:
                 reasons.append(f"{name}: fast p99 {fmt(s['fast_p99_max'])} ms in a run > 10 ms")
-            if o0 is None:
-                print("; O0 whole did not run: FAIL")
+            if o0 is None or o0["n"] == 0:
+                print("; O0 whole has no run with results: FAIL")
                 reasons.append(f"{name}: no O0 whole runs to compare")
                 continue
             ok_bad = s["fast_bad_per_run"] <= o0["fast_bad_per_run"]
@@ -592,8 +665,11 @@ def decision(by_cell, ratios, pressured):
         print("runs with TCP memory pressure (TcpExtTCPMemoryPressures rose):")
         for p in pressured:
             print(f"    {p}")
-    else:
-        print("no run recorded TCP memory pressure")
+    figured = sum(s["n"] for cells in by_cell.values() for s in cells.values()) - no_figure
+    if not pressured and figured:
+        print(f"no run recorded TCP memory pressure ({figured} runs with a figure)")
+    if no_figure:
+        print(f"no TCP memory-pressure figure in {no_figure} runs")
 
 
 def prediction(by_cell):
@@ -608,6 +684,11 @@ def prediction(by_cell):
                 continue
             s = by_cell[cell][arm]
             name = f"{arm_name(arm)} | {cell_name(cell)}"
+            if s["failed"]:
+                print(f"{name}: FAILED runs {len(s['failed'])}: {failed_str(s['failed'])}")
+            if s["n"] == 0:
+                print(f"{name}\n    no run produced results: no figure for any condition")
+                continue
             checks = []
             if w != "U":
                 if s["fast_p99_max"] is None:
@@ -631,7 +712,14 @@ def prediction(by_cell):
                 ))
             if w == "W4":
                 quarter = 0.75 * s["pool"]
-                if s["heads_no_free"] or s["free_min"] is None:
+                if s["free_min"] is not None and s["free_min"] < quarter:
+                    checks.append((
+                        "3/4 of the pool free during each 7 MiB reply",
+                        False,
+                        f"fewest {s['free_min']} of {s['pool']}"
+                        + (f"; no free-slot figure for {s['heads_no_free']} heads" if s["heads_no_free"] else ""),
+                    ))
+                elif s["heads_no_free"] or s["free_min"] is None:
                     checks.append((
                         "3/4 of the pool free during each 7 MiB reply",
                         None,
@@ -664,20 +752,27 @@ def prediction(by_cell):
 
 
 def main():
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: send-admission-d-report.py RUN_DIR...")
     rows = []
     for a in sys.argv[1:]:
         try:
             rows.append(one(a))
         except SystemExit as e:
-            print(f"skipped: {e}", file=sys.stderr)
+            print(f"skipped: {e}")
+    failed = [r for r in rows if r["failed"]]
+    if failed:
+        print(f"failed runs, counted in their cell and arm: {len(failed)}")
+        for r in failed:
+            print(f"  {r['root']}: {r['failed']}")
     if not rows:
-        raise SystemExit("usage: send-admission-d-report.py RUN_DIR...")
+        raise SystemExit("no run has a RUN line")
     groups = group(rows)
     by_cell = print_tables(groups)
-    pressured = memory(groups)
+    pressured, no_figure = memory(groups)
     calibration(groups)
     ratios = u_cost(by_cell)
-    decision(by_cell, ratios, pressured)
+    decision(by_cell, ratios, pressured, no_figure)
     prediction(by_cell)
 
 

@@ -43,13 +43,17 @@
 # side, picked by the local ports the load writes to ports.txt (SS lines in
 # ss.log). The image's own net.core.rmem_max and wmem_max are recorded before
 # they are raised (core-mem-image.txt), and the paths of the tools the
-# payload calls in tools.txt. The job fails, after stopping the server, if
-# the server has no rl-work-0 thread to read the CPU of.
+# payload calls in tools.txt. If the server has no rl-work-0 thread to read
+# the CPU of, the job stops the server without running the load, and prints
+# "no rl-work-0 thread", the RUN line with load_rc=-1 and STATUS.
 #
 # The job prints a RUN line with every parameter that varies between cells and
 # arms, the WORKER line, then the LOAD JSON line and a SERVER line without the
 # per-large-reply records and the free-slot samples (server-summary.json),
-# which run to hundreds of KiB. results.tgz holds load.json, the full
+# which run to hundreds of KiB, and last a STATUS line with the load's exit
+# code. The payload exits 0 whatever the load's exit code, so that the job
+# keeps its artifacts; send-admission-d-report.py counts a run whose results
+# it cannot read as failed. results.tgz holds load.json, the full
 # server.json, server-summary.json, both logs, ports.txt, ss.log, worker.txt,
 # tools.txt and the sysctl, sockstat and nstat files.
 # send-admission-d-report.py reads results.tgz.
@@ -134,6 +138,7 @@ sudo sysctl -w net.core.rmem_max={core_mem_max} net.core.wmem_max={core_mem_max}
 sudo sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem net.core.rmem_max net.core.wmem_max | tee results/sysctl.txt
 gate=""
 if [ "{stream_gate}" = "on" ]; then gate="--stream-gate"; fi
+runline="RUN workload={workload} small_send={small_send} order={order} budget={budget} small_slots={small_slots} small_slot_size={small_slot_size} stream_piece={stream_piece} stream_gate={stream_gate} host={host} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} core_mem_max={core_mem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} head_rcvbuf={head_rcvbuf} closed_loop={closed_loop} closed_warmup={closed_warmup} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} episode_ms={episode_ms} duration={duration} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} ss_interval={ss_interval} pool_slots={pool_slots} slot_size={slot_size} rep={rep}"
 cat /proc/net/sockstat > results/sockstat-before.txt
 nstat -az TcpExtTCPMemoryPressures > results/nstat-before.txt 2>&1 || true
 last=$(($(nproc) - 1))
@@ -144,7 +149,11 @@ tid=$(ps -L -o tid=,comm= -p "$srv" | grep -w rl-work-0 | head -n 1 | sed 's/^ *
 echo "server pid=$srv worker_tid=$tid"
 if [ -z "$tid" ]; then
   echo "no rl-work-0 thread in pid $srv"; ps -L -o tid,comm -p "$srv"
-  kill -INT $srv; wait $srv; tar czf results.tgz results; exit 1
+  kill -INT $srv; wait $srv
+  echo "$runline load_rc=-1"
+  tar czf results.tgz results
+  echo "STATUS load_rc=-1 no rl-work-0 thread"
+  exit 0
 fi
 sched=/proc/$srv/task/$tid/schedstat
 : > results/ports.txt
@@ -172,11 +181,12 @@ cat /proc/net/sockstat > results/sockstat-after.txt
 nstat -az TcpExtTCPMemoryPressures > results/nstat-after.txt 2>&1 || true
 kill -INT $srv; wait $srv
 echo "WORKER cpu_ns=$((cpu1 - cpu0)) wall_ns=$((wall1 - wall0)) tid=$tid" | tee results/worker.txt
-echo "RUN workload={workload} small_send={small_send} order={order} budget={budget} small_slots={small_slots} small_slot_size={small_slot_size} stream_piece={stream_piece} stream_gate={stream_gate} host={host} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} core_mem_max={core_mem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} head_rcvbuf={head_rcvbuf} closed_loop={closed_loop} closed_warmup={closed_warmup} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} episode_ms={episode_ms} duration={duration} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} ss_interval={ss_interval} pool_slots={pool_slots} slot_size={slot_size} rep={rep} load_rc=$rc"
+echo "$runline load_rc=$rc"
 echo "LOAD $(cat results/load.json)"
 echo "SERVER $(cat results/server-summary.json)"
 cat results/sockstat-before.txt results/sockstat-after.txt results/nstat-before.txt results/nstat-after.txt
 tail -3 results/server.log results/load.log
 tar czf results.tgz results
-[ $rc -eq 0 ] && [ -s results/load.json ] && [ -s results/server.json ]
+echo "STATUS load_rc=$rc"
+exit 0
 '''
