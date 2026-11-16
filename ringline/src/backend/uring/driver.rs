@@ -806,6 +806,12 @@ pub(crate) struct Driver {
     /// `SendPollProbe`s the SQ had no room for: (conn_index, generation).
     /// Drained each tick, with the `SendPollOut` retries.
     pub(crate) pending_send_probe_retries: Vec<(u32, u32)>,
+    /// (conn_index, generation) of connections whose close was requested
+    /// while a `writable` future was registered on them. The event loop
+    /// wakes those futures before it polls tasks (`wake_writable_on_close`):
+    /// the close may not complete, as a drain to a peer that does not read,
+    /// and its `Close` CQE removes the connection's own task.
+    pub(crate) writable_close_wakes: Vec<(u32, u32)>,
     /// Connections with a send waiting for room, as (conn_index, generation),
     /// for `handle_send_backstop`. An entry leaves when the backstop finds nothing
     /// waiting.
@@ -1305,6 +1311,7 @@ impl Driver {
             pending_copy_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
             pending_send_probe_retries: Vec::new(),
+            writable_close_wakes: Vec::new(),
             send_backstop_list: Vec::new(),
             send_backstop_scratch: Vec::new(),
             send_backstop_at: None,
@@ -1689,6 +1696,16 @@ impl Driver {
             return;
         };
         self.forward_zc_consumed[conn_index as usize] = 0;
+        // Every path that ends a connection, an error's or a peer's as much
+        // as the handler's, comes through here: a `writable` future waiting
+        // on it, blocked or armed, is woken and fails.
+        if self.send_queues[conn_index as usize]
+            .writable_task
+            .is_some()
+        {
+            let generation = self.connections.generation(conn_index);
+            self.writable_close_wakes.push((conn_index, generation));
+        }
         // Release handler state here rather than waiting for the slot to be
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.

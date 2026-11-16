@@ -845,6 +845,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // behind (for example, a closed connection's timer slot), so tasks
         // polled in this pass can reuse it.
         crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+        self.wake_writable_on_close();
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
         // violations: accessing self.driver or self.executor directly after
@@ -3200,6 +3201,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Wake the `writable` futures on connections whose close was requested
+    /// since the last pass (`Driver::writable_close_wakes`). Each finds the
+    /// close requested when polled and fails with the error its connection
+    /// recorded, or `NotConnected`.
+    fn wake_writable_on_close(&mut self) {
+        while let Some((conn_index, generation)) = self.driver.writable_close_wakes.pop() {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            let state = &mut self.driver.send_queues[conn_index as usize];
+            if let Some(task) = state.writable_task.take() {
+                state.writable_blocked = false;
+                self.executor.wake_task(task);
+            }
+        }
+    }
+
     /// Whether a `writable` future waits on `conn_index`.
     fn writable_waits(&self, conn_index: u32) -> bool {
         self.driver.send_queues[conn_index as usize]
@@ -3353,6 +3371,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             return;
         }
+        // A hangup ends a waiting future's wait before the resubmit, whose
+        // wake would otherwise take the future's task with a `Recheck`.
+        if writable && hangup {
+            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));
+        }
         // On an error or a hangup, the resubmit returns the socket's error. A
         // multishot poll's edge does not fire again, so this cannot spin.
         if pollout || (multi && hangup) {
@@ -3362,12 +3385,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         // The send just resubmitted on this POLLOUT may take the room, so a
         // future waiting on the socket looks again rather than resolve.
-        if writable {
-            if hangup {
-                self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));
-            } else if pollout {
-                self.end_writable_wait(conn_index, WritableEvent::Recheck);
-            }
+        if writable && pollout && !hangup {
+            self.end_writable_wait(conn_index, WritableEvent::Recheck);
         }
     }
 
@@ -3403,15 +3422,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && self.driver.send_queues[conn_index as usize]
                 .waiting_send
                 .is_some();
+        // A hangup ends the wait first, as on the connection's poll.
+        if hangup {
+            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));
+        }
         if resubmitted {
             self.resubmit_waiting_send(conn_index, true);
         }
-        if !self.writable_waits(conn_index) {
+        if hangup || !self.writable_waits(conn_index) {
             return;
         }
-        if hangup {
-            self.end_writable_wait(conn_index, WritableEvent::Failed(writable_errno(mask)));
-        } else if pollout {
+        if pollout {
             // As on the connection's poll: a send just resubmitted may take
             // the room.
             let event = if resubmitted {
@@ -19482,6 +19503,47 @@ mod tests {
         assert_eq!(seen.get(), Some(Ok(())));
     }
 
+    /// A peer reset seen by the send a gate waits for after a `Recheck`: the
+    /// send's error ends the connection, and the close request wakes the
+    /// gate, which fails with the reset at once, before any `Close` CQE
+    /// (which, for a gate in the connection's own task, removes that task).
+    #[test]
+    fn a_peer_reset_after_a_recheck_fails_a_blocked_writable_gate() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        let poll = pollout_ud(&el, conn_index);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), None, "blocked on the resubmitted send");
+        dispatch_and_poll(&mut el, ud.raw(), -libc::ECONNRESET, 0);
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionReset)));
+    }
+
+    /// A reset's report on the poll of a send waiting for room holds
+    /// `POLLOUT` as well as `POLLERR` and `POLLHUP`: the send is resubmitted,
+    /// and the gate that waits for it fails at once, not after the resubmit.
+    #[test]
+    fn a_reset_s_pollout_and_hangup_fail_a_writable_gate_waiting_for_a_send() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        let poll = pollout_ud(&el, conn_index);
+        let reset = (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) as i32;
+        dispatch_and_poll(&mut el, poll, reset, 0);
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::Send { len: 60, .. }
+            ),
+            "the send was resubmitted"
+        );
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionReset)));
+    }
+
     /// An error on the poll of a send waiting for room fails a gate that
     /// waits for that send.
     #[test]
@@ -19865,6 +19927,35 @@ mod tests {
         assert_eq!(seen.get(), None);
     }
 
+    /// The backstop's resubmit of a send the gate waits for finds the SQ full
+    /// and waits on a retry list, with no `POLLOUT` and so no `Recheck`. The
+    /// retry's push wakes the gate with a `Recheck`, so it waits for the
+    /// send to finish: the poll's `POLLOUT` meanwhile does not end its wait,
+    /// though the send may take the room.
+    #[test]
+    fn a_writable_gate_waits_for_a_backstop_resubmit_pushed_by_a_retry() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let seen = gate_task(&mut el, ctx);
+        let poll = pollout_ud(&el, conn_index);
+
+        el.driver.ring.force_push_failures(1);
+        el.handle_send_backstop();
+        el.poll_ready_tasks();
+        assert!(el.driver.send_queues[conn_index as usize].resubmit_queued);
+        el.drain_copy_retries();
+        el.poll_ready_tasks();
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), None, "the resubmitted send may take the room");
+
+        dispatch_and_poll(&mut el, ud.raw(), 60, 0);
+        assert_last_poll(&el, poll, false);
+        dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
+        assert_eq!(seen.get(), Some(Ok(())));
+    }
+
     /// A zero-copy send that gets `-ENOMEM` is re-sent with plain sends; with
     /// the SQ full that re-send waits on a retry list, and the gate counts it
     /// as queued: a `POLLOUT` meanwhile does not end its wait. The push wakes
@@ -20017,8 +20108,9 @@ mod tests {
     }
 
     /// The `Close` CQE wakes a gate waiting in another task, the only wake
-    /// here: the cancel of its poll is not delivered. The gate finds its
-    /// connection released.
+    /// here: the cancel of its poll is not delivered, and the wake the close
+    /// request queued (`writable_close_wakes`) is dropped, so that this one is
+    /// tested alone. The gate finds its connection released.
     #[test]
     fn the_close_cqe_wakes_a_writable_gate() {
         let mut el = make_test_loop();
@@ -20027,6 +20119,8 @@ mod tests {
         let generation = el.driver.connections.generation(ci);
         let seen = gate_task(&mut el, ctx);
         el.driver.close_connection(ci);
+        assert_eq!(el.driver.writable_close_wakes, [(ci, generation)]);
+        el.driver.writable_close_wakes.clear();
         el.driver.force_finalize_close(ci);
         assert_eq!(seen.get(), None);
         let close = UserData::encode(OpTag::Close, ci, generation);
