@@ -11,6 +11,15 @@
 //! event loop cover the multishot poll and its probe with injected
 //! completions.
 //!
+//! The client leaves its receive buffer to the kernel. On Linux, a
+//! `SO_RCVBUF` cut to 4096 after the connect keeps the client's window below
+//! the server's MSS, which the kernel caps at half the largest window the
+//! client has advertised (about 64 KiB at the handshake). The server then
+//! sends only when its zero-window persist timer fires, a few KiB each
+//! time, so the full socket takes minutes to drain and reports no `POLLOUT`
+//! within the tests' bounds. `loopback_drain_with_a_receive_buffer_shrunk_after_connect`
+//! measures this with plain sockets.
+//!
 //! The tests share the statics below, and `cargo test` runs them in one
 //! process.
 
@@ -230,6 +239,7 @@ fn launch() -> (
         .expect("launch")
 }
 
+#[cfg(target_os = "linux")]
 fn set_rcvbuf(s: &TcpStream, size: i32) {
     // SAFETY: a live socket, and `size` outlives the call.
     let rc = unsafe {
@@ -278,7 +288,6 @@ fn start(
     let (runtime, handles) = launch();
     let addr = runtime.bound_addr().expect("bound");
     let mut client = TcpStream::connect(addr).expect("connect");
-    set_rcvbuf(&client, 4096);
     client.write_all(&[cmd]).unwrap();
     (runtime, handles, client)
 }
@@ -314,14 +323,26 @@ fn drain(client: &mut TcpStream) {
     client
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
+    let began = Instant::now();
     let mut buf = vec![0u8; 1 << 16];
+    let mut read = 0usize;
+    let mut first_mib = None;
     loop {
         match client.read(&mut buf) {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(e) => panic!("drain: {e}"),
+            Ok(0) => break,
+            Ok(n) => {
+                read += n;
+                if read >= 1 << 20 && first_mib.is_none() {
+                    first_mib = Some(began.elapsed());
+                }
+            }
+            Err(e) => panic!("drain: {e} after {read} bytes in {:?}", began.elapsed()),
         }
     }
+    eprintln!(
+        "drain: {read} bytes in {:?}, the first MiB in {first_mib:?}",
+        began.elapsed()
+    );
 }
 
 /// The gate resolved within 5 s of the client starting to drain, well inside
@@ -460,4 +481,93 @@ fn a_stale_connection() {
     drop(client);
     runtime.shutdown();
     common::join_workers(&runtime, handles);
+}
+
+/// Not part of the suite: a check, with plain sockets and no ringline, of why
+/// the client above leaves its receive buffer to the kernel. A server socket
+/// filled to `WouldBlock` towards a client that does not read reports
+/// `POLLOUT` within 1 s of the client starting to read when the client keeps
+/// the kernel's buffer, and not within 2 s when the client cut its
+/// `SO_RCVBUF` to 4096 after the connect. Run on a Linux host with
+/// `cargo test -p ringline --test writable_gate loopback_drain -- --ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "a check of the kernel for a Linux host; run with --ignored"]
+fn loopback_drain_with_a_receive_buffer_shrunk_after_connect() {
+    let kernel = time_to_pollout(None);
+    let shrunk = time_to_pollout(Some(4096));
+    eprintln!(
+        "POLLOUT after the client began to read: kernel buffer {kernel:?}, 4096 after the connect {shrunk:?}"
+    );
+    assert!(
+        kernel.is_some_and(|t| t < Duration::from_secs(1)),
+        "with the kernel's buffer: {kernel:?}"
+    );
+    assert!(
+        shrunk.is_none_or(|t| t > Duration::from_secs(2)),
+        "with 4096 set after the connect: {shrunk:?}"
+    );
+}
+
+/// Fill a loopback server socket to `WouldBlock` towards a client that does
+/// not read, with the client's `SO_RCVBUF` set to `rcvbuf` after the connect;
+/// wait 200 ms and fill it again, as the tests above do; then let the client
+/// read, and return how long the server's socket took to report `POLLOUT`,
+/// or `None` if it did not within 10 s.
+#[cfg(target_os = "linux")]
+fn time_to_pollout(rcvbuf: Option<i32>) -> Option<Duration> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    server.set_nodelay(true).unwrap();
+    if let Some(size) = rcvbuf {
+        set_rcvbuf(&client, size);
+    }
+    server.set_nonblocking(true).unwrap();
+    let chunk = [7u8; CHUNK_LEN];
+    let fill = |server: &mut TcpStream| loop {
+        match server.write(&chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill: {e}"),
+        }
+    };
+    fill(&mut server);
+    std::thread::sleep(Duration::from_millis(200));
+    fill(&mut server);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        let mut client = client;
+        std::thread::spawn(move || {
+            client
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut buf = vec![0u8; 1 << 16];
+            while !stop.load(Ordering::SeqCst) {
+                match client.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    let began = Instant::now();
+    let mut pfd = libc::pollfd {
+        fd: server.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd` for the call.
+    let n = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+    let took = (n > 0 && pfd.revents & libc::POLLOUT != 0).then(|| began.elapsed());
+    stop.store(true, Ordering::SeqCst);
+    reader.join().unwrap();
+    took
 }
