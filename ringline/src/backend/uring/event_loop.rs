@@ -21847,28 +21847,93 @@ mod tests {
         }
     }
 
-    fn is_ticket_refusal(r: &io::Result<impl Sized>) -> bool {
-        matches!(r, Err(e) if e.kind() == io::ErrorKind::Other
-            && e.to_string() == crate::handler::TICKET_WAITING_REFUSAL)
+    /// The public handle for `conn_index`, for the `try_` forms and
+    /// `send_refusal`. Never dropped, so the test's connection is not closed.
+    fn public_conn(
+        el: &AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> std::mem::ManuallyDrop<crate::Connection> {
+        std::mem::ManuallyDrop::new(crate::Connection::from_claimed(ConnCtx::new(
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        )))
     }
 
-    /// A plain send on a connection with a bounded send waiting is refused
-    /// with `Other` and takes no slot; once the waiting send leaves, the
-    /// plain send is accepted.
+    fn is_ticket_refusal(r: &io::Result<impl Sized>) -> bool {
+        matches!(r, Err(e) if e.kind() == io::ErrorKind::Other
+            && e.get_ref().and_then(|e| e.downcast_ref::<crate::SendRefused>())
+                == Some(&crate::SendRefused::SendWaiting))
+    }
+
+    /// A plain send, and `try_send`, on a connection with a bounded send
+    /// waiting is refused with `Other` carrying `SendRefused::SendWaiting`,
+    /// which `send_refusal` reports, and takes no slot; once the waiting send
+    /// leaves, `send_refusal` reports nothing and both are accepted.
     #[test]
     fn a_plain_send_behind_a_waiting_bounded_send_is_refused() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut public = public_conn(&el, conn_index);
+        assert_eq!(with_driver_state(&mut el, || public.send_refusal()), None);
         let ticket = wait_a_ticket(&mut el, conn_index);
         let free = el.driver.send_copy_pool.free_count();
         let refused = with_driver_state(&mut el, || conn.send(b"x"));
         assert!(is_ticket_refusal(&refused), "{refused:?}");
+        let refused = with_driver_state(&mut el, || public.try_send(b"x"));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(
+            with_driver_state(&mut el, || public.send_refusal()),
+            Some(crate::SendRefused::SendWaiting)
+        );
         assert_eq!(el.driver.send_copy_pool.free_count(), free);
         assert_eq!(el.executor.send_completions.live(), 1, "no id left behind");
         el.executor.cancel_send(ticket);
+        assert_eq!(with_driver_state(&mut el, || public.send_refusal()), None);
         let sent = with_driver_state(&mut el, || conn.send(b"x"));
         assert!(sent.is_ok(), "{:?}", sent.err());
+        let sent = with_driver_state(&mut el, || public.try_send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// With the pool exhausted, `try_send` is refused with
+    /// `SendRefused::PoolExhausted`, which `send_refusal` does not report:
+    /// whether the pool has room depends on the send's size.
+    #[test]
+    fn try_send_on_an_exhausted_pool_is_refused_as_pool_exhausted() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let mut public = public_conn(&el, conn_index);
+        let _held = exhaust_send_pool(&mut el);
+        let refused = with_driver_state(&mut el, || public.try_send(b"x"));
+        let e = refused.expect_err("no slot is free");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            e.get_ref()
+                .and_then(|e| e.downcast_ref::<crate::SendRefused>()),
+            Some(&crate::SendRefused::PoolExhausted)
+        );
+        assert_eq!(e.to_string(), "send copy pool exhausted");
+        assert_eq!(with_driver_state(&mut el, || public.send_refusal()), None);
+    }
+
+    /// `send_refusal` on a stale handle reports nothing, with a send waiting on
+    /// the slot's new occupant.
+    #[test]
+    fn send_refusal_on_a_stale_handle_is_none() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let stale = public_conn(&el, conn_index);
+        el.driver.clear_conn_claims(conn_index);
+        el.driver.connections.release(conn_index);
+        assert_eq!(accept_connection(&mut el), conn_index, "the slot is reused");
+        wait_a_ticket(&mut el, conn_index);
+        assert_eq!(with_driver_state(&mut el, || stale.send_refusal()), None);
+        let current = public_conn(&el, conn_index);
+        assert_eq!(
+            with_driver_state(&mut el, || current.send_refusal()),
+            Some(crate::SendRefused::SendWaiting)
+        );
     }
 
     /// A bounded send waiting on one connection refuses no send on another.
@@ -21898,6 +21963,14 @@ mod tests {
                 .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
         });
         assert!(sent.is_ok(), "{:?}", sent.err());
+        let mut public = public_conn(&el, conn_index);
+        let sent = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; len]));
+            public
+                .send_parts()
+                .try_submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(sent.is_ok(), "{:?}", sent.err());
     }
 
     /// A batch of guards below `send_zc_threshold` would be gathered into a
@@ -21916,6 +21989,14 @@ mod tests {
                 .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
         });
         assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+        let mut public = public_conn(&el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; 100]));
+            public
+                .send_parts()
+                .try_submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
         assert_eq!(el.driver.send_slab.free_count(), slab_free);
     }
 
@@ -21928,6 +22009,11 @@ mod tests {
         wait_a_ticket(&mut el, conn_index);
         let refused = with_driver_state(&mut el, || {
             conn.send_parts().build(|b| b.copy(b"x").submit())
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+        let mut public = public_conn(&el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            public.send_parts().try_build(|b| b.copy(b"x").submit())
         });
         assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
     }
@@ -21949,6 +22035,11 @@ mod tests {
             crate::runtime::io::as_reader_callback(conn_index, || {
                 conn.forward_recv_buf(view).map(drop)
             })
+        });
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        let mut public = public_conn(&el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            crate::runtime::io::as_reader_callback(conn_index, || public.try_forward_recv_buf(view))
         });
         assert!(is_ticket_refusal(&refused), "{refused:?}");
         assert_eq!(el.driver.accumulators.data(conn_index), b"message");
@@ -21977,7 +22068,8 @@ mod tests {
     const HELD: &[u8] = b"receive-path records";
 
     /// Output the pool had no slots for refuses a plain send on its
-    /// connection before the admission queue has its ticket, and once it
+    /// connection, and `send_refusal` reports it, before the admission queue
+    /// has its ticket, and once it
     /// has, the connection has a send waiting and cannot be parked.
     #[test]
     fn held_tls_output_refuses_a_plain_send_and_blocks_the_park() {
@@ -21989,6 +22081,12 @@ mod tests {
         assert!(el.driver.hold_sealed(conn_index, HELD, false, true));
         let refused = with_driver_state(&mut el, || conn.send(b"x"));
         assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+        let public = public_conn(&el, conn_index);
+        assert_eq!(
+            with_driver_state(&mut el, || public.send_refusal()),
+            Some(crate::SendRefused::SendWaiting),
+            "reported before the sync"
+        );
         assert_eq!(el.park_blocker(conn_index), Some(ParkBlocker::Sends));
         el.driver.sync_sealed(&mut el.executor);
         assert!(el.executor.send_waiting_on(conn_index));

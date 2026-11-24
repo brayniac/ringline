@@ -1087,6 +1087,20 @@ impl ConnCtx {
         }
     }
 
+    /// See [`SendHalf::send_refusal`]. Reads what `send_ctx` reads, so it
+    /// agrees with the refusal a non-waiting send gets now.
+    pub(crate) fn send_refusal(&self) -> Option<crate::SendRefused> {
+        with_state(|driver, executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return None;
+            }
+            let waiting = executor.send_waiting_on(self.conn_index);
+            #[cfg(has_io_uring)]
+            let waiting = waiting || driver.sealed_waiting(self.conn_index);
+            waiting.then_some(crate::SendRefused::SendWaiting)
+        })
+    }
+
     /// See `Connection::offer_for_park`.
     #[cfg_attr(not(feature = "unstable-accept"), allow(dead_code))]
     pub(crate) fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
@@ -1740,6 +1754,25 @@ pub struct AsyncSendBuilder {
 
 #[cfg(has_io_uring)]
 impl AsyncSendBuilder {
+    /// [`build`](Self::build) without the [`SendCompletion`]: the closure's
+    /// send is queued in the call or refused, with the same errors. A refusal
+    /// for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    pub fn try_build<F>(self, f: F) -> io::Result<()>
+    where
+        F: FnOnce(crate::handler::SendBuilder<'_, '_>) -> io::Result<()>,
+    {
+        self.build(f).map(drop)
+    }
+
+    /// [`submit_batch`](Self::submit_batch) without the [`SendCompletion`]:
+    /// the batch is queued in the call or refused, with the same errors. A
+    /// refusal for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    pub fn try_submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<()> {
+        self.submit_batch(parts).map(drop)
+    }
+
     /// Build and submit the send by calling the provided closure with a
     /// `SendBuilder`, and return a [`SendCompletion`] that resolves with the
     /// total length of its parts once the send completes.
@@ -1959,6 +1992,25 @@ impl ConnCtx {
 
 #[cfg(not(has_io_uring))]
 impl AsyncSendBuilder {
+    /// [`build`](Self::build) without the [`SendCompletion`]: the closure's
+    /// send is queued in the call or refused, with the same errors. A refusal
+    /// for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    pub fn try_build<F>(self, f: F) -> io::Result<()>
+    where
+        F: FnOnce(MioSendBuilder<'_>) -> io::Result<()>,
+    {
+        self.build(f).map(drop)
+    }
+
+    /// [`submit_batch`](Self::submit_batch) without the [`SendCompletion`]:
+    /// the batch is queued in the call or refused, with the same errors. A
+    /// refusal for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    pub fn try_submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<()> {
+        self.submit_batch(parts).map(drop)
+    }
+
     /// Build and submit the send by concatenating all parts, and return a
     /// [`SendCompletion`] that resolves with their total length once the
     /// bytes have been written to the socket.
@@ -3077,6 +3129,16 @@ impl Connection {
         self.tx.send(data)
     }
 
+    /// See [`SendHalf::try_send`].
+    pub fn try_send(&mut self, data: &[u8]) -> io::Result<()> {
+        self.tx.try_send(data)
+    }
+
+    /// See [`SendHalf::send_refusal`].
+    pub fn send_refusal(&self) -> Option<crate::SendRefused> {
+        self.tx.send_refusal()
+    }
+
     /// See [`SendHalf::send_parts`].
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.tx.send_parts()
@@ -3319,6 +3381,11 @@ impl Connection {
         self.tx.conn.forward_recv_buf(data)
     }
 
+    /// See [`SendHalf::try_forward_recv_buf`].
+    pub fn try_forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
+        self.tx.try_forward_recv_buf(data)
+    }
+
     /// See [`SendHalf::shutdown_write`].
     pub fn shutdown_write(&mut self) {
         self.tx.conn.shutdown_write();
@@ -3385,9 +3452,14 @@ impl SendHalf {
     /// fails for pool reasons. On both backends, `Other` while a bounded send
     /// ([`send_admitted`](Self::send_admitted),
     /// [`send_backpressured`](Self::send_backpressured), a waiting batch)
-    /// waits for send-pool slots on this connection, so that this send does not
-    /// go out ahead of it. Nothing was queued or transmitted on those
-    /// errors, so the same buffer may be sent again later. A TLS encryption
+    /// waits for send-pool slots on this connection, or on io_uring TLS output
+    /// the send pool had no slots for waits, so that this send does not go out
+    /// ahead of it. These two `Other` refusals carry a
+    /// [`SendRefused`](crate::SendRefused) as their inner error,
+    /// `PoolExhausted` and `SendWaiting`, and
+    /// [`send_refusal`](Self::send_refusal) reports the second before a send is
+    /// made. Nothing was queued or transmitted on those errors, so the same
+    /// buffer may be sent again later. A TLS encryption
     /// failure (`Other`; on TLS 1.2, the traffic keys exhausted) closes the
     /// connection on both backends, because the record layer is finished: a
     /// record sealed before the failure has spent a sequence number, and
@@ -3399,6 +3471,30 @@ impl SendHalf {
     /// connection closing.
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.send(data)
+    }
+
+    /// Send data without waiting: the bytes are copied into the send pool and
+    /// queued in the call, or the send is refused. It is [`send`](Self::send)
+    /// without the [`SendCompletion`], and returns the same errors. A refusal
+    /// for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # fn example(tx: &mut ringline::SendHalf) -> std::io::Result<()> {
+    /// use ringline::SendRefused;
+    /// match tx.try_send(b"reply") {
+    ///     Ok(()) => {}
+    ///     Err(e) if e.get_ref().and_then(|e| e.downcast_ref::<SendRefused>()).is_some() => {
+    ///         // Nothing was queued; send again later.
+    ///     }
+    ///     Err(e) => return Err(e),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_send(&mut self, data: &[u8]) -> io::Result<()> {
+        self.conn.send(data).map(drop)
     }
 
     /// Begin building a scatter-gather send with mixed copy and zero-copy guard
@@ -3442,6 +3538,22 @@ impl SendHalf {
     /// on mio, which has no send slab.
     pub fn zero_copy_capped(&self) -> bool {
         self.conn.zero_copy_capped()
+    }
+
+    /// Why a non-waiting send on this connection would be refused now, before
+    /// it is made: `Some(SendRefused::SendWaiting)` while a bounded send
+    /// ([`send_admitted`](Self::send_admitted),
+    /// [`send_backpressured`](Self::send_backpressured), a waiting batch), or
+    /// on io_uring TLS output the send pool had no slots for, waits on the
+    /// connection. `None` otherwise, and on a closed connection.
+    ///
+    /// It does not report [`SendRefused::PoolExhausted`](crate::SendRefused::PoolExhausted),
+    /// which depends on the send's size. On io_uring a plaintext batch of
+    /// guards alone at or above `send_zc_threshold` takes no send-pool slot and
+    /// is not refused while a send waits, so for it `Some` does not mean a
+    /// refusal.
+    pub fn send_refusal(&self) -> Option<crate::SendRefused> {
+        self.conn.send_refusal()
     }
 
     /// The send-pool slots this connection holds now: slots holding its
@@ -3739,6 +3851,14 @@ impl SendHalf {
     /// is sent or consumed on `Err`.
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.forward_recv_buf(data)
+    }
+
+    /// [`forward_recv_buf`](Self::forward_recv_buf) without the
+    /// [`SendCompletion`]: it forwards in the call or is refused, with the
+    /// same errors. A refusal for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    pub fn try_forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
+        self.conn.forward_recv_buf(data).map(drop)
     }
 
     /// Shut down the write side of the connection (half-close).

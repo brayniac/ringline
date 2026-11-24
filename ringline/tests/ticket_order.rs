@@ -4,7 +4,9 @@
 //! bounded sends queued behind it, and a bounded send waiting for send-pool
 //! capacity. A plain send made then is refused, and the peer reads the
 //! waiting send's bytes before those of a plain send made once it has been
-//! admitted. A close fails the waiting send.
+//! admitted. `send_refusal` reports the waiting send and `try_send` is
+//! refused with `SendRefused::SendWaiting` while it waits. A close fails the
+//! waiting send.
 
 #![allow(clippy::manual_async_fn)]
 
@@ -14,7 +16,9 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, SendRefused,
+};
 
 mod common;
 
@@ -71,7 +75,16 @@ struct Seen {
     refused: String,
     /// `tickets_waited` after the bounded send's first poll.
     tickets_waited: u64,
+    /// `send_refusal` with four bounded sends admitted and none waiting.
+    refusal_before: Option<SendRefused>,
+    /// `send_refusal` while the bounded send waited.
+    refusal_while: Option<SendRefused>,
+    /// The `SendRefused` carried by `try_send`'s refusal while it waited.
+    try_refused: Option<SendRefused>,
 }
+
+/// `send_refusal` once the waiting send was admitted.
+static AFTER: Mutex<Option<Option<SendRefused>>> = Mutex::new(None);
 
 static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
 
@@ -85,6 +98,14 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn refusal_of(result: io::Result<()>) -> Option<SendRefused> {
+    let e = result.err()?;
+    assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");
+    e.get_ref()
+        .and_then(|e| e.downcast_ref::<SendRefused>())
+        .copied()
 }
 
 fn kind(result: io::Result<impl Sized>) -> String {
@@ -119,6 +140,7 @@ impl AsyncEventHandler for Sender {
             for _ in 0..4 {
                 queued.push(conn.send_admitted(&QUEUED_BYTES).await.expect("admitted"));
             }
+            let refusal_before = conn.send_refusal();
             let mut waiting = std::pin::pin!(conn.send_admitted(&WAITING_BYTES));
             let first =
                 std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
@@ -130,12 +152,18 @@ impl AsyncEventHandler for Sender {
             }
             let tickets_waited = ringline::send_admission_counters().tickets_waited;
             let refused = kind(conn.send(&[PLAIN; 100]));
+            let refusal_while = conn.send_refusal();
+            let try_refused = refusal_of(conn.try_send(&[PLAIN; 100]));
             *SEEN.lock().unwrap() = Some(Seen {
                 refused,
                 tickets_waited,
+                refusal_before,
+                refusal_while,
+                try_refused,
             });
             let admitted = waiting.await.expect("admitted once the peer reads");
-            conn.send(TAIL).expect("nothing waits now");
+            *AFTER.lock().unwrap() = Some(conn.send_refusal());
+            conn.try_send(TAIL).expect("nothing waits now");
             for send in queued {
                 send.await.expect("sent");
             }
@@ -180,12 +208,15 @@ fn wait_for_server(addr: std::net::SocketAddr) {
 }
 
 /// A plain send made while a bounded send waits on its connection is refused
-/// with `Other`, and once the waiting send is admitted, a plain send goes out
-/// after it: the peer reads the fill, the queued sends, the waiting send and
-/// then the plain send, and never the refused one.
+/// with `Other`, as is `try_send` with `SendRefused::SendWaiting`, which
+/// `send_refusal` reports in advance; once the waiting send is admitted,
+/// `send_refusal` reports nothing and `try_send` goes out after it: the peer
+/// reads the fill, the queued sends, the waiting send and then the plain send,
+/// and never the refused ones.
 #[test]
 fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
     let _serial = serial();
+    *AFTER.lock().unwrap() = None;
     let (runtime, handles) = launch();
     let addr = runtime.bound_addr().expect("bound");
 
@@ -206,6 +237,9 @@ fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
         "the plain send made while the bounded send waited"
     );
     assert_eq!(seen.tickets_waited, 1);
+    assert_eq!(seen.refusal_before, None, "admitted sends do not refuse");
+    assert_eq!(seen.refusal_while, Some(SendRefused::SendWaiting));
+    assert_eq!(seen.try_refused, Some(SendRefused::SendWaiting));
 
     let mut body = Vec::new();
     peer.read_to_end(&mut body).expect("read to the close");
@@ -214,6 +248,11 @@ fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
         "the refused send's bytes reached the peer"
     );
     assert!(body.ends_with(TAIL), "the plain send came last");
+    assert_eq!(
+        AFTER.lock().unwrap().take(),
+        Some(None),
+        "nothing waits once the waiting send is admitted"
+    );
     let rest = &body[..body.len() - TAIL.len()];
     let waiting = &rest[rest.len() - 6 * SLOT..];
     assert!(

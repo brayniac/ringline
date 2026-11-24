@@ -2367,6 +2367,11 @@ pub(crate) mod tests {
             err.to_string().contains("send copy pool exhausted"),
             "unexpected message: {err}"
         );
+        assert_eq!(
+            err.get_ref()
+                .and_then(|e| e.downcast_ref::<crate::SendRefused>()),
+            Some(&crate::SendRefused::PoolExhausted)
+        );
         assert_eq!(driver.pending_sends[idx].len(), 1, "nothing was queued");
         assert_eq!(
             driver.send_copy_pool.free_count(),

@@ -819,6 +819,51 @@ pub enum UdpSendError {
     Io(#[from] io::Error),
 }
 
+/// Why a non-waiting send was refused for want of send-pool slots.
+///
+/// A refused [`try_send`](crate::SendHalf::try_send),
+/// [`try_submit_batch`](crate::AsyncSendBuilder::try_submit_batch),
+/// [`try_build`](crate::AsyncSendBuilder::try_build) or
+/// [`try_forward_recv_buf`](crate::SendHalf::try_forward_recv_buf) returns an
+/// [`io::Error`] of kind [`Other`](io::ErrorKind::Other) whose inner error is a
+/// `SendRefused`. The same holds for the methods without the `try_` prefix,
+/// which also do not wait. Nothing was queued or transmitted, so the same bytes
+/// may be sent again later.
+///
+/// ```
+/// # fn handle(e: std::io::Error) {
+/// use ringline::SendRefused;
+/// match e.get_ref().and_then(|e| e.downcast_ref::<SendRefused>()) {
+///     Some(SendRefused::PoolExhausted) => { /* retry after sends complete */ }
+///     Some(SendRefused::SendWaiting) => { /* retry after the waiting send */ }
+///     Some(_) => {}
+///     None => { /* another error */ }
+/// }
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SendRefused {
+    /// The send pool has too few free slots for the send. It clears as the
+    /// worker's in-flight sends complete.
+    #[error("send copy pool exhausted")]
+    PoolExhausted,
+
+    /// A bounded send, or TLS output the send pool had no slots for, waits
+    /// for slots on this connection, and this send would go out ahead of it.
+    /// It clears when the waiting send is admitted, or its output is sent.
+    #[error("a send waits on this connection")]
+    SendWaiting,
+}
+
+impl SendRefused {
+    /// The refusal as the `io::Error` a send returns: kind `Other`, with
+    /// `self` as the inner error.
+    pub(crate) fn into_io(self) -> io::Error {
+        io::Error::other(self)
+    }
+}
+
 /// Error returned by [`try_sleep`](crate::try_sleep) and
 /// [`try_timeout`](crate::try_timeout) when the timer slot pool is full.
 ///

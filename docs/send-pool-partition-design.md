@@ -6,7 +6,9 @@ the held count per connection (order of work step 2), taking slots before
 the work and returning the excess (step 3), the removal of `send_chain`, and,
 of the rest of step 4, the ticket queue and the worker queue for bounded and
 non-waiting sends, and on io_uring the ticket of receive-path TLS output and
-`close_notify`, are implemented. A non-waiting send that would take
+`close_notify`, are implemented, as are `SendRefused`, the `try_` forms
+beside today's non-waiting sends, and `send_refusal`, without the `Capped`
+reason, which comes with the cap. A non-waiting send that would take
 slots behind a waiting ticket is refused, including `forward_to_conn`'s copy
 on io_uring, where section 2 says it waits; on mio `forward_to_conn` is not yet
 checked against the ticket queue. The held count
@@ -127,7 +129,8 @@ have the same split.
   under the name `try_build`, and `submit_batch` is the waiting form for
   parts.
 - `forward_recv_buf` is synchronous and, on TLS, takes pool slots. It stays
-  non-waiting and is refused like `try_send` (its name is open question 5).
+  non-waiting, under the name `try_forward_recv_buf`, and is refused like
+  `try_send`.
 - `send_backpressured` is removed: `send(..).await?` followed by
   `flush().await?` does what it does. Its one production caller is the redis
   client's `AUTH`.
@@ -325,7 +328,9 @@ earlier generation of the index does not decrement the current one, so slots
 a closed connection's sends still hold do not count against the next
 occupant of its index.
 
-A connection with `held >= M` is at the cap. `M` defaults to 64: in stage 0
+A connection with `held >= M` is at the cap. `M` is set with
+`ConfigBuilder::send_pool_hold_cap`, where `usize::MAX` turns the cap off,
+and defaults to 64: in stage 0
 an application-level bound of 64 slots removed the slow-reader stalls (0 of
 60,000 probe requests over 10 ms in every run, against 32-100% unbounded)
 and cost at most about 2% of throughput to connections with up to 256
@@ -373,10 +378,10 @@ measures the threshold.
 Only a non-waiting send is refused for want of slots. It is refused in
 three cases: the pool has too few free slots, as today; its connection is at
 the cap; or its connection has a ticket waiting. Each is an `io::Error` of
-kind `Other`, the kind pool exhaustion returns today, carrying a
-`ringline::SendRefused` as its inner error. `SendRefused::reason()` returns a
-`#[non_exhaustive]` enum with one variant per case, so a caller tells them
-apart with `get_ref()` and `downcast_ref` instead of matching the message.
+kind `Other`, the kind pool exhaustion returns today, whose inner error is a
+`ringline::SendRefused`: a `#[non_exhaustive]` enum with one variant per case,
+`PoolExhausted`, `Capped` and `SendWaiting`. A caller tells them apart with
+`get_ref()` and `downcast_ref` instead of matching the message.
 Kind `WouldBlock` is not used: pool exhaustion returns `Other` today, and
 the three reasons share one kind so that a caller that handles pool
 exhaustion handles the other two.
@@ -385,8 +390,10 @@ Pool exhaustion and the cap clear as in-flight sends complete; a waiting
 ticket clears when the connection's own ticket is served. The documentation
 of the error kinds (`runtime/io.rs`) says so.
 
-A new public method, beside `zero_copy_capped`, says whether a non-waiting
-send on the connection would be refused for the cap or a waiting ticket.
+`send_refusal()`, on `Connection` and `SendHalf` beside `zero_copy_capped`,
+returns `Some(Capped)` or `Some(SendWaiting)` when a non-waiting send on the
+connection would be refused for that reason now, and `None` otherwise. It
+never returns `PoolExhausted`, which depends on the send's size.
 
 ### 7. Dedicated slots (built only if stage 1's rule requires them)
 
@@ -677,10 +684,12 @@ checked, the entry says so.
 4. How large the output rustls produces without an application write can be
    (handshake flights, session tickets), which bounds what a connection's
    exempt tickets hold and sets `D`.
-5. Names: the configuration for `M`, `k`, `D` and `L`; `try_send`,
-   `try_submit_batch`, `try_build` and the name of `forward_recv_buf`; the
-   method that reports a refusal in advance; `SendRefused` and its reasons. They
-   are public and hard to change once released.
+5. Names (decided): `send_pool_hold_cap` for `M`; `try_send`,
+   `try_submit_batch`, `try_build` and `try_forward_recv_buf`; `send_refusal`;
+   `SendRefused` with `PoolExhausted`, `Capped` and `SendWaiting`. If they are
+   built, `L` is `send_pool_hold_resume` and `k` and `D` are
+   `send_pool_dedicated(spare, slot_size)`, named finally when open question 3
+   and section 7 are decided.
 6. Whether sends that take a slab entry and no slot join the ticket order.
 7. Whether ringline offers a configured default limit on a bounded send's
    wait, and what a send that reaches it returns.

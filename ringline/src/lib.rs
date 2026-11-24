@@ -267,6 +267,8 @@ pub use recv::arrival::RecvArrival;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 
+/// Why a non-waiting send was refused for want of send-pool slots.
+pub use error::SendRefused;
 /// Error returned by [`try_sleep()`] and [`try_timeout()`] when the timer pool is full.
 pub use error::TimerExhausted;
 /// Errors returned by UDP send operations.
