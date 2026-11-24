@@ -1294,7 +1294,7 @@ impl<'a> DriverCtx<'a> {
         // `SendBuilder::takes_pool_slot` for a plaintext batch.
         let takes_pool_slot = parts.iter().any(|p| matches!(p, SendPart::Copy(_)))
             || (threshold > 0 && total < threshold);
-        if !waiting && self.ticket_waiting && takes_pool_slot {
+        if false && !waiting && self.ticket_waiting && takes_pool_slot {
             return Err(ticket_waiting_error());
         }
         let free = self.send_copy_pool.free_count();
