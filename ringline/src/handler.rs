@@ -437,7 +437,7 @@ impl ConnId {
 /// connection: kind `Other`, the kind of pool exhaustion, carrying
 /// [`SendRefused::SendWaiting`](crate::SendRefused::SendWaiting).
 pub(crate) fn ticket_waiting_error() -> io::Error {
-    crate::error::SendRefused::SendWaiting.into_io()
+    io::Error::other("a send waits on this connection")
 }
 
 /// The message of a guarded send refused because its connection holds
