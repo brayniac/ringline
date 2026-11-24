@@ -1091,9 +1091,6 @@ impl ConnCtx {
     /// agrees with the refusal a non-waiting send gets now.
     pub(crate) fn send_refusal(&self) -> Option<crate::SendRefused> {
         with_state(|driver, executor| {
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return None;
-            }
             let waiting = executor.send_waiting_on(self.conn_index);
             #[cfg(has_io_uring)]
             let waiting = waiting || driver.sealed_waiting(self.conn_index);
