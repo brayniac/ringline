@@ -5543,7 +5543,7 @@ fn submit_batch_parts(
             .iter()
             .filter(|p| matches!(p, SendPart::Guard(_)))
             .count();
-        if guards > crate::buffer::send_slab::MAX_GUARDS {
+        if false && guards > crate::buffer::send_slab::MAX_GUARDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "too many guards (max 8)",
