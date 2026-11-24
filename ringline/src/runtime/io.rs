@@ -1778,22 +1778,23 @@ impl AsyncSendBuilder {
     }
 
     /// Submit a batch of pre-classified `SendPart`s without waiting: it is
-    /// queued in the call or refused. It refuses what
+    /// queued in the call or refused. It refuses everything
     /// [`submit_batch`](Self::submit_batch) refuses. On a plaintext io_uring
     /// connection it checks the batch as
-    /// [`submit_batch_admitted`](Self::submit_batch_admitted) does, before it
-    /// consumes a part: every guard's region is validated whatever the batch's
-    /// size, so a guard below `send_zc_threshold` whose pointer is outside its
-    /// region is refused, and for a batch that fails several checks the error
-    /// returned can differ from `submit_batch`'s. Send-slab refusals are
-    /// `Other`. A refusal for want of send-pool slots is `Other` carrying a
-    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    /// [`submit_batch_admitted`](Self::submit_batch_admitted) does before it
+    /// consumes a part, so it also refuses a guard below `send_zc_threshold`
+    /// whose pointer is outside its region, and a batch that fails several
+    /// checks can get a different error from `submit_batch`'s. Send-slab
+    /// refusals are `Other`, as from `submit_batch`; a waiting batch gets
+    /// `WouldBlock`. A refusal for want of send-pool slots is `Other` carrying
+    /// a [`SendRefused`](crate::SendRefused) as its inner error.
     ///
     /// On a refusal nothing is sent and [`BatchRefused`] returns every part,
     /// guards included, so the batch can be submitted again. `?` converts it
-    /// to its `io::Error` in a function that returns `io::Result`. It borrows
-    /// the parts, so in a function that returns another error type, convert
-    /// with `.map_err(io::Error::from)?`.
+    /// to its `io::Error` in a function that returns `io::Result`. When the
+    /// parts borrow data that is not `'static`, convert with
+    /// `.map_err(io::Error::from)?` in a function that returns another error
+    /// type.
     pub fn try_submit_batch<'a>(
         self,
         parts: Vec<crate::handler::SendPart<'a>>,
@@ -2064,22 +2065,23 @@ impl AsyncSendBuilder {
     }
 
     /// Submit a batch of pre-classified `SendPart`s without waiting: it is
-    /// queued in the call or refused. It refuses what
+    /// queued in the call or refused. It refuses everything
     /// [`submit_batch`](Self::submit_batch) refuses. On a plaintext io_uring
     /// connection it checks the batch as
-    /// [`submit_batch_admitted`](Self::submit_batch_admitted) does, before it
-    /// consumes a part: every guard's region is validated whatever the batch's
-    /// size, so a guard below `send_zc_threshold` whose pointer is outside its
-    /// region is refused, and for a batch that fails several checks the error
-    /// returned can differ from `submit_batch`'s. Send-slab refusals are
-    /// `Other`. A refusal for want of send-pool slots is `Other` carrying a
-    /// [`SendRefused`](crate::SendRefused) as its inner error.
+    /// [`submit_batch_admitted`](Self::submit_batch_admitted) does before it
+    /// consumes a part, so it also refuses a guard below `send_zc_threshold`
+    /// whose pointer is outside its region, and a batch that fails several
+    /// checks can get a different error from `submit_batch`'s. Send-slab
+    /// refusals are `Other`, as from `submit_batch`; a waiting batch gets
+    /// `WouldBlock`. A refusal for want of send-pool slots is `Other` carrying
+    /// a [`SendRefused`](crate::SendRefused) as its inner error.
     ///
     /// On a refusal nothing is sent and [`BatchRefused`] returns every part,
     /// guards included, so the batch can be submitted again. `?` converts it
-    /// to its `io::Error` in a function that returns `io::Result`. It borrows
-    /// the parts, so in a function that returns another error type, convert
-    /// with `.map_err(io::Error::from)?`.
+    /// to its `io::Error` in a function that returns `io::Result`. When the
+    /// parts borrow data that is not `'static`, convert with
+    /// `.map_err(io::Error::from)?` in a function that returns another error
+    /// type.
     pub fn try_submit_batch<'a>(
         self,
         parts: Vec<crate::handler::SendPart<'a>>,
@@ -5529,25 +5531,28 @@ fn submit_batch_parts(
         );
         return submitted.map(|()| n);
     }
-    // The part limits `SendBuilder` applies to a non-waiting TLS batch, which
-    // `submit_batch` refuses before any other check.
+    // The part limits `SendBuilder` applies to a non-waiting TLS batch, in
+    // batch order as `copy` and `guard` check them, which `submit_batch`
+    // refuses after the empty-batch check and before the connection checks.
     #[cfg(has_io_uring)]
     if !waiting {
-        if parts.len() > crate::buffer::send_slab::MAX_IOVECS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many send parts (max 32)",
-            ));
-        }
-        let guards = parts
-            .iter()
-            .filter(|p| matches!(p, SendPart::Guard(_)))
-            .count();
-        if guards > crate::buffer::send_slab::MAX_GUARDS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many guards (max 8)",
-            ));
+        let mut guards = 0usize;
+        for (i, part) in parts.iter().enumerate() {
+            if i >= crate::buffer::send_slab::MAX_IOVECS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many send parts (max 32)",
+                ));
+            }
+            if matches!(part, SendPart::Guard(_)) {
+                if guards >= crate::buffer::send_slab::MAX_GUARDS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "too many guards (max 8)",
+                    ));
+                }
+                guards += 1;
+            }
         }
     }
     let mut buf = Vec::with_capacity(total_part_len(parts));
