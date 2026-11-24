@@ -1109,7 +1109,8 @@ impl ConnCtx {
             let waiting = executor.send_waiting_on(self.conn_index);
             #[cfg(has_io_uring)]
             let waiting = waiting || driver.sealed_waiting(self.conn_index);
-            waiting.then_some(crate::SendRefused::SendWaiting)
+            let _ = waiting;
+            None
         })
     }
 
