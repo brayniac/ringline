@@ -777,7 +777,7 @@ impl<'a> DriverCtx<'a> {
         let mut permit = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
-                return Err(crate::error::SendRefused::PoolExhausted.into_io());
+                return Err(io::Error::other("send copy pool exhausted"));
             }
             Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
                 return Err(io::Error::new(
@@ -918,7 +918,7 @@ impl<'a> DriverCtx<'a> {
         let mut reservation = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
-                return Err(crate::error::SendRefused::PoolExhausted.into_io());
+                return Err(io::Error::other("send copy pool exhausted"));
             }
             Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
                 return Err(io::Error::new(
@@ -1262,7 +1262,7 @@ impl<'a> DriverCtx<'a> {
         let needed = self.batch_plain_slots(parts)?;
         let free = self.send_copy_pool.free_count();
         if free < needed {
-            return Err(crate::error::SendRefused::PoolExhausted.into_io());
+            return Err(io::Error::other("send copy pool exhausted"));
         }
         let has_guards = parts.iter().any(|p| matches!(p, SendPart::Guard(_)));
         if has_guards {
@@ -2934,7 +2934,7 @@ impl<'a> DriverCtx<'a> {
         let mut permit = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
-                return Err(crate::error::SendRefused::PoolExhausted.into_io());
+                return Err(io::Error::other("send copy pool exhausted"));
             }
             Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
                 return Err(io::Error::new(
@@ -4232,7 +4232,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.total_copy_len,
             )
         }
-        .ok_or_else(|| crate::error::SendRefused::PoolExhausted.into_io())?;
+        .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
 
         let user_data = crate::completion::UserData::encode(
             crate::completion::OpTag::Send,
@@ -4275,7 +4275,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                     self.total_copy_len,
                 )
             }
-            .ok_or_else(|| crate::error::SendRefused::PoolExhausted.into_io())?;
+            .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
 
             let mut iovecs = [libc::iovec {
                 iov_base: std::ptr::null_mut(),
