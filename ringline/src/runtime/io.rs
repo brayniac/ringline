@@ -5536,23 +5536,21 @@ fn submit_batch_parts(
     // refuses after the empty-batch check and before the connection checks.
     #[cfg(has_io_uring)]
     if !waiting {
-        let mut guards = 0usize;
-        for (i, part) in parts.iter().enumerate() {
-            if i >= crate::buffer::send_slab::MAX_IOVECS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "too many send parts (max 32)",
-                ));
-            }
-            if matches!(part, SendPart::Guard(_)) {
-                if guards >= crate::buffer::send_slab::MAX_GUARDS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "too many guards (max 8)",
-                    ));
-                }
-                guards += 1;
-            }
+        if parts.len() > crate::buffer::send_slab::MAX_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many send parts (max 32)",
+            ));
+        }
+        let guards = parts
+            .iter()
+            .filter(|p| matches!(p, SendPart::Guard(_)))
+            .count();
+        if guards > crate::buffer::send_slab::MAX_GUARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many guards (max 8)",
+            ));
         }
     }
     let mut buf = Vec::with_capacity(total_part_len(parts));
