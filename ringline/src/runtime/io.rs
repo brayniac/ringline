@@ -1092,9 +1092,6 @@ impl ConnCtx {
     /// pool slot is not refused by them.
     pub(crate) fn send_refusal(&self) -> Option<crate::SendRefused> {
         with_state(|driver, executor| {
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return None;
-            }
             #[cfg(has_io_uring)]
             {
                 let idx = self.conn_index as usize;
