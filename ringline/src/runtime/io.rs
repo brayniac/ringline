@@ -1778,12 +1778,22 @@ impl AsyncSendBuilder {
     }
 
     /// Submit a batch of pre-classified `SendPart`s without waiting: it is
-    /// queued in the call or refused, with the errors of
-    /// [`submit_batch`](Self::submit_batch). On a refusal nothing is sent and
-    /// [`BatchRefused`] returns every part, guards included, so the batch can
-    /// be submitted again; `?` converts it to its `io::Error`. A refusal for
-    /// want of send-pool slots is `Other` carrying a
+    /// queued in the call or refused. It refuses what
+    /// [`submit_batch`](Self::submit_batch) refuses. On a plaintext io_uring
+    /// connection it checks the batch as
+    /// [`submit_batch_admitted`](Self::submit_batch_admitted) does, before it
+    /// consumes a part: every guard's region is validated whatever the batch's
+    /// size, so a guard below `send_zc_threshold` whose pointer is outside its
+    /// region is refused, and for a batch that fails several checks the error
+    /// returned can differ from `submit_batch`'s. Send-slab refusals are
+    /// `Other`. A refusal for want of send-pool slots is `Other` carrying a
     /// [`SendRefused`](crate::SendRefused) as its inner error.
+    ///
+    /// On a refusal nothing is sent and [`BatchRefused`] returns every part,
+    /// guards included, so the batch can be submitted again. `?` converts it
+    /// to its `io::Error` in a function that returns `io::Result`. It borrows
+    /// the parts, so in a function that returns another error type, convert
+    /// with `.map_err(io::Error::from)?`.
     pub fn try_submit_batch<'a>(
         self,
         parts: Vec<crate::handler::SendPart<'a>>,
@@ -2054,12 +2064,22 @@ impl AsyncSendBuilder {
     }
 
     /// Submit a batch of pre-classified `SendPart`s without waiting: it is
-    /// queued in the call or refused, with the errors of
-    /// [`submit_batch`](Self::submit_batch). On a refusal nothing is sent and
-    /// [`BatchRefused`] returns every part, guards included, so the batch can
-    /// be submitted again; `?` converts it to its `io::Error`. A refusal for
-    /// want of send-pool slots is `Other` carrying a
+    /// queued in the call or refused. It refuses what
+    /// [`submit_batch`](Self::submit_batch) refuses. On a plaintext io_uring
+    /// connection it checks the batch as
+    /// [`submit_batch_admitted`](Self::submit_batch_admitted) does, before it
+    /// consumes a part: every guard's region is validated whatever the batch's
+    /// size, so a guard below `send_zc_threshold` whose pointer is outside its
+    /// region is refused, and for a batch that fails several checks the error
+    /// returned can differ from `submit_batch`'s. Send-slab refusals are
+    /// `Other`. A refusal for want of send-pool slots is `Other` carrying a
     /// [`SendRefused`](crate::SendRefused) as its inner error.
+    ///
+    /// On a refusal nothing is sent and [`BatchRefused`] returns every part,
+    /// guards included, so the batch can be submitted again. `?` converts it
+    /// to its `io::Error` in a function that returns `io::Result`. It borrows
+    /// the parts, so in a function that returns another error type, convert
+    /// with `.map_err(io::Error::from)?`.
     pub fn try_submit_batch<'a>(
         self,
         parts: Vec<crate::handler::SendPart<'a>>,
@@ -3631,9 +3651,8 @@ impl SendHalf {
     /// [`send_backpressured`](Self::send_backpressured), a waiting batch), or
     /// on io_uring TLS output the send pool had no slots for, waits on the
     /// connection. `None` otherwise: on a stale handle, after
-    /// [`abort`](Self::abort) or [`close`](Self::close) has reached the point
-    /// where every send is refused as closing, and on io_uring once a TLS
-    /// connection's close_notify is queued.
+    /// [`abort`](Self::abort), and on io_uring once a close's `Close` is
+    /// submitted or a TLS connection's close_notify is queued.
     ///
     /// It does not report [`SendRefused::PoolExhausted`](crate::SendRefused::PoolExhausted),
     /// which depends on the send's size. On a plaintext io_uring connection a
@@ -3642,7 +3661,8 @@ impl SendHalf {
     /// above `send_zc_threshold`, a
     /// [`forward_recv_buf`](Self::forward_recv_buf) that detaches the
     /// accumulator at or above it, or a
-    /// [`forward_to_conn`](RecvHalf::forward_to_conn) chunk sent zero-copy.
+    /// [`forward_to_conn`](RecvHalf::forward_to_conn) chunk sent zero-copy. On
+    /// mio a `forward_to_conn` is not refused either.
     pub fn send_refusal(&self) -> Option<crate::SendRefused> {
         self.conn.send_refusal()
     }
@@ -5480,8 +5500,9 @@ fn batch_is_tls(ctx: &crate::handler::DriverCtx<'_>, conn_index: u32) -> bool {
 /// A plaintext io_uring batch goes through `SendBuilder` once
 /// `batch_plain_ready` has checked everything `submit` refuses. Any other
 /// batch is gathered into one buffer, borrowing the guards, and sent with
-/// `send_bounded`, or `send_awaited` when not waiting; the parts are dropped
-/// once it is queued.
+/// `send_bounded`, or `send_awaited` when not waiting; a waiting batch's parts
+/// are dropped once it is queued, and a non-waiting batch's are left in
+/// `parts`.
 fn submit_batch_parts(
     ctx: &mut crate::handler::DriverCtx<'_>,
     token: ConnId,
@@ -5508,6 +5529,27 @@ fn submit_batch_parts(
         );
         return submitted.map(|()| n);
     }
+    // The part limits `SendBuilder` applies to a non-waiting TLS batch, which
+    // `submit_batch` refuses before any other check.
+    #[cfg(has_io_uring)]
+    if !waiting {
+        if parts.len() > crate::buffer::send_slab::MAX_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many send parts (max 32)",
+            ));
+        }
+        let guards = parts
+            .iter()
+            .filter(|p| matches!(p, SendPart::Guard(_)))
+            .count();
+        if guards > crate::buffer::send_slab::MAX_GUARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many guards (max 8)",
+            ));
+        }
+    }
     let mut buf = Vec::with_capacity(total_part_len(parts));
     for part in parts.iter() {
         match part {
@@ -5520,13 +5562,16 @@ fn submit_batch_parts(
             }
         }
     }
+    let n = parts.len();
     if waiting {
         ctx.send_bounded(token, &buf, id)?;
+        parts.clear();
     } else {
+        // The parts are left to the caller, which drops them after
+        // `with_state` returns: a guard's `Drop` may panic, and on mio no
+        // guard withdraws the id on unwind.
         ctx.send_awaited(token, &buf, id)?;
     }
-    let n = parts.len();
-    parts.clear();
     Ok(n)
 }
 

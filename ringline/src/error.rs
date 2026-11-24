@@ -826,10 +826,11 @@ pub enum UdpSendError {
 /// [`io::Error`] of kind [`Other`](io::ErrorKind::Other) whose inner error is a
 /// `SendRefused`, and a refused
 /// [`try_submit_batch`](crate::AsyncSendBuilder::try_submit_batch) returns
-/// that error in a [`BatchRefused`](crate::BatchRefused) with every part. The
-/// same holds for the methods without the `try_` prefix, which also do not
-/// wait. Nothing was queued or transmitted, so the bytes can be sent again
-/// later; the guard parts of a refused `submit_batch` or `build` are dropped. A waiting send
+/// that error in a [`BatchRefused`](crate::BatchRefused) with every part.
+/// `send`, `build`, `forward_recv_buf` and `submit_batch`, which also do not
+/// wait, return the same `io::Error`, and `submit_batch` and `build` drop
+/// their guard parts. Nothing was queued or transmitted, so the bytes can be
+/// sent again later. A waiting send
 /// ([`send_admitted`](crate::SendHalf::send_admitted), a waiting batch) waits
 /// for slots instead; its own refusals are described on it.
 ///

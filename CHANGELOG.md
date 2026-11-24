@@ -27,7 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   errors. `AsyncSendBuilder::try_submit_batch` is `submit_batch` without the
   `SendCompletion`, and on a refusal returns every part, guards included, in
   a `BatchRefused`, as `submit_batch_admitted` does; `submit_batch` drops
-  them.
+  them. On a plaintext io_uring connection it checks the batch as
+  `submit_batch_admitted` does before consuming a part, so it also validates
+  the region of a guard below `send_zc_threshold`, and a batch that fails
+  several checks can get a different error than from `submit_batch`.
 
 - The `ringkern` feature: on Hermit, positional reads and writes (file and
   direct I/O on the mio backend's disk-I/O pool) use the `sys_pread` and

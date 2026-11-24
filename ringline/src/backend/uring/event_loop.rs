@@ -21990,6 +21990,105 @@ mod tests {
         );
     }
 
+    /// Take every free send slab entry for `owner`, a connection other than
+    /// the one under test, so the slab is full without that connection
+    /// holding any.
+    fn exhaust_send_slab(el: &mut AsyncEventLoop<NoopHandler>, owner: u32) {
+        let generation = el.driver.connections.generation(owner);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        while el
+            .driver
+            .send_slab
+            .allocate(
+                owner,
+                generation,
+                &iovecs,
+                u16::MAX,
+                [const { None }; crate::buffer::send_slab::MAX_GUARDS],
+                0,
+                100,
+            )
+            .is_some()
+        {}
+        assert!(!el.driver.send_slab.has_free());
+    }
+
+    /// With the send slab full, a guard batch at `send_zc_threshold` is
+    /// refused with `WouldBlock` when waiting and `Other` when not, and
+    /// `try_submit_batch` returns `Other` with its part.
+    #[test]
+    fn a_full_send_slab_refuses_a_non_waiting_batch_with_other() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let owner = accept_connection(&mut el);
+        exhaust_send_slab(&mut el, owner);
+        let token =
+            crate::handler::ConnId::new(conn_index, el.driver.connections.generation(conn_index));
+        let len = el.driver.send_zc_threshold as usize;
+        let parts = vec![crate::handler::SendPart::Guard(crate::GuardBox::new(
+            PlainGuard(vec![7; len]),
+        ))];
+        let waiting = el.driver.make_ctx().batch_plain_ready(token, &parts, true);
+        assert_eq!(
+            waiting.expect_err("slab full").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let not_waiting = el.driver.make_ctx().batch_plain_ready(token, &parts, false);
+        assert_eq!(
+            not_waiting.expect_err("slab full").kind(),
+            io::ErrorKind::Other
+        );
+        let mut public = public_conn(&el, conn_index);
+        let refused = with_driver_state(&mut el, || public.send_parts().try_submit_batch(parts))
+            .expect_err("slab full");
+        assert_eq!(refused.error.kind(), io::ErrorKind::Other);
+        assert_eq!(refused.error.to_string(), "send slab exhausted");
+        assert_eq!(refused.parts.len(), 1, "the guard comes back");
+    }
+
+    /// On TLS, `try_submit_batch` behind a waiting bounded send is refused
+    /// with `SendWaiting`, and one with nine guards with `InvalidInput`, as
+    /// `submit_batch` refuses it; both return every part.
+    #[test]
+    fn a_tls_try_submit_batch_is_refused_with_its_parts() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let mut public = public_conn(&el, conn_index);
+        let guards = || {
+            (0..9)
+                .map(|_| {
+                    crate::handler::SendPart::Guard(crate::GuardBox::new(PlainGuard(vec![7; 10])))
+                })
+                .collect::<Vec<_>>()
+        };
+        let refused = with_driver_state(&mut el, || public.send_parts().try_submit_batch(guards()))
+            .expect_err("nine guards");
+        assert_eq!(refused.error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(refused.parts.len(), 9);
+        let refused = with_driver_state(&mut el, || {
+            public.send_parts().submit_batch(guards()).map(drop)
+        });
+        assert_eq!(
+            refused.expect_err("nine guards").kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        wait_a_ticket(&mut el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            public
+                .send_parts()
+                .try_submit_batch(vec![crate::handler::SendPart::Copy(b"x")])
+        })
+        .expect_err("a send waits");
+        assert_eq!(refused.parts.len(), 1, "the part comes back");
+        let refused: io::Result<()> = Err(refused.error);
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+    }
+
     /// `send_refusal` on a stale handle reports nothing, with a send waiting on
     /// the slot's new occupant.
     #[test]

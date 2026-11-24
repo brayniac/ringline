@@ -1256,8 +1256,8 @@ impl<'a> DriverCtx<'a> {
     /// Whether [`SendBuilder::submit`] can queue a batch of `parts` on
     /// plaintext connection `conn` now, checked without consuming a part:
     /// the connection checks, [`batch_plain_slots`](Self::batch_plain_slots),
-    /// for a non-waiting batch (`waiting` false) that takes a pool slot no
-    /// send waiting on the connection, a free pool slot for copy parts, and,
+    /// for a non-waiting batch (`waiting` false) that takes a pool slot, that
+    /// no send waits on the connection; a free pool slot for copy parts, and,
     /// for a batch with guards that does not fit the small-send gather, a free
     /// send-slab entry the connection may take (`zero_copy_over_cap`). The
     /// slab refusals are `WouldBlock` for a waiting batch and `Other` for a
