@@ -21925,8 +21925,9 @@ mod tests {
             .copied()
     }
 
-    /// With the pool exhausted, a TLS `try_send` and a `try_build` of a copy
-    /// part are refused with `SendRefused::PoolExhausted`.
+    /// With the pool exhausted, a TLS `try_send`, and a `try_build` and a
+    /// `try_submit_batch` of a copy part, are refused with
+    /// `SendRefused::PoolExhausted`; the batch's part comes back.
     #[test]
     fn tls_try_send_and_try_build_on_an_exhausted_pool_are_pool_exhausted() {
         let mut el = make_test_loop();
@@ -21946,6 +21947,17 @@ mod tests {
         });
         assert_eq!(
             pool_refusal(refused),
+            Some(crate::SendRefused::PoolExhausted)
+        );
+        let refused = with_driver_state(&mut el, || {
+            plain_conn
+                .send_parts()
+                .try_submit_batch(vec![crate::handler::SendPart::Copy(b"x")])
+        })
+        .expect_err("no slot is free");
+        assert_eq!(refused.parts.len(), 1, "the part comes back");
+        assert_eq!(
+            pool_refusal(Err(refused.error)),
             Some(crate::SendRefused::PoolExhausted)
         );
     }
@@ -22056,7 +22068,13 @@ mod tests {
             public
                 .send_parts()
                 .try_submit_batch(vec![crate::handler::SendPart::Guard(guard)])
-        });
+        })
+        .expect_err("refused behind the ticket");
+        assert!(
+            matches!(refused.parts[..], [crate::handler::SendPart::Guard(_)]),
+            "the guard comes back"
+        );
+        let refused: io::Result<()> = Err(refused.error);
         assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
         assert_eq!(el.driver.send_slab.free_count(), slab_free);
     }

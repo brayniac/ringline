@@ -81,6 +81,9 @@ struct Seen {
     refusal_while: Option<SendRefused>,
     /// The `SendRefused` carried by `try_send`'s refusal while it waited.
     try_refused: Option<SendRefused>,
+    /// The `SendRefused` of `try_submit_batch`'s refusal while it waited,
+    /// and how many parts came back.
+    batch_refused: (Option<SendRefused>, usize),
 }
 
 /// `send_refusal` once the waiting send was admitted.
@@ -154,12 +157,20 @@ impl AsyncEventHandler for Sender {
             let refused = kind(conn.send(&[PLAIN; 100]));
             let refusal_while = conn.send_refusal();
             let try_refused = refusal_of(conn.try_send(&[PLAIN; 100]));
+            let batch_refused = match conn
+                .send_parts()
+                .try_submit_batch(vec![ringline::SendPart::Copy(&[PLAIN; 100])])
+            {
+                Ok(()) => (None, 0),
+                Err(refused) => (refusal_of(Err(refused.error)), refused.parts.len()),
+            };
             *SEEN.lock().unwrap() = Some(Seen {
                 refused,
                 tickets_waited,
                 refusal_before,
                 refusal_while,
                 try_refused,
+                batch_refused,
             });
             let admitted = waiting.await.expect("admitted once the peer reads");
             *AFTER.lock().unwrap() = Some(conn.send_refusal());
@@ -240,6 +251,11 @@ fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
     assert_eq!(seen.refusal_before, None, "admitted sends do not refuse");
     assert_eq!(seen.refusal_while, Some(SendRefused::SendWaiting));
     assert_eq!(seen.try_refused, Some(SendRefused::SendWaiting));
+    assert_eq!(
+        seen.batch_refused,
+        (Some(SendRefused::SendWaiting), 1),
+        "try_submit_batch is refused and its part comes back"
+    );
 
     let mut body = Vec::new();
     peer.read_to_end(&mut body).expect("read to the close");

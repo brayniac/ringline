@@ -1253,15 +1253,22 @@ impl<'a> DriverCtx<'a> {
         Ok(usize::from(copy_len > 0))
     }
 
-    /// Whether [`SendBuilder::submit`] can queue a waiting batch of `parts`
-    /// on plaintext connection `conn` now, checked without consuming a part:
+    /// Whether [`SendBuilder::submit`] can queue a batch of `parts` on
+    /// plaintext connection `conn` now, checked without consuming a part:
     /// the connection checks, [`batch_plain_slots`](Self::batch_plain_slots),
-    /// a free pool slot for copy parts, and, for a batch with guards that
-    /// does not fit the small-send gather, a free send-slab entry the
-    /// connection may take (`zero_copy_over_cap`). On `Ok`, `submit` does not
-    /// refuse the batch.
+    /// for a non-waiting batch (`waiting` false) that takes a pool slot no
+    /// send waiting on the connection, a free pool slot for copy parts, and,
+    /// for a batch with guards that does not fit the small-send gather, a free
+    /// send-slab entry the connection may take (`zero_copy_over_cap`). The
+    /// slab refusals are `WouldBlock` for a waiting batch and `Other` for a
+    /// non-waiting one. On `Ok`, `submit` does not refuse the batch.
     #[cfg(has_io_uring)]
-    pub(crate) fn batch_plain_ready(&self, conn: ConnId, parts: &[SendPart<'_>]) -> io::Result<()> {
+    pub(crate) fn batch_plain_ready(
+        &self,
+        conn: ConnId,
+        parts: &[SendPart<'_>],
+        waiting: bool,
+    ) -> io::Result<()> {
         let conn_state = self
             .connections
             .get(conn.index)
@@ -1276,37 +1283,42 @@ impl<'a> DriverCtx<'a> {
             return Err(e);
         }
         let needed = self.batch_plain_slots(parts)?;
+        let total: usize = parts
+            .iter()
+            .map(|p| match p {
+                SendPart::Copy(d) => d.len(),
+                SendPart::Guard(g) => g.as_ptr_len().1 as usize,
+            })
+            .sum();
+        let threshold = self.send_zc_threshold as usize;
+        // `SendBuilder::takes_pool_slot` for a plaintext batch.
+        let takes_pool_slot = parts.iter().any(|p| matches!(p, SendPart::Copy(_)))
+            || (threshold > 0 && total < threshold);
+        if !waiting && self.ticket_waiting && takes_pool_slot {
+            return Err(ticket_waiting_error());
+        }
         let free = self.send_copy_pool.free_count();
         if free < needed {
             return Err(crate::error::SendRefused::PoolExhausted.into_io());
         }
+        let slab_kind = if waiting {
+            io::ErrorKind::WouldBlock
+        } else {
+            io::ErrorKind::Other
+        };
         let has_guards = parts.iter().any(|p| matches!(p, SendPart::Guard(_)));
         if has_guards {
-            let total: usize = parts
-                .iter()
-                .map(|p| match p {
-                    SendPart::Copy(d) => d.len(),
-                    SendPart::Guard(g) => g.as_ptr_len().1 as usize,
-                })
-                .sum();
             // `submit_small_gather` takes one slot when one is free and the
             // whole batch fits it; otherwise the batch needs a slab entry.
-            let threshold = self.send_zc_threshold as usize;
             let gathers = threshold > 0
                 && total < threshold
                 && total <= self.send_copy_pool.slot_size() as usize
                 && free >= 1;
             if !gathers && !self.send_slab.has_free() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "send slab exhausted",
-                ));
+                return Err(io::Error::new(slab_kind, "send slab exhausted"));
             }
             if !gathers && self.zero_copy_over_cap(conn) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    ZERO_COPY_CAP_REFUSAL,
-                ));
+                return Err(io::Error::new(slab_kind, ZERO_COPY_CAP_REFUSAL));
             }
         }
         Ok(())

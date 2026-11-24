@@ -124,6 +124,7 @@ have the same split.
   (section 6), and returns `io::Result<()>`.
 - `submit_batch` waits, as `submit_batch_admitted` does today, and
   `try_submit_batch` does not; both resolve at admission as `send` does.
+  Both return every part of a refused batch in a `BatchRefused`.
   `send_parts(..).build(..)` calls `submit` inside a synchronous closure
   (`runtime/io.rs`, `handler.rs`), so it cannot wait; it stays non-waiting
   under the name `try_build`, and `submit_batch` is the waiting form for

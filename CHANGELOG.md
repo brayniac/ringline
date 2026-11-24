@@ -22,9 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Connection::send_refusal` return `Some(SendWaiting)` before a send is
   made. `Error::SendPoolExhausted` is documented as never returned.
 - `try_send` and `try_forward_recv_buf` on `SendHalf` and `Connection`, and
-  `AsyncSendBuilder::try_build` and `try_submit_batch`: `send`,
-  `forward_recv_buf`, `build` and `submit_batch` without the
-  `SendCompletion`, returning `io::Result<()>` with the same errors.
+  `AsyncSendBuilder::try_build`: `send`, `forward_recv_buf` and `build`
+  without the `SendCompletion`, returning `io::Result<()>` with the same
+  errors. `AsyncSendBuilder::try_submit_batch` is `submit_batch` without the
+  `SendCompletion`, and on a refusal returns every part, guards included, in
+  a `BatchRefused`, as `submit_batch_admitted` does; `submit_batch` drops
+  them.
 
 - The `ringkern` feature: on Hermit, positional reads and writes (file and
   direct I/O on the mio backend's disk-I/O pool) use the `sys_pread` and

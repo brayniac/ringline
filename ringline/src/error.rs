@@ -821,14 +821,15 @@ pub enum UdpSendError {
 /// Why a send was refused for want of send-pool slots.
 ///
 /// A refused [`try_send`](crate::SendHalf::try_send),
-/// [`try_submit_batch`](crate::AsyncSendBuilder::try_submit_batch),
 /// [`try_build`](crate::AsyncSendBuilder::try_build) or
 /// [`try_forward_recv_buf`](crate::SendHalf::try_forward_recv_buf) returns an
 /// [`io::Error`] of kind [`Other`](io::ErrorKind::Other) whose inner error is a
-/// `SendRefused`. The same holds for the methods without the `try_` prefix,
-/// which also do not wait. Nothing was queued or transmitted. A refused
-/// `try_send`, `try_forward_recv_buf` or copy part can be sent again later; the
-/// guard parts of a refused batch are dropped. A waiting send
+/// `SendRefused`, and a refused
+/// [`try_submit_batch`](crate::AsyncSendBuilder::try_submit_batch) returns
+/// that error in a [`BatchRefused`](crate::BatchRefused) with every part. The
+/// same holds for the methods without the `try_` prefix, which also do not
+/// wait. Nothing was queued or transmitted, so the bytes can be sent again
+/// later; the guard parts of a refused `submit_batch` or `build` are dropped. A waiting send
 /// ([`send_admitted`](crate::SendHalf::send_admitted), a waiting batch) waits
 /// for slots instead; its own refusals are described on it.
 ///

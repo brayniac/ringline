@@ -1777,12 +1777,50 @@ impl AsyncSendBuilder {
         self.build(f).map(drop)
     }
 
-    /// [`submit_batch`](Self::submit_batch) without the [`SendCompletion`]:
-    /// the batch is queued in the call or refused, with the same errors. A
-    /// refusal for want of send-pool slots is `Other` carrying a
+    /// Submit a batch of pre-classified `SendPart`s without waiting: it is
+    /// queued in the call or refused, with the errors of
+    /// [`submit_batch`](Self::submit_batch). On a refusal nothing is sent and
+    /// [`BatchRefused`] returns every part, guards included, so the batch can
+    /// be submitted again; `?` converts it to its `io::Error`. A refusal for
+    /// want of send-pool slots is `Other` carrying a
     /// [`SendRefused`](crate::SendRefused) as its inner error.
-    pub fn try_submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<()> {
-        self.submit_batch(parts).map(drop)
+    pub fn try_submit_batch<'a>(
+        self,
+        parts: Vec<crate::handler::SendPart<'a>>,
+    ) -> Result<(), BatchRefused<'a>> {
+        let mut parts = parts;
+        let conn_index = self.token.index;
+        let generation = self.token.generation;
+        let sent = with_state(|driver, executor| {
+            if total_part_len(&parts) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty send batch",
+                ));
+            }
+            let id = executor.register_send(conn_index);
+            // The checks and the gather run the guards' code.
+            let unwinding = WithdrawUnlessDisarmed(Some(id));
+            let mut ctx = send_ctx(driver, executor, conn_index);
+            let submitted = submit_batch_parts(&mut ctx, self.token, &mut parts, id, false);
+            unwinding.disarm();
+            match submitted {
+                Ok(_) => Ok(SendCompletion::pending(conn_index, generation, id)),
+                Err(e) => {
+                    executor.withdraw_send(id);
+                    Err(e)
+                }
+            }
+        });
+        // Dropped outside `with_state`: its `Drop` reaches the executor
+        // through the thread-local driver state.
+        match sent {
+            Ok(sent) => {
+                drop(sent);
+                Ok(())
+            }
+            Err(error) => Err(BatchRefused { error, parts }),
+        }
     }
 
     /// Build and submit the send by calling the provided closure with a
@@ -2015,12 +2053,47 @@ impl AsyncSendBuilder {
         self.build(f).map(drop)
     }
 
-    /// [`submit_batch`](Self::submit_batch) without the [`SendCompletion`]:
-    /// the batch is queued in the call or refused, with the same errors. A
-    /// refusal for want of send-pool slots is `Other` carrying a
+    /// Submit a batch of pre-classified `SendPart`s without waiting: it is
+    /// queued in the call or refused, with the errors of
+    /// [`submit_batch`](Self::submit_batch). On a refusal nothing is sent and
+    /// [`BatchRefused`] returns every part, guards included, so the batch can
+    /// be submitted again; `?` converts it to its `io::Error`. A refusal for
+    /// want of send-pool slots is `Other` carrying a
     /// [`SendRefused`](crate::SendRefused) as its inner error.
-    pub fn try_submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<()> {
-        self.submit_batch(parts).map(drop)
+    pub fn try_submit_batch<'a>(
+        self,
+        parts: Vec<crate::handler::SendPart<'a>>,
+    ) -> Result<(), BatchRefused<'a>> {
+        let mut parts = parts;
+        let conn_index = self.token.index;
+        let generation = self.token.generation;
+        let sent = with_state(|driver, executor| {
+            if total_part_len(&parts) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty send batch",
+                ));
+            }
+            let id = executor.register_send(conn_index);
+            let mut ctx = send_ctx(driver, executor, conn_index);
+            let submitted = submit_batch_parts(&mut ctx, self.token, &mut parts, id, false);
+            match submitted {
+                Ok(_) => Ok(SendCompletion::pending(conn_index, generation, id)),
+                Err(e) => {
+                    executor.withdraw_send(id);
+                    Err(e)
+                }
+            }
+        });
+        // Dropped outside `with_state`: its `Drop` reaches the executor
+        // through the thread-local driver state.
+        match sent {
+            Ok(sent) => {
+                drop(sent);
+                Ok(())
+            }
+            Err(error) => Err(BatchRefused { error, parts }),
+        }
     }
 
     /// Build and submit the send by concatenating all parts, and return a
@@ -5152,8 +5225,8 @@ impl Drop for Admission<'_> {
 
 // ── BatchAdmission ───────────────────────────────────────────────────
 
-/// The refusal of a waiting batch ([`AsyncSendBuilder::submit_batch_admitted`]),
-/// with every part of the batch.
+/// The refusal of a batch from [`AsyncSendBuilder::submit_batch_admitted`] or
+/// [`AsyncSendBuilder::try_submit_batch`], with every part of the batch.
 ///
 /// `From<BatchRefused> for io::Error` returns [`error`](Self::error) and drops
 /// the parts, for a caller that does not want them back.
@@ -5337,12 +5410,12 @@ impl<'a> BatchAdmission<'a> {
                 // before the panic continues.
                 ctx.send_copy_pool.begin_passing();
                 let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    submit_batch_parts(&mut ctx, token, &mut self.parts, id)
+                    submit_batch_parts(&mut ctx, token, &mut self.parts, id, true)
                 }));
                 ctx.send_copy_pool.end_passing();
                 submitted.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             } else {
-                submit_batch_parts(&mut ctx, token, &mut self.parts, id)
+                submit_batch_parts(&mut ctx, token, &mut self.parts, id, true)
             }
         };
         match submitted {
@@ -5399,24 +5472,27 @@ fn batch_is_tls(ctx: &crate::handler::DriverCtx<'_>, conn_index: u32) -> bool {
     !ctx.tls_table.is_null() && unsafe { (*ctx.tls_table).has(conn_index) }
 }
 
-/// Submit an admitted batch's `parts` under `id`, and return how many were
-/// submitted. On `Err`, `parts` holds every part: each check runs before a
-/// part is consumed.
+/// Submit a batch's `parts` under `id`, and return how many were submitted:
+/// an admitted waiting batch (`waiting` true) or a non-waiting one, whose
+/// `ctx` comes from `send_ctx`. On `Err`, `parts` holds every part: each check
+/// runs before a part is consumed.
 ///
 /// A plaintext io_uring batch goes through `SendBuilder` once
 /// `batch_plain_ready` has checked everything `submit` refuses. Any other
 /// batch is gathered into one buffer, borrowing the guards, and sent with
-/// `send_bounded`; the parts are dropped once it is queued.
+/// `send_bounded`, or `send_awaited` when not waiting; the parts are dropped
+/// once it is queued.
 fn submit_batch_parts(
     ctx: &mut crate::handler::DriverCtx<'_>,
     token: ConnId,
     parts: &mut Vec<crate::handler::SendPart<'_>>,
     id: SendId,
+    waiting: bool,
 ) -> io::Result<usize> {
     use crate::handler::SendPart;
     #[cfg(has_io_uring)]
     if !batch_is_tls(ctx, token.index) {
-        ctx.batch_plain_ready(token, parts)?;
+        ctx.batch_plain_ready(token, parts, waiting)?;
         let n = parts.len();
         let mut builder = ctx.send_parts(token);
         for part in parts.drain(..) {
@@ -5444,7 +5520,11 @@ fn submit_batch_parts(
             }
         }
     }
-    ctx.send_bounded(token, &buf, id)?;
+    if waiting {
+        ctx.send_bounded(token, &buf, id)?;
+    } else {
+        ctx.send_awaited(token, &buf, id)?;
+    }
     let n = parts.len();
     parts.clear();
     Ok(n)
