@@ -21930,7 +21930,9 @@ mod tests {
     /// `SendRefused::PoolExhausted`; the batch's part comes back.
     #[test]
     fn tls_try_send_and_try_build_on_an_exhausted_pool_are_pool_exhausted() {
-        let mut el = make_test_loop();
+        // Slots that hold a whole TLS record, so the TLS send reaches the
+        // pool check.
+        let mut el = tls_bounded_test_loop();
         let plain = accept_connection(&mut el);
         let tls = accept_connection(&mut el);
         let _peer = install_handshaked_tls_with_peer(&mut el, tls);
