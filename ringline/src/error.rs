@@ -13,7 +13,7 @@ use thiserror::Error;
 /// | `BufferRegistration` | io_uring refused to register memory | `ENOMEM`: `RLIMIT_MEMLOCK` (raise with `ulimit -l` / `LimitMEMLOCK=`, or grant `CAP_IPC_LOCK`) or a failed page migration; `EFAULT`: a buffer over 1 GiB or of length 0, an unpinnable mapping, or a failed page migration. The message says which apply |
 /// | `ConnectionLimitReached` | All connection slots in use | Increase via `ConfigBuilder::max_connections(...)` or close idle connections |
 /// | `InvalidConnection` | Stale handle, connection closed | Re-establish connection; do not reuse the `Connection` |
-/// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
+/// | `SendPoolExhausted` | Never returned; see [`SendRefused`] | |
 /// | `InvalidRegion` | Region ID not registered | Check `MemoryRegion` registration; ensure region outlives usage |
 /// | `PointerOutOfRegion` | SendGuard pointer outside registered region | Verify pointer arithmetic; region boundaries are strict |
 /// | `ResourceLimit` | `RLIMIT_NOFILE` or `RLIMIT_MEMLOCK` too low for the config | The message names the limit and the `ulimit` to run; checked before any worker starts |
@@ -100,9 +100,8 @@ pub enum Error {
 
     /// Send pool exhausted.
     ///
-    /// All send buffer slots are in flight. This is a backpressure signal:
-    /// - Await pending `send()` futures before sending more
-    /// - Increase via `ConfigBuilder::send_pool(count, slot_size)` (default count: 1024)
+    /// Never returned: a send refused for want of send-pool slots returns an
+    /// [`io::Error`] carrying [`SendRefused::PoolExhausted`].
     #[error("send pool exhausted")]
     SendPoolExhausted,
 
@@ -819,7 +818,7 @@ pub enum UdpSendError {
     Io(#[from] io::Error),
 }
 
-/// Why a non-waiting send was refused for want of send-pool slots.
+/// Why a send was refused for want of send-pool slots.
 ///
 /// A refused [`try_send`](crate::SendHalf::try_send),
 /// [`try_submit_batch`](crate::AsyncSendBuilder::try_submit_batch),
@@ -827,8 +826,11 @@ pub enum UdpSendError {
 /// [`try_forward_recv_buf`](crate::SendHalf::try_forward_recv_buf) returns an
 /// [`io::Error`] of kind [`Other`](io::ErrorKind::Other) whose inner error is a
 /// `SendRefused`. The same holds for the methods without the `try_` prefix,
-/// which also do not wait. Nothing was queued or transmitted, so the same bytes
-/// may be sent again later.
+/// which also do not wait. Nothing was queued or transmitted. A refused
+/// `try_send`, `try_forward_recv_buf` or copy part can be sent again later; the
+/// guard parts of a refused batch are dropped. A waiting send
+/// ([`send_admitted`](crate::SendHalf::send_admitted), a waiting batch) waits
+/// for slots instead; its own refusals are described on it.
 ///
 /// ```
 /// # fn handle(e: std::io::Error) {
@@ -845,7 +847,8 @@ pub enum UdpSendError {
 #[non_exhaustive]
 pub enum SendRefused {
     /// The send pool has too few free slots for the send. It clears as the
-    /// worker's in-flight sends complete.
+    /// worker's in-flight sends complete. Returned for non-waiting sends on
+    /// io_uring; on mio a non-waiting send takes no send-pool slots.
     #[error("send copy pool exhausted")]
     PoolExhausted,
 

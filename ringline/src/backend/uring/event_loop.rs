@@ -21917,6 +21917,67 @@ mod tests {
         assert_eq!(with_driver_state(&mut el, || public.send_refusal()), None);
     }
 
+    fn pool_refusal(r: io::Result<()>) -> Option<crate::SendRefused> {
+        let e = r.err()?;
+        assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");
+        e.get_ref()
+            .and_then(|e| e.downcast_ref::<crate::SendRefused>())
+            .copied()
+    }
+
+    /// With the pool exhausted, a TLS `try_send` and a `try_build` of a copy
+    /// part are refused with `SendRefused::PoolExhausted`.
+    #[test]
+    fn tls_try_send_and_try_build_on_an_exhausted_pool_are_pool_exhausted() {
+        let mut el = make_test_loop();
+        let plain = accept_connection(&mut el);
+        let tls = accept_connection(&mut el);
+        let _peer = install_handshaked_tls_with_peer(&mut el, tls);
+        let mut plain_conn = public_conn(&el, plain);
+        let mut tls_conn = public_conn(&el, tls);
+        let _held = exhaust_send_pool(&mut el);
+        let refused = with_driver_state(&mut el, || tls_conn.try_send(b"x"));
+        assert_eq!(
+            pool_refusal(refused),
+            Some(crate::SendRefused::PoolExhausted)
+        );
+        let refused = with_driver_state(&mut el, || {
+            plain_conn.send_parts().try_build(|b| b.copy(b"x").submit())
+        });
+        assert_eq!(
+            pool_refusal(refused),
+            Some(crate::SendRefused::PoolExhausted)
+        );
+    }
+
+    /// A TLS connection whose close_notify waits as sealed output after
+    /// `close()` refuses `try_send` and `try_build` as closing
+    /// (`NotConnected`), not `SendWaiting`, and `send_refusal` reports
+    /// nothing.
+    #[test]
+    fn a_closing_tls_connection_is_refused_as_closing_not_behind_its_close_notify() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let mut public = public_conn(&el, conn_index);
+        let _held = exhaust_send_pool(&mut el);
+        el.driver.close_connection_graceful(conn_index);
+        assert!(el.driver.sealed_waiting(conn_index), "the alert waits");
+        assert_eq!(with_driver_state(&mut el, || public.send_refusal()), None);
+        let refused = with_driver_state(&mut el, || public.try_send(b"x"));
+        assert_eq!(
+            refused.expect_err("closing").kind(),
+            io::ErrorKind::NotConnected
+        );
+        let refused = with_driver_state(&mut el, || {
+            public.send_parts().try_build(|b| b.copy(b"x").submit())
+        });
+        assert_eq!(
+            refused.expect_err("closing").kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
     /// `send_refusal` on a stale handle reports nothing, with a send waiting on
     /// the slot's new occupant.
     #[test]

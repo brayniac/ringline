@@ -697,6 +697,15 @@ pub(crate) fn close_notify_sent_error() -> io::Error {
 
 #[cfg(has_io_uring)]
 impl<'a> DriverCtx<'a> {
+    /// Whether `conn_index` is a TLS connection whose close_notify has been
+    /// queued, as a send or as sealed output.
+    fn tls_close_notify_sent(&self, conn_index: u32) -> bool {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        !self.tls_table.is_null()
+            && unsafe { (*self.tls_table).has(conn_index) }
+            && unsafe { (*self.tls_table).close_notify_sent(conn_index) }
+    }
+
     /// Request shutdown of this worker's event loop.
     /// The worker stops at its next shutdown check. It checks once per
     /// iteration, after draining the completions its wait returned and before
@@ -878,6 +887,13 @@ impl<'a> DriverCtx<'a> {
         // `send_parts`.
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
+        }
+        // Ahead of the ticket check: once a close has queued the
+        // close_notify, which may itself wait as sealed output, the
+        // connection takes no more sends, and `SendWaiting` would invite a
+        // retry.
+        if self.tls_close_notify_sent(conn.index) {
+            return Err(close_notify_sent_error());
         }
         if !bounded && self.ticket_waiting {
             return Err(ticket_waiting_error());
@@ -4135,6 +4151,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Ok(());
         }
 
+        // As in `send_inner`: a closing TLS connection is refused as closing,
+        // not behind its waiting close_notify.
+        if self.ctx.tls_close_notify_sent(self.conn.index) {
+            return Err(close_notify_sent_error());
+        }
         if self.ctx.ticket_waiting && self.takes_pool_slot() {
             return Err(ticket_waiting_error());
         }

@@ -328,7 +328,7 @@ earlier generation of the index does not decrement the current one, so slots
 a closed connection's sends still hold do not count against the next
 occupant of its index.
 
-A connection with `held >= M` is at the cap. `M` is set with
+A connection with `held >= M` is at the cap. `M` will be set with
 `ConfigBuilder::send_pool_hold_cap`, where `usize::MAX` turns the cap off,
 and defaults to 64: in stage 0
 an application-level bound of 64 slots removed the slow-reader stalls (0 of
@@ -686,10 +686,9 @@ checked, the entry says so.
    exempt tickets hold and sets `D`.
 5. Names (decided): `send_pool_hold_cap` for `M`; `try_send`,
    `try_submit_batch`, `try_build` and `try_forward_recv_buf`; `send_refusal`;
-   `SendRefused` with `PoolExhausted`, `Capped` and `SendWaiting`. If they are
-   built, `L` is `send_pool_hold_resume` and `k` and `D` are
-   `send_pool_dedicated(spare, slot_size)`, named finally when open question 3
-   and section 7 are decided.
+   `SendRefused` with `PoolExhausted`, `Capped` and `SendWaiting`. Candidates,
+   pending open question 3 and section 7: `send_pool_hold_resume` for `L`,
+   `send_pool_dedicated(spare, slot_size)` for `k` and `D`.
 6. Whether sends that take a slab entry and no slot join the ticket order.
 7. Whether ringline offers a configured default limit on a bounded send's
    wait, and what a send that reaches it returns.
@@ -746,9 +745,10 @@ checked, the entry says so.
 4. In one breaking release: the per-connection ticket queue and the worker
    queue (sections 2 and 3), with
    receive-path TLS output waiting in order instead of failing the
-   connection; bounded sends by default, the `try_` forms, `SendRefused` and
-   the method that reports a refusal in advance; the removal of `send_chain`
-   (done ahead of the rest);
+   connection; bounded sends by default; the `try_` forms, `SendRefused` and
+   `send_refusal` (done ahead of the rest, without `Capped`); the removal of
+   `send_chain` (done ahead of the rest); the removal of the unused
+   `Error::SendPoolExhausted`;
    and the in-tree callers (sections 1, 2 and 6, In-tree callers).
 5. The cap above half occupancy, `M` = 64 by default (section 5), and its
    mio account (the mio section).

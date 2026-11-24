@@ -10,14 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `SendRefused`, why a non-waiting send was refused for want of send-pool
-  slots: `PoolExhausted` (the pool has too few free slots) or `SendWaiting`
-  (a bounded send, or on io_uring TLS output the pool had no slots for,
-  waits on the connection). The `Other` errors these refusals already
-  returned carry it as their inner error, so
+  slots: `PoolExhausted` (the pool has too few free slots; io_uring only, as
+  on mio a non-waiting send takes no slots) or `SendWaiting` (a bounded
+  send, or on io_uring TLS output the pool had no slots for, waits on the
+  connection). The `Other` errors these refusals already returned carry it
+  as their inner error, so
   `e.get_ref().and_then(|e| e.downcast_ref::<SendRefused>())` tells them
-  apart without matching the message. The messages are unchanged.
-  `SendHalf::send_refusal` and `Connection::send_refusal` return
-  `Some(SendWaiting)` before a send is made.
+  apart without matching the message. Their kind and `Display` text are
+  unchanged; their `Debug` output shows the variant (`error: PoolExhausted`)
+  instead of the message. `SendHalf::send_refusal` and
+  `Connection::send_refusal` return `Some(SendWaiting)` before a send is
+  made. `Error::SendPoolExhausted` is documented as never returned.
 - `try_send` and `try_forward_recv_buf` on `SendHalf` and `Connection`, and
   `AsyncSendBuilder::try_build` and `try_submit_batch`: `send`,
   `forward_recv_buf`, `build` and `submit_batch` without the

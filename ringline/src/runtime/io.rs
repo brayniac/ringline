@@ -1087,12 +1087,24 @@ impl ConnCtx {
         }
     }
 
-    /// See [`SendHalf::send_refusal`]. Reads what `send_ctx` reads, so it
-    /// agrees with the refusal a non-waiting send gets now.
+    /// See [`SendHalf::send_refusal`]. Reads the flags `send_ctx` reads, after
+    /// the closing checks a send makes ahead of them; a send that takes no
+    /// pool slot is not refused by them.
     pub(crate) fn send_refusal(&self) -> Option<crate::SendRefused> {
         with_state(|driver, executor| {
             if driver.connections.generation(self.conn_index) != self.generation {
                 return None;
+            }
+            #[cfg(has_io_uring)]
+            {
+                let idx = self.conn_index as usize;
+                if driver.send_queues[idx].closing_refusal().is_some()
+                    || driver.tls_table.as_ref().is_some_and(|t| {
+                        t.has(self.conn_index) && t.close_notify_sent(self.conn_index)
+                    })
+                {
+                    return None;
+                }
             }
             let waiting = executor.send_waiting_on(self.conn_index);
             #[cfg(has_io_uring)]
@@ -3545,13 +3557,19 @@ impl SendHalf {
     /// ([`send_admitted`](Self::send_admitted),
     /// [`send_backpressured`](Self::send_backpressured), a waiting batch), or
     /// on io_uring TLS output the send pool had no slots for, waits on the
-    /// connection. `None` otherwise, and on a closed connection.
+    /// connection. `None` otherwise: on a stale handle, after
+    /// [`abort`](Self::abort) or [`close`](Self::close) has reached the point
+    /// where every send is refused as closing, and on io_uring once a TLS
+    /// connection's close_notify is queued.
     ///
     /// It does not report [`SendRefused::PoolExhausted`](crate::SendRefused::PoolExhausted),
-    /// which depends on the send's size. On io_uring a plaintext batch of
-    /// guards alone at or above `send_zc_threshold` takes no send-pool slot and
-    /// is not refused while a send waits, so for it `Some` does not mean a
-    /// refusal.
+    /// which depends on the send's size. On a plaintext io_uring connection a
+    /// send that takes no send-pool slot is not refused while a send waits, so
+    /// for it `Some` does not mean a refusal: a batch of guards alone at or
+    /// above `send_zc_threshold`, a
+    /// [`forward_recv_buf`](Self::forward_recv_buf) that detaches the
+    /// accumulator at or above it, or a
+    /// [`forward_to_conn`](RecvHalf::forward_to_conn) chunk sent zero-copy.
     pub fn send_refusal(&self) -> Option<crate::SendRefused> {
         self.conn.send_refusal()
     }
