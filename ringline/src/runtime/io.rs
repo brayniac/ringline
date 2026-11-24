@@ -1784,10 +1784,11 @@ impl AsyncSendBuilder {
     /// [`submit_batch_admitted`](Self::submit_batch_admitted) does before it
     /// consumes a part, so it also refuses a guard below `send_zc_threshold`
     /// whose pointer is outside its region, and a batch that fails several
-    /// checks can get a different error from `submit_batch`'s. Send-slab
-    /// refusals are `Other`, as from `submit_batch`; a waiting batch gets
-    /// `WouldBlock`. A refusal for want of send-pool slots is `Other` carrying
-    /// a [`SendRefused`](crate::SendRefused) as its inner error.
+    /// checks can get a different error from `submit_batch`'s. On io_uring
+    /// its send-slab refusals are `Other`, as from `submit_batch`;
+    /// [`submit_batch_admitted`](Self::submit_batch_admitted) gets `WouldBlock`
+    /// for them. A refusal for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
     ///
     /// On a refusal nothing is sent and [`BatchRefused`] returns every part,
     /// guards included, so the batch can be submitted again. `?` converts it
@@ -2071,10 +2072,11 @@ impl AsyncSendBuilder {
     /// [`submit_batch_admitted`](Self::submit_batch_admitted) does before it
     /// consumes a part, so it also refuses a guard below `send_zc_threshold`
     /// whose pointer is outside its region, and a batch that fails several
-    /// checks can get a different error from `submit_batch`'s. Send-slab
-    /// refusals are `Other`, as from `submit_batch`; a waiting batch gets
-    /// `WouldBlock`. A refusal for want of send-pool slots is `Other` carrying
-    /// a [`SendRefused`](crate::SendRefused) as its inner error.
+    /// checks can get a different error from `submit_batch`'s. On io_uring
+    /// its send-slab refusals are `Other`, as from `submit_batch`;
+    /// [`submit_batch_admitted`](Self::submit_batch_admitted) gets `WouldBlock`
+    /// for them. A refusal for want of send-pool slots is `Other` carrying a
+    /// [`SendRefused`](crate::SendRefused) as its inner error.
     ///
     /// On a refusal nothing is sent and [`BatchRefused`] returns every part,
     /// guards included, so the batch can be submitted again. `?` converts it

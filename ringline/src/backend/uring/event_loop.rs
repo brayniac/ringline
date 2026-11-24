@@ -22081,6 +22081,17 @@ mod tests {
         .expect_err("over both limits");
         assert_eq!(refused.error.to_string(), "too many guards (max 8)");
         assert_eq!(refused.parts.len(), 33);
+        let built = with_driver_state(&mut el, || {
+            let mut parts = guards();
+            parts.extend((0..24).map(|_| crate::handler::SendPart::Copy(b"x")));
+            public.send_parts().submit_batch(parts).map(drop)
+        })
+        .expect_err("over both limits");
+        assert_eq!(
+            built.to_string(),
+            refused.error.to_string(),
+            "submit_batch reports the same limit"
+        );
         let refused = with_driver_state(&mut el, || {
             public.send_parts().submit_batch(guards()).map(drop)
         });
