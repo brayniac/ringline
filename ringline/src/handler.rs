@@ -1301,7 +1301,7 @@ impl<'a> DriverCtx<'a> {
         if free < needed {
             return Err(crate::error::SendRefused::PoolExhausted.into_io());
         }
-        let slab_kind = if waiting {
+        let slab_kind = if true || waiting {
             io::ErrorKind::WouldBlock
         } else {
             io::ErrorKind::Other
