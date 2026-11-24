@@ -892,9 +892,6 @@ impl<'a> DriverCtx<'a> {
         // close_notify, which may itself wait as sealed output, the
         // connection takes no more sends, and `SendWaiting` would invite a
         // retry.
-        if self.tls_close_notify_sent(conn.index) {
-            return Err(close_notify_sent_error());
-        }
         if !bounded && self.ticket_waiting {
             return Err(ticket_waiting_error());
         }
